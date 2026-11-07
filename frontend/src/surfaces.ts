@@ -4,7 +4,7 @@ const LABELS: Record<string, string> = {
   vscode: 'VS Code',
   desktop_app: '桌面版',
   web: '网页 / 云端',
-  exec: 'exec',
+  exec: 'Codex Exec',
   sdk: 'SDK',
   code_review: '代码审查',
   github_code_review: '代码审查',

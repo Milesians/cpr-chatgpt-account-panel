@@ -88,20 +88,89 @@ const ERROR_LABELS: Record<string, string> = {
   duplicate_in_input: '输入重复',
   invalid_line_format: '行格式错误',
   invalid_email: '邮箱格式无效',
-  missing_email: '缺少邮箱',
-  missing_password: '缺少密码',
+  email_missing: '缺少邮箱',
+  password_missing: '缺少密码',
   invalid_totp: '2FA 格式无效',
   invalid_kind: '类型无效',
   account_unavailable: '账号已停用或不可用',
   credential_changed: '凭据版本冲突',
   network_timeout: '连接超时',
   network: '网络请求失败',
+  login_rejected: '认证请求被拒绝',
+  login_forbidden: '认证请求被禁止',
+  upstream_rejected: '上游认证服务错误',
+  invalid_redirect: '跳转地址无效',
+  unsupported_redirect: '跳转目标不受信任',
+  invalid_response: '响应数据无效',
+  unexpected_callback: '未预期收到回调跳转',
+  unsupported_login_step: '未知的登录步骤',
+  too_many_steps: '登录跳转步骤过多',
+  internal_error: '内部错误',
+  ambiguous_existing: 'CPR 中存在多个同名账号',
+  unsupported_account: '不支持的账号类型',
+  not_found: '账号不存在',
 }
 
-export function errorCodeLabel(code?: string | null): string {
+export function hasKnownErrorCode(code?: string | null): boolean {
   if (!code)
-    return '未知错误'
-  return ERROR_LABELS[code] ?? code
+    return false
+  return Object.prototype.hasOwnProperty.call(ERROR_LABELS, code)
+}
+
+export function errorCodeLabel(code?: string | null, fallbackMessage?: string | null): string {
+  if (!code)
+    return fallbackMessage?.trim() || '未知错误'
+  return ERROR_LABELS[code] ?? (fallbackMessage?.trim() || code)
+}
+
+export function formatLoginError(code?: string | null, message?: string | null): string {
+  const msg = message?.trim() ?? ''
+  if (code && hasKnownErrorCode(code)) {
+    const label = ERROR_LABELS[code]!
+    return msg ? `[${label}] ${msg}` : label
+  }
+  return msg || errorCodeLabel(code)
+}
+
+/** 详情页重登主按钮文字与禁用原因 */
+export function resolveLoginMainAction(state: {
+  enabled: boolean
+  hasPassword: boolean
+  inputPassword: string
+}): { label: string, disabled: boolean, title?: string } {
+  const hasInput = state.inputPassword.trim().length > 0
+  const label = !hasInput && state.hasPassword ? '免输重登' : '登录并写回 CPR'
+  if (!state.enabled) {
+    return { label, disabled: true, title: '账号在 CPR 里已停用，无法发起登录' }
+  }
+  if (!hasInput && !state.hasPassword) {
+    return { label, disabled: true, title: '请先输入登录密码' }
+  }
+  return { label, disabled: false }
+}
+
+/** 导入按钮文字与禁用原因 */
+export function resolveImportAction(state: {
+  rawText: string
+  report: PasteReport | null
+  queueLength: number
+  importing: boolean
+  includeExistingUpdates: boolean
+}): { label: string, disabled: boolean, title?: string } {
+  const label = `导入 ${state.queueLength} 个`
+  if (state.importing) {
+    return { label, disabled: true, title: '正在逐个导入账号' }
+  }
+  if (!state.rawText.trim()) {
+    return { label, disabled: true, title: '没有内容：请先粘贴要导入的账号文本' }
+  }
+  if (!state.report || state.queueLength === 0) {
+    if (state.report && state.report.created === 0 && state.report.updated > 0 && !state.includeExistingUpdates) {
+      return { label, disabled: true, title: '都已在 CPR，勾选更新才会重登' }
+    }
+    return { label, disabled: true, title: '没有可导入的行' }
+  }
+  return { label, disabled: false }
 }
 
 export function needsManualOAuth(code?: string | null): boolean {

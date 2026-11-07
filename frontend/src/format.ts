@@ -59,6 +59,74 @@ export function windowName(minutes: number): string {
 
 export const kindLabel: Record<Account['kind'], string> = { personal: '个人', team: 'Team', unknown: '未知' }
 
+const PLAN_LABELS: Record<string, string> = {
+  plus: 'Plus',
+  pro: 'Pro',
+  team: 'Team',
+  business: 'Business',
+  enterprise: 'Enterprise',
+  edu: 'Edu',
+  free: 'Free',
+  free_workspace: 'Free Workspace',
+}
+
+const TEAM_PLANS = new Set(['team', 'business', 'enterprise', 'edu', 'free_workspace'])
+
+/** 套餐名格式化：首字母大写（Plus / Pro / Team / Business / Enterprise / Edu / Free，未知原样但不全大写） */
+export function formatPlanName(plan: string | null | undefined): string {
+  const trimmed = plan?.trim() ?? ''
+  if (!trimmed)
+    return ''
+  const lower = trimmed.toLowerCase()
+  if (PLAN_LABELS[lower])
+    return PLAN_LABELS[lower]
+  if (trimmed === trimmed.toUpperCase() && /[A-Z]/.test(trimmed)) {
+    return trimmed
+      .toLowerCase()
+      .split(/[\s_-]+/)
+      .filter(Boolean)
+      .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(' ')
+  }
+  return trimmed
+}
+
+export function isTeamPlan(plan: string | null | undefined): boolean {
+  const lower = plan?.trim().toLowerCase() ?? ''
+  return TEAM_PLANS.has(lower)
+}
+
+/** 套餐与类型展示：Team 类套餐不再另加 Team 类型标签，个人套餐显示「Plus · 个人」 */
+export function formatPlanWithKind(plan: string | null | undefined, kind: Account['kind']): string {
+  const p = formatPlanName(plan)
+  if (p) {
+    if (isTeamPlan(plan) || kind === 'team')
+      return p
+    if (kind === 'personal')
+      return `${p} · 个人`
+    return p
+  }
+  return kindLabel[kind] ?? '未知'
+}
+
+export const credentialStateMap: Record<string, string> = {
+  ready: '凭据有效',
+  expired: '已过期',
+  banned: '已封禁',
+  invalid: '凭据无效',
+  missing: '缺少凭据',
+  unconfigured: '未配置凭据',
+  revoked: '已吊销',
+  unknown: '状态未知',
+}
+
+export function credentialStateLabel(state: string | null | undefined): string {
+  const s = state?.trim().toLowerCase() ?? ''
+  if (!s)
+    return '状态未知'
+  return credentialStateMap[s] ?? '状态异常'
+}
+
 export const billingStatusLabel: Record<string, string> = {
   paid: '已支付', succeeded: '已支付', refunded: '已退款', void: '已作废',
   due: '待续费', open: '待支付', pending: '待支付',
@@ -108,7 +176,7 @@ export function money(amount: number | undefined, currency: string | undefined):
 }
 
 export function paymentText(p: LastPayment): string {
-  return `${billingStatusLabel[p.status.toLowerCase()] ?? p.status} · ${day(p.created_at_ms)}`
+  return `${billingStatusLabel[p.status.toLowerCase()] ?? p.status} · ${day(p.created_at_ms)} · ${ago(p.checked_at_ms)}查`
 }
 
 /** 用量的单位说明 */
@@ -173,6 +241,17 @@ export function isUnchecked(a: Account): boolean {
   return !a.blocker && !a.usage
 }
 
+/** 账号是否令牌过期或凭据异常（需要在列表操作区显示免输重登或去重新登录） */
+export function needsCredentialRelogin(a: Account): boolean {
+  if (a.credential_state !== 'ready')
+    return true
+  if (!a.blocker)
+    return false
+  return a.blocker.code === 'token_expired'
+    || a.blocker.code === 'credential_state'
+    || a.blocker.code === 'no_credentials'
+}
+
 export type AccountFilterKey = 'all' | 'work' | 'payment' | 'quota90' | 'unchecked' | 'blocked'
 
 export function matchesAccountFilter(a: Account, filter: AccountFilterKey): boolean {
@@ -200,12 +279,13 @@ export function weeklyQuotaPercent(a: Account): number {
   return fromQuota ?? -1
 }
 
+/** 行左竖条优先级：红（扣款失败/逾期/查询报错）> 紫（Work 有用量）> 黄（待续费/周额度 >90%/令牌过期或凭据不可查） */
 export function rowAccentTone(a: Account): 'work' | 'bad' | 'warn' | 'none' {
-  if (hasPaymentAnomaly(a) && paymentIssue(a.payment?.status) === 'failed')
+  if ((hasPaymentAnomaly(a) && paymentIssue(a.payment?.status) === 'failed') || Boolean(a.usage?.error))
     return 'bad'
   if (hasWork(a.usage))
     return 'work'
-  if (hasPaymentAnomaly(a) || hasHighWeeklyQuota(a) || isUnqueryable(a))
+  if (hasPaymentAnomaly(a) || hasHighWeeklyQuota(a) || Boolean(a.blocker))
     return 'warn'
   return 'none'
 }
@@ -213,4 +293,3 @@ export function rowAccentTone(a: Account): 'work' | 'bad' | 'warn' | 'none' {
 export function title(a: Account): string {
   return a.email || a.name
 }
-

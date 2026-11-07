@@ -1,10 +1,20 @@
 <script setup lang="ts">
 import type { LastPayment, Subscription, Transaction } from '../api'
 import { ZButton, ZEmpty, ZTag } from '@codex-proxy/ui'
-import { Check, Copy, CreditCard, ReceiptText } from '@lucide/vue'
-import { ref } from 'vue'
+import { Check, Copy, CreditCard, RefreshCw } from '@lucide/vue'
+import { computed, ref } from 'vue'
 import { api } from '../api'
-import { billingStatusLabel, billingTag, dateTime, day, daysLeft, money, paymentIssue, subscriptionStatusLabel } from '../format'
+import {
+  ago,
+  billingStatusLabel,
+  billingTag,
+  day,
+  daysLeft,
+  formatPlanName,
+  money,
+  paymentIssue,
+  subscriptionStatusLabel,
+} from '../format'
 
 const props = defineProps<{ accountId: string, payment: LastPayment | null, blocked: string | null }>()
 const emit = defineEmits<{ payment: [payment: LastPayment | null] }>()
@@ -17,6 +27,11 @@ const cursor = ref('')
 const billLoading = ref(false)
 const billError = ref('')
 const copied = ref('')
+let copyTimer: ReturnType<typeof setTimeout> | null = null
+
+const hasData = computed(() => subscription.value !== null || rows.value !== null)
+const loadingInitial = computed(() => (subLoading.value || billLoading.value) && !hasData.value)
+const loadingRefresh = computed(() => (subLoading.value || billLoading.value) && hasData.value)
 
 async function loadSubscription() {
   subLoading.value = true
@@ -41,7 +56,7 @@ async function loadBilling(more = false) {
     cursor.value = r.history.next_cursor ?? ''
     if (!more) {
       emit('payment', r.payment)
-      if (r.history.subscription)
+      if (r.history.subscription && !subscription.value)
         subscription.value = r.history.subscription
     }
   }
@@ -53,19 +68,28 @@ async function loadBilling(more = false) {
   }
 }
 
+async function loadAll() {
+  await Promise.allSettled([
+    loadSubscription(),
+    loadBilling(false),
+  ])
+}
+
 /** 插件页面在隔离 iframe 里，不能开新标签：给出链接让人复制 */
 async function copy(url: string, id: string) {
   try {
     await navigator.clipboard.writeText(url)
     copied.value = id
+    if (copyTimer)
+      clearTimeout(copyTimer)
+    copyTimer = setTimeout(() => {
+      if (copied.value === id)
+        copied.value = ''
+    }, 2000)
   }
   catch {
     copied.value = ''
   }
-}
-
-function select(e: Event) {
-  (e.target as HTMLInputElement).select()
 }
 </script>
 
@@ -77,15 +101,21 @@ function select(e: Event) {
           订阅与账单
         </h3>
         <span v-if="payment" class="muted">
-          最近一笔 {{ billingStatusLabel[payment.status.toLowerCase()] ?? payment.status }} · {{ day(payment.created_at_ms) }}（记于 {{ dateTime(payment.checked_at_ms) }}）
+          最近一笔 {{ billingStatusLabel[payment.status.toLowerCase()] ?? payment.status }} · {{ day(payment.created_at_ms) }} · {{ ago(payment.checked_at_ms) }}查
         </span>
       </div>
       <div class="card-actions">
-        <ZButton size="small" :loading="subLoading" :disabled="!!blocked" @click="loadSubscription">
-          <ReceiptText :size="13" aria-hidden="true" /> 查询订阅
-        </ZButton>
-        <ZButton type="primary" size="small" :loading="billLoading && !rows" :disabled="!!blocked" @click="loadBilling(false)">
-          <CreditCard :size="13" aria-hidden="true" /> 查询账单
+        <ZButton
+          type="primary"
+          size="small"
+          :loading="loadingInitial || loadingRefresh"
+          :disabled="!!blocked"
+          :title="blocked ?? (hasData ? '重新读取订阅与账单' : '并行读取订阅状态与账单记录')"
+          @click="loadAll"
+        >
+          <RefreshCw v-if="hasData" :size="13" aria-hidden="true" />
+          <CreditCard v-else :size="13" aria-hidden="true" />
+          {{ hasData ? '刷新' : '查询订阅与账单' }}
         </ZButton>
       </div>
     </div>
@@ -100,7 +130,7 @@ function select(e: Event) {
     <dl v-if="subscription" class="facts-grid">
       <div class="fact-box">
         <dt>套餐</dt>
-        <dd class="uppercase">{{ subscription.plan_type }}</dd>
+        <dd>{{ formatPlanName(subscription.plan_type) || subscription.plan_type }}</dd>
       </div>
       <div class="fact-box">
         <dt>订阅状态</dt>
@@ -135,6 +165,14 @@ function select(e: Event) {
     <template v-if="rows">
       <ZEmpty v-if="!rows.length" size="small" title="没有账单记录" />
       <div v-else class="card-list" role="list" aria-label="账单记录列表">
+        <div class="card-head billing-head" aria-hidden="true">
+          <span>账单日期</span>
+          <span>金额</span>
+          <span>状态</span>
+          <span>套餐描述</span>
+          <span class="text-right">发票</span>
+        </div>
+
         <div
           v-for="t in rows"
           :key="t.id"
@@ -142,42 +180,35 @@ function select(e: Event) {
           class="card-row billing-row"
           :data-issue="paymentIssue(t.status) ?? undefined"
         >
-          <div>
-            <div class="font-semibold text-cp-text">{{ day(t.created_at_ms) }}</div>
-            <div class="muted text-xs">账单日期</div>
+          <div class="cell-item" data-label="账单日期">
+            <span class="font-semibold text-cp-text">{{ day(t.created_at_ms) }}</span>
           </div>
 
-          <div>
-            <div class="font-semibold tabular-nums text-cp-text">{{ money(t.amount, t.currency) }}</div>
-            <div class="muted text-xs">金额</div>
+          <div class="cell-item" data-label="金额">
+            <span class="font-semibold tabular-nums text-cp-text">{{ money(t.amount, t.currency) }}</span>
           </div>
 
-          <div>
+          <div class="cell-item" data-label="状态">
             <ZTag size="small" :type="billingTag(t.status)">
               {{ billingStatusLabel[t.status.toLowerCase()] ?? t.status }}
             </ZTag>
           </div>
 
-          <div>
-            <div class="font-medium uppercase text-cp-text">{{ t.plan || '—' }}</div>
-            <div class="muted text-xs">套餐</div>
+          <div class="cell-item" data-label="套餐描述">
+            <span class="font-medium text-cp-text">{{ t.plan || '—' }}</span>
           </div>
 
           <div class="invoice-box">
-            <template v-if="t.document_url">
-              <input
-                class="invoice-url"
-                readonly
-                :value="t.document_url"
-                aria-label="Stripe 发票链接"
-                @focus="select"
-              >
-              <ZButton size="small" @click="copy(t.document_url, t.id)">
-                <Check v-if="copied === t.id" :size="13" aria-hidden="true" />
-                <Copy v-else :size="13" aria-hidden="true" />
-                {{ copied === t.id ? '已复制' : '复制发票链接' }}
-              </ZButton>
-            </template>
+            <ZButton
+              v-if="t.document_url"
+              size="small"
+              :title="t.document_url"
+              @click="copy(t.document_url, t.id)"
+            >
+              <Check v-if="copied === t.id" :size="13" aria-hidden="true" />
+              <Copy v-else :size="13" aria-hidden="true" />
+              {{ copied === t.id ? '已复制' : '复制发票链接' }}
+            </ZButton>
             <span v-else class="muted text-xs">无发票链接</span>
           </div>
         </div>

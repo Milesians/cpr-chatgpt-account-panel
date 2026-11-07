@@ -3,7 +3,7 @@ import { computed } from 'vue'
 import { dateTime } from '../format'
 
 const props = defineProps<{ label: string, used: number | null, resetsAt?: number | null }>()
-const level = computed(() => props.used === null ? 'empty' : props.used >= 90 ? 'bad' : props.used >= 70 ? 'warn' : 'ok')
+const level = computed(() => props.used === null ? 'empty' : props.used >= 90 ? 'warn' : 'ok')
 </script>
 
 <template>

@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import type { CodexUsage, UsageSummary } from '../api'
 import { ZButton, ZSegmented } from '@codex-proxy/ui'
-import { Sparkles } from '@lucide/vue'
+import { RefreshCw, Sparkles } from '@lucide/vue'
 import { computed, ref } from 'vue'
 import { api } from '../api'
-import { ago, compact, dateTime, percent, shortDate, unitNote, windowName } from '../format'
+import { compact, dateTime, percent, shortDate, unitNote, windowName } from '../format'
 import { featureLabel, isWork, slotColour, slotOf, surfaceLabel } from '../surfaces'
 import DailyChart from './DailyChart.vue'
 import ShareBars from './ShareBars.vue'
@@ -14,10 +14,15 @@ const props = defineProps<{ accountId: string, summary: UsageSummary | null, blo
 const emit = defineEmits<{ checked: [summary: UsageSummary] }>()
 
 const days = ref('7')
-const ranges = [{ label: '7 天', value: '7' }, { label: '14 天', value: '14' }, { label: '30 天', value: '30' }]
+const ranges = [
+  { label: '7 天', value: '7' },
+  { label: '14 天', value: '14' },
+  { label: '30 天', value: '30' },
+]
 const usage = ref<CodexUsage | null>(null)
 const loading = ref(false)
 const error = ref('')
+const hoveredTokenIndex = ref<number | null>(null)
 
 async function load() {
   loading.value = true
@@ -43,7 +48,6 @@ const partName: Record<string, string> = { limits: '额度窗口', tokens: '每�
 const tokenDaily = computed(() => usage.value?.tokens?.daily ?? [])
 const tokenMax = computed(() => Math.max(0, ...tokenDaily.value.map(d => d.tokens)))
 const tokenTotal = computed(() => tokenDaily.value.reduce((s, d) => s + d.tokens, 0))
-const hoveredTokenIndex = ref<number | null>(null)
 const activeTokenIndex = computed(() => {
   if (hoveredTokenIndex.value !== null && tokenDaily.value[hoveredTokenIndex.value])
     return hoveredTokenIndex.value
@@ -53,7 +57,9 @@ const activeTokenDay = computed(() =>
   activeTokenIndex.value !== null ? tokenDaily.value[activeTokenIndex.value] ?? null : null,
 )
 
-const surfaceColour = (k: string) => slotColour(slotOf(k))
+function surfaceColour(key: string): string {
+  return slotColour(slotOf(key))
+}
 </script>
 
 <template>
@@ -61,21 +67,30 @@ const surfaceColour = (k: string) => slotColour(slotOf(k))
     <div class="detail-card-head">
       <div class="card-title-group">
         <h3 id="usage-title" class="card-title">
-          ChatGPT 官方用量
+          官方用量
         </h3>
         <span v-if="usage" class="muted">查询于 {{ dateTime(usage.checked_at_ms) }}</span>
-        <span v-else-if="summary" class="muted">上次查询 {{ ago(summary.checked_at_ms) }}（最近 {{ summary.days }} 天）</span>
+        <span v-else-if="summary" class="muted">上次列表查询：{{ dateTime(summary.checked_at_ms) }}（近 {{ summary.days }} 天）</span>
       </div>
       <div class="card-actions">
-        <ZSegmented v-model="days" :options="ranges" size="small" aria-label="时间范围" :disabled="loading" />
-        <ZButton type="primary" size="small" :loading="loading" :disabled="!!blocked" :title="blocked ?? undefined" @click="load">
-          <Sparkles :size="13" aria-hidden="true" /> 查询
+        <ZSegmented v-model="days" :options="ranges" size="small" aria-label="天数" />
+        <ZButton
+          type="primary"
+          size="small"
+          :loading="loading"
+          :disabled="!!blocked"
+          :title="blocked ?? (usage ? '重新读取官方用量' : '读取 ChatGPT 官方用量')"
+          @click="load"
+        >
+          <RefreshCw v-if="usage" :size="13" aria-hidden="true" />
+          <Sparkles v-else :size="13" aria-hidden="true" />
+          {{ usage ? '刷新' : '查询用量' }}
         </ZButton>
       </div>
     </div>
 
     <p class="muted note">
-      经账号在 CPR 绑定的代理读 ChatGPT 自己的用量统计，只发 GET、不消耗额度，点了才查。ChatGPT 按请求方的身份记使用位置；CPR 以 Codex 的身份转发，所以记在 Work 下的用量一定不是经 CPR 用的。
+      经账号绑定的代理读取 ChatGPT 官方用量，不消耗额度，点了才查。
     </p>
 
     <p v-if="blocked" class="banner banner-warn">
@@ -84,23 +99,17 @@ const surfaceColour = (k: string) => slotColour(slotOf(k))
     <p v-if="error" class="banner banner-error" role="alert">
       {{ error }}
     </p>
-    <p v-else-if="!usage && summary?.error" class="banner banner-error">
-      上次查询失败：{{ summary.error.message }}
-    </p>
 
     <template v-if="usage">
-      <div v-if="work" class="work-callout" :data-used="work.total > 0">
-        <template v-if="work.total > 0">
-          <strong>最近 {{ usage.days }} 天 Work 有用量：占 {{ percent(work.share, work.share < 0.1 ? 1 : 0) }}</strong>
-          <span class="text-cp-text-secondary">
-            {{ work.days_with_use }} 天有用量，最近一次 {{ work.last_day ? shortDate(work.last_day) : '—' }}
-            · {{ work.surfaces.map(s => `${surfaceLabel(s.key)} ${compact(s.value)}`).join('、') }}
-          </span>
-        </template>
-        <strong v-else>最近 {{ usage.days }} 天 Work 没有用量</strong>
-      </div>
-      <p v-else class="banner banner-warn">
-        用量明细没读到，判断不了 Work 有没有用量
+      <p v-if="work && work.total > 0" class="work-inline-note">
+        <i class="swatch" style="background: var(--series-6)" aria-hidden="true" />
+        <span>
+          Work 位置明细：{{ work.surfaces.map(s => `${surfaceLabel(s.key)} ${compact(s.value)}`).join('、') || '—' }}
+          · 最近一次 {{ work.last_day ? shortDate(work.last_day) : '—' }}
+        </span>
+      </p>
+      <p v-else-if="!work" class="banner banner-warn">
+        用量明细未读到，判断不了 Work 有没有用量
       </p>
 
       <div v-if="usage.limits?.windows.length" class="meters">
@@ -180,7 +189,7 @@ const surfaceColour = (k: string) => slotColour(slotOf(k))
 
       <ul v-if="problems.length" class="problems">
         <li v-for="[part, msg] in problems" :key="part">
-          {{ partName[part] ?? part }}没读到：{{ msg }}
+          {{ partName[part] ?? part }}未读到：{{ msg }}
         </li>
       </ul>
     </template>

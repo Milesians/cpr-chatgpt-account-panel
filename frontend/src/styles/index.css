@@ -150,7 +150,7 @@ body {
   gap: 5px;
 }
 
-/* ─── Filter Chips (turnstate 风格分类计数芯片) ─── */
+/* ─── Filter Chips (分类计数筛选芯片) ─── */
 .filter-bar {
   display: flex;
   flex-wrap: wrap;
@@ -206,6 +206,32 @@ body {
   text-align: center;
 }
 
+/* ─── 静态数字展示 (预览统计) ─── */
+.preview-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 12px;
+  border: 1px solid var(--cp-color-border-secondary);
+  border-radius: var(--cp-radius-md);
+  background: var(--cp-color-fill-quaternary);
+  font-size: var(--cp-font-size-xs);
+  color: var(--cp-color-text-secondary);
+}
+
+.preview-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.preview-stat strong {
+  color: var(--cp-color-text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
 .state-dot {
   width: 8px;
   height: 8px;
@@ -233,7 +259,7 @@ body {
   background: var(--series-other);
 }
 
-/* ─── Monitor List & Grid Rows (turnstate 风格) ─── */
+/* ─── Monitor List & Grid Rows ─── */
 .monitor-list {
   border: 1px solid var(--cp-color-border-secondary);
   border-radius: var(--cp-radius-lg);
@@ -261,7 +287,7 @@ body {
     minmax(210px, 1.15fr)
     minmax(240px, 1.35fr)
     minmax(150px, 0.9fr)
-    136px;
+    minmax(180px, auto);
   align-items: center;
   gap: 14px;
   padding: 12px 16px;
@@ -344,7 +370,6 @@ body {
   border-radius: 4px;
   background: var(--cp-color-fill-tertiary);
   color: var(--cp-color-text-secondary);
-  text-transform: uppercase;
   font-size: 10px;
   font-weight: 600;
 }
@@ -570,7 +595,7 @@ body {
   align-items: center;
 }
 
-/* ─── 详情页顶部判定面板 (verdict-panel) 与摘要小块 (rate-tiles) ─── */
+/* ─── 详情页顶部身份面板 (verdict-panel) 与摘要小块 (rate-tiles) ─── */
 .detail-page {
   display: flex;
   flex-direction: column;
@@ -591,25 +616,10 @@ body {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 20px;
+  padding: 16px 20px;
   border: 1px solid var(--cp-color-border-secondary);
   border-radius: var(--cp-radius-lg);
   background: var(--cp-color-bg-container);
-}
-
-.verdict-panel[data-tone='work'] {
-  border-color: color-mix(in srgb, var(--series-6) 45%, var(--cp-color-border-secondary));
-  background: color-mix(in srgb, var(--series-6) 6%, var(--cp-color-bg-container));
-}
-
-.verdict-panel[data-tone='bad'] {
-  border-color: color-mix(in srgb, var(--tone-bad) 45%, var(--cp-color-border-secondary));
-  background: color-mix(in srgb, var(--tone-bad) 6%, var(--cp-color-bg-container));
-}
-
-.verdict-panel[data-tone='warn'] {
-  border-color: color-mix(in srgb, var(--tone-warn) 45%, var(--cp-color-border-secondary));
-  background: color-mix(in srgb, var(--tone-warn) 6%, var(--cp-color-bg-container));
 }
 
 .rate-tiles {
@@ -650,7 +660,7 @@ body {
   color: var(--cp-color-text-tertiary);
 }
 
-/* ─── 详情分段卡片 (detail-card) ─── */
+/* ─── 详情卡片 (detail-card) ─── */
 .detail-card {
   display: flex;
   flex-direction: column;
@@ -691,25 +701,14 @@ body {
   gap: 8px;
 }
 
-.work-callout {
+.work-inline-note {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 13px 16px;
-  border-radius: var(--cp-radius-md);
-  font-size: 13px;
-  border: 1px solid var(--cp-color-border-secondary);
-  background: var(--cp-color-fill-quaternary);
-}
-
-.work-callout[data-used='true'] {
-  border-color: color-mix(in srgb, var(--series-6) 35%, var(--cp-color-border-secondary));
-  background: color-mix(in srgb, var(--series-6) 9%, var(--cp-color-bg-container));
-  box-shadow: inset 4px 0 0 var(--series-6);
-}
-
-.work-callout strong {
-  font-size: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  font-size: var(--cp-font-size-xs);
+  color: var(--cp-color-text-secondary);
 }
 
 .problems {
@@ -719,7 +718,7 @@ body {
   color: var(--cp-color-text-secondary);
 }
 
-/* ─── TrendChart / DailyChart 交互走势图 (turnstate 风格) ─── */
+/* ─── TrendChart / DailyChart 交互走势图 ─── */
 .trend-chart {
   display: flex;
   flex-direction: column;
@@ -884,7 +883,7 @@ body {
   font-weight: 500;
 }
 
-/* ─── 订阅键值网格与卡片化列表行 (Billing / Devices / Login) ─── */
+/* ─── 订阅键值网格与列表行 (Billing / Devices / Import) ─── */
 .facts-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -917,6 +916,16 @@ body {
   gap: 8px;
 }
 
+.card-head {
+  display: grid;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 14px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--cp-color-text-tertiary);
+}
+
 .card-row {
   display: grid;
   align-items: center;
@@ -928,19 +937,23 @@ body {
   font-size: 13px;
 }
 
+.card-head.billing-head,
 .card-row.billing-row {
-  grid-template-columns: 110px 110px 110px minmax(90px, 1fr) minmax(220px, auto);
+  grid-template-columns: 110px 110px 110px minmax(110px, 1fr) auto;
 }
 
+.card-head.device-head,
 .card-row.device-row {
   grid-template-columns: minmax(180px, 1.4fr) minmax(110px, 1fr) 130px minmax(110px, 1fr) auto;
 }
 
-.card-row.login-account-row {
-  grid-template-columns: minmax(180px, 1.4fr) 90px 110px minmax(140px, 1fr) minmax(150px, 1.2fr) auto;
+.card-head.import-preview-head,
+.card-row.import-preview-row {
+  grid-template-columns: 56px minmax(160px, 1.4fr) 80px 80px minmax(130px, 1fr);
 }
 
-.card-row.import-preview-row {
+.card-head.import-preview-head.has-progress,
+.card-row.import-preview-row.has-progress {
   grid-template-columns: 56px minmax(160px, 1.3fr) 80px 80px minmax(130px, 1fr) minmax(160px, 1.2fr);
 }
 
@@ -961,17 +974,6 @@ body {
   align-items: center;
   gap: 6px;
   justify-content: flex-end;
-}
-
-.invoice-url {
-  width: 210px;
-  max-width: 100%;
-  padding: 4px 8px;
-  border: 1px solid var(--cp-color-border-secondary);
-  border-radius: var(--cp-radius-sm);
-  background: var(--cp-color-bg-container);
-  color: var(--cp-color-text-secondary);
-  font: 11px var(--cp-font-mono, ui-monospace, monospace);
 }
 
 .device-name {
@@ -1029,6 +1031,21 @@ body {
   resize: vertical;
 }
 
+.text-link {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--series-1);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.text-link:hover {
+  color: var(--series-6);
+}
+
 .sub-panel {
   display: flex;
   flex-direction: column;
@@ -1051,13 +1068,19 @@ body {
 
 /* ─── 响应式布局（平板 & 手机 390px） ─── */
 @media (max-width: 1040px) {
-  .monitor-head {
+  .monitor-head,
+  .card-head {
     display: none;
   }
 
   .monitor-row {
     grid-template-columns: 24px minmax(0, 1fr) auto;
     gap: 10px 12px;
+  }
+
+  .monitor-row > .row-col-actions {
+    grid-column: 3;
+    grid-row: 1;
   }
 
   .monitor-row > .row-col-quota,
@@ -1072,19 +1095,23 @@ body {
 
   .card-row.billing-row,
   .card-row.device-row,
-  .card-row.login-account-row,
-  .card-row.import-preview-row {
+  .card-row.import-preview-row,
+  .card-row.import-preview-row.has-progress {
     grid-template-columns: 1fr;
     gap: 8px;
   }
 
-  .invoice-box {
-    justify-content: flex-start;
+  .cell-item[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 2px;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--cp-color-text-tertiary);
   }
 
-  .invoice-url {
-    flex: 1;
-    width: auto;
+  .invoice-box {
+    justify-content: flex-start;
   }
 }
 

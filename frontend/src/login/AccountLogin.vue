@@ -4,11 +4,12 @@ import type { AccountLoginStatus } from './helpers'
 import { ZButton, ZTag } from '@codex-proxy/ui'
 import { Check, Copy, KeyRound, Link2, Lock, Trash2 } from '@lucide/vue'
 import { computed, onMounted, ref, watch } from 'vue'
-import { dateTime } from '../format'
+import { credentialStateLabel, dateTime, formatPlanName } from '../format'
 import { loginApi } from './client'
-import { errorCodeLabel, needsManualOAuth } from './helpers'
+import { formatLoginError, needsManualOAuth, resolveLoginMainAction } from './helpers'
 
 const props = defineProps<{ accountId: string }>()
+const emit = defineEmits<{ updated: [account: AccountLoginStatus] }>()
 
 const status = ref<AccountLoginStatus | null>(null)
 const loadingStatus = ref(false)
@@ -34,10 +35,30 @@ const errorCode = ref('')
 const successMsg = ref('')
 
 const blockedByDisabled = computed(() => status.value !== null && !status.value.enabled)
-const canQuickRelogin = computed(() => {
+const mainAction = computed(() => resolveLoginMainAction({
+  enabled: status.value === null ? true : status.value.enabled,
+  hasPassword: Boolean(status.value?.hasPassword),
+  inputPassword: password.value,
+}))
+
+const saveOnlyTitle = computed(() => {
+  if (!password.value && !totp.value.trim())
+    return '请先输入要保存的密码或 2FA 密钥'
+  return undefined
+})
+
+const manualToggleTitle = computed(() => {
   if (blockedByDisabled.value)
-    return false
-  return Boolean(password.value.trim() || status.value?.hasPassword)
+    return '账号在 CPR 里已停用，无法发起登录'
+  return undefined
+})
+
+const submitCallbackTitle = computed(() => {
+  if (blockedByDisabled.value)
+    return '账号在 CPR 里已停用，无法发起登录'
+  if (!callbackUrl.value.trim())
+    return '请先粘贴浏览器跳转后的回调链接'
+  return undefined
 })
 
 async function loadStatus() {
@@ -85,7 +106,9 @@ async function handleRunLogin() {
     status.value = r.account
     password.value = ''
     totp.value = ''
-    successMsg.value = `登录成功，新令牌已写回 CPR（套餐：${r.planType || 'plus'}，到期：${dateTime(r.expiresAtMs)}）`
+    const planLabel = formatPlanName(r.planType) || 'Plus'
+    successMsg.value = `登录成功，新令牌已写回 CPR（套餐：${planLabel}，到期：${dateTime(r.expiresAtMs)}）`
+    emit('updated', r.account)
   }
   catch (e) {
     const err = e as ApiError
@@ -122,7 +145,8 @@ async function handleSaveCredentials() {
     status.value = r.account
     password.value = ''
     totp.value = ''
-    successMsg.value = '凭据已保存到私有状态'
+    successMsg.value = '已保存密码与 2FA'
+    emit('updated', r.account)
   }
   catch (e) {
     const err = e as ApiError
@@ -147,6 +171,7 @@ async function handleClearCredentials() {
     })
     status.value = r.account
     successMsg.value = '已清除该账号保存的密码与 2FA 密钥'
+    emit('updated', r.account)
   }
   catch (e) {
     const err = e as ApiError
@@ -193,11 +218,13 @@ async function handleCompleteOAuth() {
       accountId: props.accountId,
       callbackUrl: callbackUrl.value.trim(),
     })
-    if (r.account)
+    if (r.account) {
       status.value = r.account
+      emit('updated', r.account)
+    }
     callbackUrl.value = ''
     authorizeUrl.value = ''
-    successMsg.value = '手动 OAuth 授权换码成功，新令牌已写回 CPR'
+    successMsg.value = '手动登录成功，已写回 CPR'
   }
   catch (e) {
     const err = e as ApiError
@@ -243,9 +270,12 @@ onMounted(loadStatus)
     <div class="detail-card-head">
       <div class="card-title-group">
         <h3 id="account-login-title" class="card-title">
-          重新登录与凭据管理
+          重新登录
         </h3>
         <template v-if="status">
+          <ZTag size="small" :type="status.credentialState === 'ready' ? 'success' : 'warning'">
+            {{ credentialStateLabel(status.credentialState) }}
+          </ZTag>
           <ZTag size="small" :type="status.hasPassword ? 'success' : 'default'">
             {{ status.hasPassword ? '已保存密码' : '未存密码' }}
           </ZTag>
@@ -260,22 +290,13 @@ onMounted(loadStatus)
 
       <div class="card-actions">
         <ZButton
-          type="primary"
-          size="small"
-          :loading="runningLogin"
-          :disabled="!canQuickRelogin"
-          @click="handleRunLogin"
-        >
-          <KeyRound :size="13" aria-hidden="true" />
-          {{ status?.hasPassword && !password ? '用已存凭据重新登录' : '登录并写回 CPR' }}
-        </ZButton>
-        <ZButton
           size="small"
           :disabled="blockedByDisabled"
+          :title="manualToggleTitle"
           @click="showManualOAuth = !showManualOAuth"
         >
           <Link2 :size="13" aria-hidden="true" />
-          {{ showManualOAuth ? '收起手动授权' : '手动 OAuth 链接兜底' }}
+          {{ showManualOAuth ? '收起手动登录' : '浏览器手动登录' }}
         </ZButton>
       </div>
     </div>
@@ -284,10 +305,10 @@ onMounted(loadStatus)
       账号在 CPR 里已停用，停用的账号不能经它的绑定代理发起登录请求。
     </p>
     <p v-if="errorMsg" class="banner banner-error" role="alert">
-      <strong v-if="errorCode">[{{ errorCodeLabel(errorCode) }}] </strong>{{ errorMsg }}
+      {{ formatLoginError(errorCode, errorMsg) }}
     </p>
     <p v-else-if="status?.lastError" class="banner banner-warn">
-      上次登录失败（{{ errorCodeLabel(status.lastError.code) }} · {{ dateTime(status.lastError.atMs) }}）：{{ status.lastError.message }}
+      上次登录失败（{{ dateTime(status.lastError.atMs) }}）：{{ formatLoginError(status.lastError.code, status.lastError.message) }}
     </p>
     <p v-if="successMsg" class="banner banner-ok" role="status">
       {{ successMsg }}
@@ -338,30 +359,49 @@ onMounted(loadStatus)
     </div>
 
     <div class="flex flex-wrap items-center justify-between gap-3 text-xs">
-      <label class="inline-flex cursor-pointer items-center gap-1.5 text-cp-text-secondary">
-        <input
-          v-model="saveCredentials"
-          type="checkbox"
+      <div class="flex flex-wrap items-center gap-3">
+        <label class="inline-flex cursor-pointer items-center gap-1.5 text-cp-text-secondary">
+          <input
+            v-model="saveCredentials"
+            type="checkbox"
+          >
+          <span>保存密码与 2FA</span>
+        </label>
+        <button
+          type="button"
+          class="text-link"
+          @click="showAdvanced = !showAdvanced"
         >
-        <span>
-          登录时保存新输入的密码与 2FA
-        </span>
-      </label>
-      <div class="flex flex-wrap gap-2">
-        <ZButton size="small" @click="showAdvanced = !showAdvanced">
           {{ showAdvanced ? '隐藏工作区选项' : '指定工作区 ID' }}
+        </button>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-2">
+        <ZButton
+          type="primary"
+          size="small"
+          :loading="runningLogin"
+          :disabled="mainAction.disabled"
+          :title="mainAction.title"
+          @click="handleRunLogin"
+        >
+          <KeyRound :size="13" aria-hidden="true" />
+          {{ mainAction.label }}
         </ZButton>
         <ZButton
           size="small"
           :loading="savingCreds"
           :disabled="!password && !totp.trim()"
+          :title="saveOnlyTitle"
           @click="handleSaveCredentials"
         >
-          <Lock :size="13" aria-hidden="true" /> 仅保存凭据
+          <Lock :size="13" aria-hidden="true" /> 仅保存
         </ZButton>
         <ZButton
           v-if="status?.hasPassword || status?.hasTotp"
           size="small"
+          type="danger"
+          text
           :loading="savingCreds"
           @click="handleClearCredentials"
         >
@@ -372,18 +412,19 @@ onMounted(loadStatus)
 
     <div v-if="showManualOAuth" class="sub-panel">
       <div class="detail-card-head">
-        <strong class="text-xs text-cp-text">手动 OAuth 授权链接兜底（遇到 Cloudflare 验证或邮箱验证码时使用）</strong>
+        <strong class="text-xs text-cp-text">浏览器手动登录（遇到 Cloudflare 验证或邮箱验证码时使用）</strong>
         <ZButton
           size="small"
           :loading="startingOAuth"
           :disabled="blockedByDisabled"
+          :title="manualToggleTitle"
           @click="handleStartOAuth"
         >
           {{ authorizeUrl ? '重新生成授权链接' : '生成授权链接' }}
         </ZButton>
       </div>
       <p class="muted note">
-        在您自己的浏览器中打开下方授权链接完成登录，浏览器跳转到 <code>http://localhost:1455/auth/callback?code=...</code> 后，复制完整地址贴回下方即可经当前账号的代理换取令牌并写回 CPR。
+        在您自己的浏览器中打开下方授权链接完成登录，浏览器跳转到 <code>http://localhost:1455/auth/callback?code=...</code> 后，复制完整地址贴回下方即可经当前账号的代理写回 CPR。
       </p>
       <div v-if="authorizeUrl" class="inline-copy-row">
         <input
@@ -396,7 +437,7 @@ onMounted(loadStatus)
         <ZButton size="small" @click="copyAuthorizeUrl">
           <Check v-if="copiedUrl" :size="13" aria-hidden="true" />
           <Copy v-else :size="13" aria-hidden="true" />
-          {{ copiedUrl ? '已复制' : '复制链接' }}
+          {{ copiedUrl ? '已复制' : '复制授权链接' }}
         </ZButton>
       </div>
       <div class="inline-copy-row">
@@ -412,9 +453,10 @@ onMounted(loadStatus)
           size="small"
           :loading="completingOAuth"
           :disabled="blockedByDisabled || !callbackUrl.trim()"
+          :title="submitCallbackTitle"
           @click="handleCompleteOAuth"
         >
-          完成换码并写回
+          提交回调链接
         </ZButton>
       </div>
     </div>

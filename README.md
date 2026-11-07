@@ -34,7 +34,7 @@
 - `/backend-api/subscriptions?account_id=`：套餐、有效状态、到期、自动续费；付款逾期时读 `became_delinquent_timestamp` 和 `grace_period_end_timestamp`（RFC 3339 或 Unix 秒，别的格式只丢那一项）
 - `/backend-api/payments/transaction-history?account_id=&limit=20`：账单分页。第一页最新一笔是扣款失败类（`failed`、`past_due`、`unpaid`…）时顺带查一次订阅，显示宽限期
 - 查第一页时把最新一笔（日期、金额、状态、套餐，不含发票链接）记在插件私有状态 `payments` 里，列表显示“最近支付”
-- 发票只给 HTTPS 的 `invoice.stripe.com/i/` 链接。插件页面在 CPR 的隔离 iframe 里（`sandbox="allow-scripts"`），不能开新标签，所以页面给出链接让人复制
+- 发票只给 HTTPS 的 `invoice.stripe.com/i/` 链接。插件页面在 CPR 的隔离 iframe 里（`sandbox="allow-scripts"`），不能开新标签，所以页面提供“复制发票链接”按钮让人复制
 
 ## 登录设备
 
@@ -44,32 +44,33 @@
 - CPR 令牌所在的会话（`is_current_device`，或令牌 claims 里的 `session_id`）不能单独登出
 - **登出其他设备**：只有唯一认出了 CPR 的会话时才能做；每登出一台前都重新核对列表，出现新设备或 CPR 的会话不在了就停
 - **登出所有设备**：连 CPR 的会话一起登出，放在最后（请求用的就是它的令牌），期间新登录的设备也登出；之后 CPR 里这个账号的令牌失效，要重新登录写回 CPR。没认出 CPR 的会话、令牌中途失效的报 `cpr_voided_early`
-- 页面点之前在应用内确认一次；中途停下时错误里说明已经登出了几台
+- 单台“登出”和“登出其他设备”直接执行，只有“登出所有设备”点之前在应用内确认一次；中途停下时错误里说明已经登出了几台
 
 ## 页面
 
-- **列表**：每个 OpenAI OAuth 账号一行：账号（邮箱、套餐、个人/Team、查不了的原因）、CPR 自己记下的额度（`host.data.quota.get`，不访问上游）、最近一次官方用量（各位置占比条、Work 占比）、最近支付。Work 有用量的排最前，其次周额度超过 90% 的、没查过或查失败的。可按个人/Team、“Work 有用量”“扣款异常”筛选、搜索
-- **查询全部用量 / 查询全部账单**：一个接一个查（用量查最近 7 天，账单查第一页），可以中途停；跳过现在查不了的账号
-- **账号详情**：官方用量（7/14/30 天，额度窗口、Work 提示、每天按位置的堆叠图、位置/发起方式/模型占比、每日 Token）、订阅与账单、登录设备
+- **列表**：每个 OpenAI OAuth 账号一行：账号（邮箱、套餐与类型、无法查询的原因）、CPR 额度（`host.data.quota.get`，不访问上游）、最近一次官方用量（各位置占比条、Work 占比）、最近支付。Work 有用量的排最前，其次周额度超过 90% 的、没查过或查失败的。可按个人/Team、“Work 有用量”“扣款异常”“周额度 >90%”“未查询”“无法查询”筛选、搜索。令牌过期或凭据异常的行在操作区直接提供“免输重登”（已存密码）或“去重新登录”（未存密码）
+- **查询全部用量 / 查询全部账单 / 批量免输重登**：一个接一个执行（用量查最近 7 天，账单查第一页，批量免输重登针对已选中有已存密码的启用账号），可以中途停；跳过现在无法执行的账号并说明原因
+- **账号详情**：单页上下依次展示官方用量（7/14/30 天，“查询用量”/“刷新”，额度窗口、Work 位置明细、每天按位置的堆叠图、位置/发起方式/模型占比、每日 Token）、订阅与账单（“查询订阅与账单”/“刷新”并行拉取）、重新登录（“免输重登”/“登录并写回 CPR”、“仅保存”、“清除已存凭据”、“浏览器手动登录”）、登录设备（“查询设备”/“刷新”）
 
 使用位置的颜色跟着位置走、不跟名次，浅色和深色都用 dataviz 校验脚本检查过（浅色下有 3 个颜色对底色不到 3:1，所以每处都有文字图例和数值）。
 
-## 登录与快速导入
+## 重新登录与导入账号
 
-- **凭据存储**：账号的密码与 2FA 密钥（Base32 或 `otpauth://totp/` 链接）以**明文**存在 CPR 数据库 `plugin_state_records` 表的 `login` 命名空间里（键为 CPR 账号 ID；粘贴待导入时暂存在 `email:<邮箱>:<kind>` 下）。密码与 2FA 绝不写入宿主日志 `host.log` 或错误信息，前端页面也绝不回显明文（只返回 `hasPassword` / `hasTotp` 显示“已保存密码 / 已保存 2FA”）。库里若有旧版加密字段（`passwordEnc` / `totpEnc`），反序列化时自然当作未保存密码（`None`）。
+- **凭据存储**：账号的密码与 2FA 密钥（Base32 或 `otpauth://totp/` 链接）以**明文**存在 CPR 数据库 `plugin_state_records` 表的 `login` 命名空间里（键为 CPR 账号 ID；粘贴待导入时暂存在 `email:<邮箱>:<kind>` 下）。密码与 2FA 绝不写入宿主日志 `host.log` 或错误信息，前端页面也绝不回显明文（只返回 `hasPassword` / `hasTotp` 显示“已保存密码 / 已保存 2FA”或“未存密码 / 未存 2FA”）。库里若有旧版加密字段（`passwordEnc` / `totpEnc`），反序列化时自然当作未保存密码（`None`）。
 - **已有账号重登**：经该账号在 CPR 绑定的出站代理（`host.http.account`）跑完 OpenAI OAuth PKCE 登录状态机（含 Sentinel PoW、TOTP 验证、Workspace 选择）并换取新令牌，经 `host.auth.save`（`Replace`）写回 CPR。
-- **新账号快速导入（复用借道账号代理）**：
-  1. 先经 CPR 管理接口 `GET /api/admin/accounts` 读取所选借道账号（carrier）绑定的 `outboundProxyId`；若借道账号未绑定出站代理则直接拒绝导入（不创建直连账号）。
-  2. 调 CPR 管理接口 `POST /api/admin/accounts/oauth/start`（不带 `accountId`，带 `outboundProxyId`，`name` 为邮箱），获取 CPR 生成的授权链接与 `flowId`。
-  3. 借道账号经 `host.http.account` 跑完登录步骤，截下回调地址 `callbackUrl` 后交给 `POST /api/admin/accounts/oauth/complete`，由 CPR 自己通过该代理换码并一步建好已绑定代理的新账号（套餐由 CPR 自己从令牌解析，不调 `host.auth.save Create`）。
-  4. 建号完成后核对新账号邮箱，将明文密码与 2FA 保存到新账号 ID 下，并用 `host.state.delete`（带 `expectedVersion`）删掉 `email:<邮箱>:<kind>` 暂存记录。
+- **导入账号（复用借道账号代理）**：
+  1. 粘贴文本后自动防抖预览（统计总行数、待新建、已在 CPR、跳过），点“导入 N 个”逐条执行。
+  2. 先经 CPR 管理接口 `GET /api/admin/accounts` 读取所选借道账号（carrier）绑定的 `outboundProxyId`；若借道账号未绑定出站代理则直接拒绝导入（不创建直连账号）。
+  3. 调 CPR 管理接口 `POST /api/admin/accounts/oauth/start`（不带 `accountId`，带 `outboundProxyId`，`name` 为邮箱），获取 CPR 生成的授权链接与 `flowId`。
+  4. 借道账号经 `host.http.account` 跑完登录步骤，截下回调地址 `callbackUrl` 后交给 `POST /api/admin/accounts/oauth/complete`，由 CPR 自己通过该代理换码并一步建好已绑定代理的新账号（套餐由 CPR 自己从令牌解析，不调 `host.auth.save Create`）。
+  5. 建号完成后核对新账号邮箱，将明文密码与 2FA 保存到新账号 ID 下，并用 `host.state.delete`（带 `expectedVersion`）删掉 `email:<邮箱>:<kind>` 暂存记录。
 
 ## 模块分工
 
 - **面板**（用量、账单、登录设备、列表、详情）：`backend/src/{chatgpt,usage,billing,devices,store,management,api,host}.rs`、`frontend/src/{App.vue,api.ts,format.ts,surfaces.ts,components/}`
-- **登录**（用登录凭据换令牌并写回 CPR、快速导入新账号）：`backend/src/{admin.rs,login/}`、`frontend/src/login/`，单独维护。和面板的接口：
+- **登录**（用登录凭据换令牌并写回 CPR、导入新账号）：`backend/src/{admin.rs,login/}`、`frontend/src/login/`，单独维护。和面板的接口：
   - 后端：`login::routes()` 返回本模块的管理路由（路径都以 `api/login/` 开头，`management` 合进注册），`api/login/` 开头的请求交给 `login::handle`；`login::Login` 是进程内状态，用 `Config` 建一次。错误用 `api::ApiError`，路由用 `api::route`
-  - 前端：`login/LoginPage.vue` 是顶部“登录与导入”页，`login/AccountLogin.vue` 放在账号详情页最下面（props `accountId`）。请求用 `api.ts` 的 `call`
+  - 前端：`login/LoginPage.vue` 是顶部“导入账号”页，`login/AccountLogin.vue` 放在账号详情页（props `accountId`）。请求用 `api.ts` 的 `call`
   - 设置项加在 `config::Config` 和 `plugin.json` 的 `configurationSchema`（普通设置 `cprAdminUrl`、`oauthRedirect`，敏感设置 `cprAdminApiKey` 进 `secretFields`）；私有状态的命名空间加在 `plugin.json` 的 `state`
   - 共用的：`chatgpt::supported` / `chatgpt::is_team`（个人号和 Team 按 CPR 给的套餐区分）、`host.rs` 的宿主回调封装
 

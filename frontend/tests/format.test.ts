@@ -3,20 +3,26 @@ import { test } from 'node:test'
 import {
   attention,
   billingTag,
+  credentialStateLabel,
   daysLeft,
+  formatPlanName,
+  formatPlanWithKind,
   hasHighWeeklyQuota,
   hasPaymentAnomaly,
+  isTeamPlan,
   isUnchecked,
   isUnqueryable,
   matchesAccountFilter,
   money,
+  needsCredentialRelogin,
   paymentIssue,
+  paymentText,
   rowAccentTone,
   shortDate,
   windowName,
 } from '../src/format.ts'
 
-test('payment issues', () => {
+test('payment issues and text', () => {
   assert.equal(paymentIssue('Past_Due'), 'failed')
   assert.equal(paymentIssue('open'), 'due')
   assert.equal(paymentIssue('paid'), null)
@@ -24,6 +30,56 @@ test('payment issues', () => {
   assert.equal(billingTag('failed'), 'danger')
   assert.equal(billingTag('pending'), 'warning')
   assert.equal(billingTag('refunded'), 'default')
+  assert.match(paymentText({
+    status: 'paid',
+    created_at_ms: Date.now() - 86400_000,
+    checked_at_ms: Date.now() - 3600_000,
+    amount: 2000,
+    currency: 'USD',
+    plan: 'plus',
+  }), /1 小时前查/)
+})
+
+test('plan formatting and kind labels', () => {
+  assert.equal(formatPlanName('plus'), 'Plus')
+  assert.equal(formatPlanName('PRO'), 'Pro')
+  assert.equal(formatPlanName('team'), 'Team')
+  assert.equal(formatPlanName('business'), 'Business')
+  assert.equal(formatPlanName('enterprise'), 'Enterprise')
+  assert.equal(formatPlanName('edu'), 'Edu')
+  assert.equal(formatPlanName('free'), 'Free')
+  assert.equal(formatPlanName('free_workspace'), 'Free Workspace')
+  assert.equal(formatPlanName('CUSTOM_PLAN'), 'Custom Plan')
+  assert.equal(formatPlanName('CustomTier'), 'CustomTier')
+
+  assert.equal(isTeamPlan('team'), true)
+  assert.equal(isTeamPlan('business'), true)
+  assert.equal(isTeamPlan('plus'), false)
+
+  assert.equal(formatPlanWithKind('team', 'team'), 'Team')
+  assert.equal(formatPlanWithKind('business', 'team'), 'Business')
+  assert.equal(formatPlanWithKind('plus', 'personal'), 'Plus · 个人')
+  assert.equal(formatPlanWithKind('pro', 'personal'), 'Pro · 个人')
+  assert.equal(formatPlanWithKind(null, 'personal'), '个人')
+})
+
+test('credential_state mapping', () => {
+  assert.equal(credentialStateLabel('ready'), '凭据有效')
+  assert.equal(credentialStateLabel('expired'), '已过期')
+  assert.equal(credentialStateLabel('banned'), '已封禁')
+  assert.equal(credentialStateLabel('invalid'), '凭据无效')
+  assert.equal(credentialStateLabel('missing'), '缺少凭据')
+  assert.equal(credentialStateLabel('unconfigured'), '未配置凭据')
+  assert.equal(credentialStateLabel('revoked'), '已吊销')
+  assert.equal(credentialStateLabel(''), '状态未知')
+  assert.equal(credentialStateLabel('other_state'), '状态异常')
+})
+
+test('needsCredentialRelogin check', () => {
+  assert.equal(needsCredentialRelogin({ credential_state: 'ready', blocker: null } as any), false)
+  assert.equal(needsCredentialRelogin({ credential_state: 'expired', blocker: null } as any), true)
+  assert.equal(needsCredentialRelogin({ credential_state: 'ready', blocker: { code: 'token_expired', message: 'x' } } as any), true)
+  assert.equal(needsCredentialRelogin({ credential_state: 'ready', blocker: { code: 'account_unavailable', message: 'x' } } as any), false)
 })
 
 test('money in the smallest unit', () => {
@@ -67,6 +123,11 @@ test('account filter classification and row accent tones', () => {
     usage: { ...baseUsage, work: { total: 0, share: 0, days_with_use: 0, surfaces: [] } },
     payment: { status: 'past_due', created_at_ms: 1, checked_at_ms: 1 },
   } as any
+  const usageErrorAcct = {
+    id: 'a_err',
+    usage: { ...baseUsage, error: { code: 'oauth_unauthorized', message: '查询失败' } },
+    payment: null,
+  } as any
   const quota90Acct = {
     id: 'a3',
     quota: { windows: [{ window_seconds: 604800, used_percent: 92 }] },
@@ -88,6 +149,8 @@ test('account filter classification and row accent tones', () => {
   assert.equal(matchesAccountFilter(failedAcct, 'payment'), true)
   assert.equal(rowAccentTone(failedAcct), 'bad')
 
+  assert.equal(rowAccentTone(usageErrorAcct), 'bad')
+
   assert.equal(hasHighWeeklyQuota(quota90Acct), true)
   assert.equal(isUnchecked(quota90Acct), true)
   assert.equal(matchesAccountFilter(quota90Acct, 'quota90'), true)
@@ -99,4 +162,3 @@ test('account filter classification and row accent tones', () => {
   assert.equal(matchesAccountFilter(blockedAcct, 'blocked'), true)
   assert.equal(rowAccentTone(blockedAcct), 'warn')
 })
-

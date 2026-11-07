@@ -27,5 +27,6 @@ test('a day sums by slot', () => {
 
 test('labels', () => {
   assert.equal(surfaceLabel('desktop_app'), '桌面版')
+  assert.equal(surfaceLabel('exec'), 'Codex Exec')
   assert.equal(surfaceLabel('new_thing'), 'new_thing')
 })

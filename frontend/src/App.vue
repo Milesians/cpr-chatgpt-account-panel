@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { Account } from './api'
+import type { AccountLoginStatus } from './login/helpers'
 import { ZButton, ZConfigProvider, ZSegmented } from '@codex-proxy/ui'
 import { zhHans } from '@codex-proxy/ui/locale'
 import { RefreshCw, UserRound } from '@lucide/vue'
@@ -8,14 +9,16 @@ import { api } from './api'
 import AccountDetail from './components/AccountDetail.vue'
 import AccountList from './components/AccountList.vue'
 import { dateTime, hasPaymentAnomaly, hasWork } from './format'
+import { loginApi } from './login/client'
 import LoginPage from './login/LoginPage.vue'
 
 const section = ref<'accounts' | 'login'>('accounts')
 const sections = [
   { label: '账号监控', value: 'accounts' },
-  { label: '登录与导入', value: 'login' },
+  { label: '导入账号', value: 'login' },
 ]
 const accounts = shallowRef<Account[] | null>(null)
+const loginAccounts = shallowRef<AccountLoginStatus[]>([])
 const checkedAt = ref(0)
 const opened = ref<string | null>(null)
 const loading = ref(false)
@@ -25,11 +28,24 @@ const current = computed(() => accounts.value?.find(a => a.id === opened.value) 
 const withWork = computed(() => accounts.value?.filter(a => hasWork(a.usage)).length ?? 0)
 const withPaymentAnomaly = computed(() => accounts.value?.filter(a => hasPaymentAnomaly(a)).length ?? 0)
 
+async function loadLoginOverview() {
+  try {
+    const r = await loginApi.overview()
+    loginAccounts.value = r.accounts
+  }
+  catch {
+    // 登录状态读取失败不阻塞主列表
+  }
+}
+
 async function load() {
   loading.value = true
   error.value = ''
   try {
-    const r = await api.accounts()
+    const [r] = await Promise.all([
+      api.accounts(),
+      loadLoginOverview(),
+    ])
     accounts.value = r.accounts
     checkedAt.value = r.checked_at_ms
   }
@@ -45,7 +61,17 @@ function patch(id: string, p: Partial<Account>) {
   accounts.value = accounts.value?.map(x => x.id === id ? { ...x, ...p } : x) ?? null
 }
 
-// 列表一直挂着（只是 v-show 隐藏），从详情或登录页返回时筛选、排序、选中和滚动位置都保留
+function patchLoginAccount(updated: AccountLoginStatus) {
+  const exists = loginAccounts.value.some(a => a.accountId === updated.accountId)
+  if (exists) {
+    loginAccounts.value = loginAccounts.value.map(a => a.accountId === updated.accountId ? updated : a)
+  }
+  else {
+    loginAccounts.value = [...loginAccounts.value, updated]
+  }
+}
+
+// 列表一直挂着（只是 v-show 隐藏），从详情或导入页返回时筛选、排序、选中和滚动位置都保留
 let listScroll = 0
 const app = () => document.querySelector<HTMLElement>('#app')
 
@@ -55,10 +81,19 @@ function saveListScroll() {
   }
 }
 
-function open(id: string) {
+function open(id: string, focusLogin = false) {
   saveListScroll()
   opened.value = id
-  nextTick(() => app()?.scrollTo({ top: 0 }))
+  nextTick(() => {
+    if (focusLogin) {
+      const el = document.querySelector<HTMLElement>('#account-login-section')
+      el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      el?.querySelector<HTMLInputElement>('input')?.focus()
+    }
+    else {
+      app()?.scrollTo({ top: 0 })
+    }
+  })
 }
 
 function back() {
@@ -106,7 +141,13 @@ onMounted(load)
         </div>
         <div class="flex flex-wrap items-center gap-2">
           <ZSegmented v-model="section" :options="sections" size="small" aria-label="页面切换" />
-          <ZButton size="small" :loading="loading" aria-label="刷新" @click="load">
+          <ZButton
+            size="small"
+            :loading="loading"
+            :title="loading ? '正在刷新账号列表' : undefined"
+            aria-label="刷新"
+            @click="load"
+          >
             <RefreshCw :size="14" aria-hidden="true" /> 刷新
           </ZButton>
         </div>
@@ -123,19 +164,25 @@ onMounted(load)
           :account="current"
           @back="back"
           @patch="patch"
+          @login-updated="a => { patchLoginAccount(a); load() }"
         />
         <div v-show="!current">
           <AccountList
             :accounts="accounts"
+            :login-accounts="loginAccounts"
             :loading="loading"
             @open="open"
             @patch="patch"
+            @relogged="a => { patchLoginAccount(a); load() }"
           />
         </div>
       </div>
 
       <div v-show="section === 'login'">
-        <LoginPage @accounts-changed="load" />
+        <LoginPage
+          :login-accounts="loginAccounts"
+          @accounts-changed="load"
+        />
       </div>
     </main>
   </ZConfigProvider>

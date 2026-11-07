@@ -1,8 +1,8 @@
 // Headless UI verification & screenshot generator for cpr-chatgpt-account-panel.
 // Renders the built frontend bundle against a mocked CPR host bridge across
 // light, dark, and 390px narrow viewports, verifies layout/DOM invariants,
-// and saves persistent screenshots for List, Detail (Usage & Billing),
-// Detail (Devices & Login), and Login & Import pages.
+// and saves persistent screenshots for List, Batch Relogin, Detail (Usage & Billing),
+// Detail (Devices & Login), and Import Account pages.
 
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
@@ -109,14 +109,14 @@ const mockAccounts = [
     blocker: null,
   },
   {
-    id: 'acc-fresh',
-    name: 'pro-unchecked',
-    email: 'fresh@example.com',
+    id: 'acc-expired-saved',
+    name: 'expired-with-saved-pw',
+    email: 'saved-pw@example.com',
     plan_type: 'pro',
     kind: 'personal',
     enabled: true,
-    credential_state: 'ready',
-    access_token_expires_at_ms: now + 4 * dayMs,
+    credential_state: 'expired',
+    access_token_expires_at_ms: now - 2 * dayMs,
     quota: {
       windows: [
         { window_seconds: 18000, used_percent: 5 },
@@ -125,7 +125,10 @@ const mockAccounts = [
     },
     usage: null,
     payment: null,
-    blocker: null,
+    blocker: {
+      code: 'token_expired',
+      message: '访问令牌已过期，需要重新登录',
+    },
   },
   {
     id: 'acc-expired',
@@ -141,7 +144,7 @@ const mockAccounts = [
     payment: null,
     blocker: {
       code: 'token_expired',
-      message: '访问令牌已过期，请先在 CPR 刷新账号',
+      message: '访问令牌已过期，请先重新登录',
     },
   },
 ]
@@ -231,7 +234,7 @@ const mockBilling = {
         amount: 15000,
         currency: 'USD',
         status: 'past_due',
-        plan: 'ChatGPT Team (5 seats)',
+        plan: 'CHATGPT TEAM (5 SEATS)',
         document_url: 'https://invoice.stripe.com/i/acct_mock/test_inv_001',
       },
       {
@@ -242,7 +245,7 @@ const mockBilling = {
         amount: 15000,
         currency: 'USD',
         status: 'paid',
-        plan: 'ChatGPT Team (5 seats)',
+        plan: 'CHATGPT TEAM (5 SEATS)',
         document_url: 'https://invoice.stripe.com/i/acct_mock/test_inv_000',
       },
     ],
@@ -327,6 +330,19 @@ const mockLoginAccounts = [
     pendingOauth: null,
   },
   {
+    accountId: 'acc-expired-saved',
+    name: 'expired-with-saved-pw',
+    email: 'saved-pw@example.com',
+    kind: 'personal',
+    enabled: true,
+    credentialState: 'expired',
+    hasPassword: true,
+    hasTotp: true,
+    lastLoginAtMs: now - 8 * dayMs,
+    lastError: null,
+    pendingOauth: null,
+  },
+  {
     accountId: 'acc-expired',
     name: 'expired-account',
     email: 'old@example.com',
@@ -337,8 +353,8 @@ const mockLoginAccounts = [
     hasTotp: false,
     lastLoginAtMs: null,
     lastError: {
-      code: 'cloudflare_blocked',
-      message: '遇到 Cloudflare 质询拦截，请使用手动 OAuth 授权链接兜底',
+      code: 'browser_challenge',
+      message: '遇到 Cloudflare 浏览器验证拦截，请使用浏览器手动登录',
       atMs: now - 1800_000,
     },
     pendingOauth: null,
@@ -346,38 +362,42 @@ const mockLoginAccounts = [
 ]
 
 const mockPastePreview = {
+  applied: false,
   lines: 3,
   created: 2,
   updated: 1,
   skipped: 0,
-  failed: 0,
+  existingInCpr: 1,
   items: [
     {
       line: 1,
       email: 'new-plus@acme.io',
       kind: 'personal',
+      hasPassword: true,
       hasTotp: true,
       action: 'create',
-      status: 'pending',
+      inCpr: false,
       message: '新个人账号，待执行 OAuth 登录建入 CPR',
     },
     {
       line: 2,
       email: 'new-team@acme.io',
       kind: 'team',
+      hasPassword: true,
       hasTotp: false,
       action: 'create',
-      status: 'pending',
+      inCpr: false,
       message: '新 Team 账号，待执行 OAuth 登录建入 CPR',
     },
     {
       line: 3,
       email: 'alpha@acme.io',
       kind: 'team',
+      hasPassword: true,
       hasTotp: true,
       action: 'update',
-      status: 'pending',
-      accountId: 'acc-work',
+      inCpr: true,
+      existingAccountId: 'acc-work',
       message: '已在 CPR (acc-work)，勾选更新后可覆盖重登',
     },
   ],
@@ -409,6 +429,7 @@ const bridgePayload = {
 const bridgeScript = `<script>
 const __MOCK__ = ${JSON.stringify(bridgePayload)};
 const __THEMES__ = ${JSON.stringify(themes)};
+window.__LOGIN_DELAY_MS__ = 0;
 window.__setHostTheme = (name) => {
   const root = document.documentElement;
   root.dataset.theme = name;
@@ -452,12 +473,18 @@ window.codexProxyPlugin = {
     if (fn === 'api/login/paste') return __reply(__MOCK__.pastePreview);
     if (fn === 'api/login/oauth/start') return __reply(__MOCK__.oauthStart);
     if (fn === 'api/login/run') {
+      if (window.__LOGIN_DELAY_MS__ > 0) {
+        await new Promise(r => setTimeout(r, window.__LOGIN_DELAY_MS__));
+      }
+      const acctId = payload?.accountId || 'acc-work';
+      const found = __MOCK__.loginOverview.accounts.find(a => a.accountId === acctId) || __MOCK__.loginOverview.accounts[0];
       return __reply({
-        accountId: payload?.accountId || 'acc-work',
-        email: 'alpha@acme.io',
-        planType: 'team',
+        ok: true,
+        accountId: acctId,
+        email: found.email,
+        planType: found.kind === 'team' ? 'team' : 'pro',
         expiresAtMs: Date.now() + 7 * 86400000,
-        account: __MOCK__.loginOverview.accounts[0],
+        account: { ...found, credentialState: 'ready' },
       });
     }
     return __reply({ error: { code: 'not_found', message: 'Unhandled mock route: ' + fn } }, 404);
@@ -581,6 +608,25 @@ try {
     return result.value
   }
 
+  async function assertNoClippedButtons(contextLabel) {
+    const check = await evaluate(`
+      const overflowX = document.documentElement.scrollWidth > window.innerWidth + 1;
+      const clipped = [];
+      for (const btn of document.querySelectorAll('button')) {
+        const style = getComputedStyle(btn);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        const r = btn.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        if (r.left < -1 || r.right > window.innerWidth + 1) {
+          clipped.push({ text: btn.textContent.trim(), left: Math.round(r.left), right: Math.round(r.right), vw: window.innerWidth });
+        }
+      }
+      return { overflowX, clipped };
+    `)
+    assert.equal(check.overflowX, false, `${contextLabel} 不能出现横向溢出`)
+    assert.deepEqual(check.clipped, [], `${contextLabel} 不能有被裁切的按钮: ${JSON.stringify(check.clipped)}`)
+  }
+
   async function capture(name, width, height, theme) {
     await setViewport(width, height, theme)
     const { data } = await cdp('Page.captureScreenshot', { format: 'png' }, sessionId)
@@ -597,24 +643,48 @@ try {
   const listStats = await evaluate(`
     const chips = [...document.querySelectorAll('.filter-chip')].map(el => el.textContent.replace(/\\s+/g, ' ').trim());
     const rows = document.querySelectorAll('.monitor-row').length;
-    const overflowX = document.documentElement.scrollWidth > window.innerWidth + 1;
+    const actionButtons = [...document.querySelectorAll('.row-col-actions button')].map(b => b.textContent.trim());
     const lightBg = getComputedStyle(document.querySelector('.monitor-list')).backgroundColor;
-    return { chips, rows, overflowX, lightBg };
+    return { chips, rows, actionButtons, lightBg };
   `)
   assert.equal(listStats.rows, 4, '列表应渲染 4 个账号监控行')
   assert.equal(listStats.chips.length, 6, '列表顶部应有 6 个分类计数筛选芯片')
-  assert.equal(listStats.overflowX, false, '桌面宽度下列表不能出现横向溢出')
+  assert.ok(listStats.chips.some(c => c.includes('无法查询')), '筛选芯片应显示「无法查询」')
+  assert.ok(listStats.actionButtons.includes('免输重登'), '令牌过期且有已存密码的账号行应显示「免输重登」')
+  assert.ok(listStats.actionButtons.includes('去重新登录'), '令牌过期且未存密码的账号行应显示「去重新登录」')
 
   await capture('01-list-light', 1440, 900, 'light')
   await capture('02-list-dark', 1440, 900, 'dark')
   const darkBg = await evaluate(`return getComputedStyle(document.querySelector('.monitor-list')).backgroundColor;`)
   assert.notEqual(darkBg, listStats.lightBg, '深色模式下列表背景色应切换为深色容器色')
-  await capture('03-list-390px', 390, 920, 'light')
+  await capture('03-list-390px', 390, 980, 'light')
+  await assertNoClippedButtons('390px 列表页')
 
-  const listMobileOverflow = await evaluate(`
-    return document.documentElement.scrollWidth > window.innerWidth + 1;
+  // ── 1b. 列表行内「免输重登」与批量免输重登进度截图 ──
+  await setViewport(1440, 900, 'light')
+  await evaluate(`
+    window.__LOGIN_DELAY_MS__ = 500;
+    const allCheckbox = document.querySelector('.monitor-toolbar input[type="checkbox"]');
+    allCheckbox.click();
+    await new Promise(r => setTimeout(r, 120));
+    const batchBtn = [...document.querySelectorAll('.selection-bar button')].find(b => b.textContent.includes('批量免输重登'));
+    batchBtn.click();
+    await new Promise(r => setTimeout(r, 150));
   `)
-  assert.equal(listMobileOverflow, false, '390px 手机宽度下列表不能出现横向溢出')
+  const batchProgressStats = await evaluate(`
+    const barText = document.querySelector('.selection-bar')?.textContent ?? '';
+    return {
+      hasReloginProgress: barText.includes('正在批量免输重登'),
+      hasSkippedReason: barText.includes('跳过') && barText.includes('未存密码'),
+    };
+  `)
+  assert.equal(batchProgressStats.hasReloginProgress, true, '批量重登时底部操作栏应显示进度')
+  assert.equal(batchProgressStats.hasSkippedReason, true, '批量重登时应说明跳过未存密码账号的原因')
+  await capture('13-list-relogin-batch-progress', 1440, 900, 'light')
+  await sleep(1600)
+  await evaluate(`
+    window.__LOGIN_DELAY_MS__ = 0;
+  `)
 
   // 验证筛选芯片点击与恢复
   await setViewport(1440, 900, 'light')
@@ -635,39 +705,47 @@ try {
     document.querySelector('.row-title-btn').click();
     await new Promise(r => setTimeout(r, 150));
     const buttons = [...document.querySelectorAll('button')];
-    buttons.find(b => b.textContent.trim() === '查询')?.click();
-    buttons.find(b => b.textContent.includes('查询账单'))?.click();
+    buttons.find(b => b.textContent.trim() === '查询用量')?.click();
+    buttons.find(b => b.textContent.includes('查询订阅与账单'))?.click();
     await new Promise(r => setTimeout(r, 250));
   `)
 
   const detailStats = await evaluate(`
+    const buttons = [...document.querySelectorAll('button')].map(b => b.textContent.trim());
     return {
       verdictVisible: Boolean(document.querySelector('.verdict-panel')),
+      segmentedCount: document.querySelectorAll('.detail-topbar .z-segmented').length,
       rateTiles: document.querySelectorAll('.rate-tile').length,
       trendCharts: document.querySelectorAll('.trend-chart').length,
       billingRows: document.querySelectorAll('.billing-row').length,
+      invoiceInputs: document.querySelectorAll('.invoice-url').length,
+      hasRefreshBtn: buttons.includes('刷新'),
     };
   `)
-  assert.equal(detailStats.verdictVisible, true, '详情页顶部应有 verdict-panel')
+  assert.equal(detailStats.verdictVisible, true, '详情页顶部应有身份头部')
+  assert.equal(detailStats.segmentedCount, 0, '详情页应去掉分段切换器')
   assert.equal(detailStats.rateTiles, 4, '详情页顶部应有 4 个核心指标块')
   assert.equal(detailStats.trendCharts, 2, '查询用量后应渲染每日位置走势图和每日 Token 走势图')
-  assert.equal(detailStats.billingRows, 2, '查询账单后应渲染 2 条卡片化账单记录')
+  assert.equal(detailStats.billingRows, 2, '查询订阅与账单后应渲染 2 条账单记录')
+  assert.equal(detailStats.invoiceInputs, 0, '账单行不应再包含只读网址输入框')
+  assert.equal(detailStats.hasRefreshBtn, true, '查询后按钮应变为「刷新」')
 
   await capture('04-detail-usage-billing-light', 1440, 1380, 'light')
   await capture('05-detail-usage-billing-dark', 1440, 1380, 'dark')
   await capture('06-detail-usage-billing-390px', 390, 1650, 'light')
+  await assertNoClippedButtons('390px 详情页（用量与账单）')
 
-  // ── 3. 详情页（登录设备 + 重新登录与凭据管理）验收与截图 ──
+  // ── 3. 详情页（重新登录 + 登录设备）验收与截图 ──
   await setViewport(1440, 1100, 'light')
   await evaluate(`
     const buttons = [...document.querySelectorAll('button')];
-    buttons.find(b => b.textContent.includes('查看设备'))?.click();
-    buttons.find(b => b.textContent.includes('手动 OAuth 链接兜底'))?.click();
+    buttons.find(b => b.textContent.includes('查询设备'))?.click();
+    buttons.find(b => b.textContent.includes('浏览器手动登录'))?.click();
     await new Promise(r => setTimeout(r, 200));
     const genBtn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('生成授权链接'));
     genBtn?.click();
     await new Promise(r => setTimeout(r, 200));
-    document.querySelector('#devices-title')?.scrollIntoView({ behavior: 'instant', block: 'start' });
+    document.querySelector('#account-login-section')?.scrollIntoView({ behavior: 'instant', block: 'start' });
     await new Promise(r => setTimeout(r, 150));
   `)
 
@@ -677,14 +755,15 @@ try {
       loginSection: Boolean(document.querySelector('#account-login-section')),
     };
   `)
-  assert.equal(deviceStats.deviceRows, 3, '点击查看设备后应渲染 3 台登录设备卡片行')
-  assert.equal(deviceStats.loginSection, true, '详情页应包含重新登录与凭据管理卡片')
+  assert.equal(deviceStats.deviceRows, 3, '点击查询设备后应渲染 3 台登录设备行')
+  assert.equal(deviceStats.loginSection, true, '详情页应包含重新登录卡片')
 
   await capture('07-detail-devices-login-light', 1440, 1100, 'light')
   await capture('08-detail-devices-login-dark', 1440, 1100, 'dark')
   await capture('09-detail-devices-login-390px', 390, 1380, 'light')
+  await assertNoClippedButtons('390px 详情页（重登与设备）')
 
-  // 验证登出所有设备后显示「一键重新登录」与「前往快速登录区」入口
+  // 验证登出所有设备后显示「免输重登」与「去重新登录」入口
   await setViewport(1440, 1000, 'light')
   const voidedBannerCheck = await evaluate(`
     const signOutAllBtn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('登出所有设备'));
@@ -696,41 +775,41 @@ try {
     const text = document.body.innerText;
     return {
       hasVoidedNotice: text.includes('需要重新登录写回 CPR'),
-      hasQuickReloginBtn: text.includes('一键重新登录') && text.includes('前往快速登录区'),
+      hasQuickReloginBtn: text.includes('免输重登') && text.includes('去重新登录'),
     };
   `)
   assert.equal(voidedBannerCheck.hasVoidedNotice, true, '登出所有设备后应提示需要重新登录写回 CPR')
-  assert.equal(voidedBannerCheck.hasQuickReloginBtn, true, '提示旁应直接提供一键重新登录与前往快速登录区入口')
+  assert.equal(voidedBannerCheck.hasQuickReloginBtn, true, '提示旁应直接提供免输重登与去重新登录入口')
 
-  // ── 4. 登录与快速导入页验收与截图 ──
+  // ── 4. 导入账号页验收与截图 ──
   await evaluate(`
-    const loginTab = [...document.querySelectorAll('[role="radio"], .z-segmented button, .z-segmented-item')].find(el => el.textContent.includes('登录与导入'));
+    const loginTab = [...document.querySelectorAll('[role="radio"], .z-segmented button, .z-segmented-item')].find(el => el.textContent.includes('导入账号'));
     loginTab.click();
     await new Promise(r => setTimeout(r, 200));
     const ta = document.querySelector('textarea');
     ta.value = 'new-plus@acme.io----pass123----JBSWY3DPEHPK3PXP----personal\\nnew-team@acme.io----pass456--------team\\nalpha@acme.io----pass789----JBSWY3DPEHPK3PXP----team';
     ta.dispatchEvent(new Event('input', { bubbles: true }));
-    await new Promise(r => setTimeout(r, 100));
-    const previewBtn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('解析并预览'));
-    previewBtn.click();
-    await new Promise(r => setTimeout(r, 200));
-    const expandBtn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('输入凭据登录'));
-    expandBtn?.click();
-    await new Promise(r => setTimeout(r, 150));
+    await new Promise(r => setTimeout(r, 550));
   `)
 
   const loginPageStats = await evaluate(`
+    const buttons = [...document.querySelectorAll('button')].map(b => b.textContent.trim());
     return {
       previewRows: document.querySelectorAll('.import-preview-row').length,
       existingRows: document.querySelectorAll('.login-account-row').length,
+      hasImportCountBtn: buttons.some(b => b.includes('导入 2 个')),
+      hasPreviewBtn: buttons.some(b => b.includes('解析并预览')),
     };
   `)
-  assert.equal(loginPageStats.previewRows, 3, '快速导入预览应渲染 3 行卡片')
-  assert.equal(loginPageStats.existingRows, 3, '已有账号快速重登列表应渲染 3 行卡片')
+  assert.equal(loginPageStats.previewRows, 3, '输入后防抖应自动渲染 3 行导入预览')
+  assert.equal(loginPageStats.existingRows, 0, '已有账号快速重新登录列表应已删除')
+  assert.equal(loginPageStats.hasImportCountBtn, true, '主按钮应显示「导入 2 个」')
+  assert.equal(loginPageStats.hasPreviewBtn, false, '「解析并预览」按钮应已删除')
 
-  await capture('10-login-import-light', 1440, 1280, 'light')
-  await capture('11-login-import-dark', 1440, 1280, 'dark')
-  await capture('12-login-import-390px', 390, 1580, 'light')
+  await capture('10-login-import-light', 1440, 1100, 'light')
+  await capture('11-login-import-dark', 1440, 1100, 'dark')
+  await capture('12-login-import-390px', 390, 1380, 'light')
+  await assertNoClippedButtons('390px 导入账号页')
 
   assert.deepEqual(errors, [], `页面运行不应有未捕获异常: ${errors.join('; ')}`)
   console.log('UI check passed. Generated screenshots:')
