@@ -149,6 +149,68 @@ export function hasWork(u: UsageSummary | null | undefined): boolean {
   return !!u?.work && u.work.total > 0
 }
 
+/** 周额度（10080 分钟 = 7 天）是否达到或超过 90%，同时参考 CPR 记下的额度和官方用量窗口 */
+export function hasHighWeeklyQuota(a: Account): boolean {
+  const fromUsage = a.usage?.windows.some(([m, p]) => m === 10080 && p >= 90) ?? false
+  const fromQuota = a.quota?.windows.some(w => w.window_seconds === 604800 && (w.used_percent ?? 0) >= 90) ?? false
+  return fromUsage || fromQuota
+}
+
+/** 最近一笔账单是否异常（扣款失败或待续费） */
+export function hasPaymentAnomaly(a: Account): boolean {
+  if (!a.payment)
+    return false
+  return paymentIssue(a.payment.status) !== null
+}
+
+/** 账号是否查不了（有 blocker 或官方用量查询报错） */
+export function isUnqueryable(a: Account): boolean {
+  return Boolean(a.blocker || a.usage?.error)
+}
+
+/** 账号是否未查询（既可查、又还没查过官方用量） */
+export function isUnchecked(a: Account): boolean {
+  return !a.blocker && !a.usage
+}
+
+export type AccountFilterKey = 'all' | 'work' | 'payment' | 'quota90' | 'unchecked' | 'blocked'
+
+export function matchesAccountFilter(a: Account, filter: AccountFilterKey): boolean {
+  switch (filter) {
+    case 'all':
+      return true
+    case 'work':
+      return hasWork(a.usage)
+    case 'payment':
+      return hasPaymentAnomaly(a)
+    case 'quota90':
+      return hasHighWeeklyQuota(a)
+    case 'unchecked':
+      return isUnchecked(a)
+    case 'blocked':
+      return isUnqueryable(a)
+  }
+}
+
+export function weeklyQuotaPercent(a: Account): number {
+  const fromUsage = a.usage?.windows.find(([m]) => m === 10080)?.[1]
+  if (fromUsage !== undefined)
+    return fromUsage
+  const fromQuota = a.quota?.windows.find(w => w.window_seconds === 604800)?.used_percent
+  return fromQuota ?? -1
+}
+
+export function rowAccentTone(a: Account): 'work' | 'bad' | 'warn' | 'none' {
+  if (hasPaymentAnomaly(a) && paymentIssue(a.payment?.status) === 'failed')
+    return 'bad'
+  if (hasWork(a.usage))
+    return 'work'
+  if (hasPaymentAnomaly(a) || hasHighWeeklyQuota(a) || isUnqueryable(a))
+    return 'warn'
+  return 'none'
+}
+
 export function title(a: Account): string {
   return a.email || a.name
 }
+

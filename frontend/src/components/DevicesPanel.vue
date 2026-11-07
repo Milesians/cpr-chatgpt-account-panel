@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import type { Device, Devices, SignOutTarget } from '../api'
-import { ZButton, ZDialog, ZTag } from '@codex-proxy/ui'
-import { computed, ref } from 'vue'
+import { ZButton, ZDialog, ZEmpty, ZTag } from '@codex-proxy/ui'
+import { KeyRound, Laptop, LogOut, MapPin, RefreshCw } from '@lucide/vue'
+import { computed, nextTick, ref } from 'vue'
 import { api } from '../api'
 import { dateTime } from '../format'
 import { loginApi } from '../login/client'
 
 const props = defineProps<{ accountId: string, blocked: string | null }>()
+const emit = defineEmits<{ focusLogin: [] }>()
 
 const devices = ref<Devices | null>(null)
 const loading = ref(false)
@@ -58,10 +60,13 @@ const cprVoided = ref(false)
 const relogging = ref(false)
 
 function scrollToLogin() {
-  const el = document.querySelector<HTMLElement>('#account-login-section')
-  el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-  const input = el?.querySelector<HTMLInputElement>('input')
-  input?.focus()
+  emit('focusLogin')
+  nextTick(() => {
+    const el = document.querySelector<HTMLElement>('#account-login-section')
+    el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    const input = el?.querySelector<HTMLInputElement>('input')
+    input?.focus()
+  })
 }
 
 async function quickRelogin() {
@@ -112,51 +117,133 @@ async function confirm() {
 <template>
   <section class="detail-card" aria-labelledby="devices-title">
     <div class="detail-card-head">
-      <h3 id="devices-title" class="card-title">登录设备</h3>
-      <ZButton type="primary" size="small" :loading="loading" :disabled="!!blocked" @click="load">{{ devices ? '刷新' : '查看设备' }}</ZButton>
-      <template v-if="devices">
-        <ZButton size="small" :disabled="!devices.in_use_known || !others.length || working" :title="devices.in_use_known ? undefined : '认不出 CPR 正在使用哪个登录，只能逐台登出'" @click="askOthers">登出其他设备</ZButton>
-        <ZButton size="small" type="danger" :disabled="!active.length || working" @click="askAll">登出所有设备</ZButton>
-        <span class="muted">查询于 {{ dateTime(devices.checked_at_ms) }}</span>
-      </template>
-    </div>
-    <p class="muted note">ChatGPT 设置页里这个登录的设备，点了才查。CPR 正在使用的登录不能单独登出；“登出所有设备”会连它一起登出，之后要重新登录。</p>
-    <p v-if="blocked" class="banner banner-warn">{{ blocked }}</p>
-    <p v-if="error" class="banner banner-error" role="alert">{{ error }}</p>
-    <div v-if="notice" class="banner banner-ok flex flex-wrap items-center justify-between gap-2" role="status">
-      <span>{{ notice }}</span>
-      <div v-if="cprVoided || notice.includes('重新登录')" class="inline-flex items-center gap-2">
-        <ZButton type="primary" size="small" :loading="relogging" @click="quickRelogin">一键重新登录</ZButton>
-        <ZButton size="small" @click="scrollToLogin">前往快速登录区</ZButton>
+      <div class="card-title-group">
+        <h3 id="devices-title" class="card-title">
+          登录设备
+        </h3>
+        <span v-if="devices" class="muted">
+          共 {{ devices.devices.length }} 台（在线 {{ active.length }} 台）· 查询于 {{ dateTime(devices.checked_at_ms) }}
+        </span>
+      </div>
+      <div class="card-actions">
+        <ZButton type="primary" size="small" :loading="loading" :disabled="!!blocked" @click="load">
+          <RefreshCw v-if="devices" :size="13" aria-hidden="true" />
+          <Laptop v-else :size="13" aria-hidden="true" />
+          {{ devices ? '刷新' : '查看设备' }}
+        </ZButton>
+        <template v-if="devices">
+          <ZButton
+            size="small"
+            :disabled="!devices.in_use_known || !others.length || working"
+            :title="devices.in_use_known ? undefined : '认不出 CPR 正在使用哪个登录，只能逐台登出'"
+            @click="askOthers"
+          >
+            登出其他设备
+          </ZButton>
+          <ZButton
+            size="small"
+            type="danger"
+            :disabled="!active.length || working"
+            @click="askAll"
+          >
+            <LogOut :size="13" aria-hidden="true" /> 登出所有设备
+          </ZButton>
+        </template>
       </div>
     </div>
+
+    <p class="muted note">
+      ChatGPT 设置页里这个登录的设备，点了才查。CPR 正在使用的登录不能单独登出；“登出所有设备”会连它一起登出，之后要重新登录。
+    </p>
+
+    <p v-if="blocked" class="banner banner-warn">
+      {{ blocked }}
+    </p>
+    <p v-if="error" class="banner banner-error" role="alert">
+      {{ error }}
+    </p>
+
+    <div
+      v-if="notice"
+      class="banner banner-ok flex flex-wrap items-center justify-between gap-2"
+      role="status"
+    >
+      <span>{{ notice }}</span>
+      <div
+        v-if="cprVoided || notice.includes('重新登录')"
+        class="inline-flex flex-wrap items-center gap-2"
+      >
+        <ZButton type="primary" size="small" :loading="relogging" @click="quickRelogin">
+          <KeyRound :size="13" aria-hidden="true" /> 一键重新登录
+        </ZButton>
+        <ZButton size="small" @click="scrollToLogin">
+          前往快速登录区
+        </ZButton>
+      </div>
+    </div>
+
     <template v-if="devices">
-      <p v-if="!devices.devices.length" class="muted">没有设备</p>
-      <table v-else class="data-table">
-        <thead><tr><th>设备</th><th>客户端</th><th>最近登录</th><th>地点</th><th /></tr></thead>
-        <tbody>
-          <tr v-for="d in devices.devices" :key="d.id">
-            <td>
-              <div class="device-name">
-                <span>{{ d.name || '未命名设备' }}</span>
-                <ZTag v-if="d.in_use" size="small" type="info">CPR 在用</ZTag>
-                <ZTag v-else-if="d.current" size="small">当前</ZTag>
-                <ZTag v-if="d.trusted" size="small">受信任</ZTag>
-                <ZTag v-if="d.signed_out" size="small">已登出</ZTag>
-              </div>
-              <span class="muted">{{ d.platform }}</span>
-            </td>
-            <td>{{ d.apps.join('、') || '—' }}</td>
-            <td>{{ dateTime(d.last_signed_in_ms) }}</td>
-            <td>{{ where(d) || '—' }}</td>
-            <td class="actions">
-              <ZButton v-if="!d.signed_out && !d.in_use" size="small" :disabled="working" @click="askDevice(d)">登出</ZButton>
-            </td>
-          </tr>
-        </tbody>
-      </table>
+      <ZEmpty v-if="!devices.devices.length" size="small" title="没有设备" />
+      <div v-else class="card-list" role="list" aria-label="登录设备列表">
+        <div
+          v-for="d in devices.devices"
+          :key="d.id"
+          role="listitem"
+          class="card-row device-row"
+          :data-in-use="d.in_use"
+        >
+          <div class="min-w-0">
+            <div class="device-name">
+              <span>{{ d.name || '未命名设备' }}</span>
+              <ZTag v-if="d.in_use" size="small" type="info">CPR 在用</ZTag>
+              <ZTag v-else-if="d.current" size="small">当前</ZTag>
+              <ZTag v-if="d.trusted" size="small" type="success">受信任</ZTag>
+              <ZTag v-if="d.signed_out" size="small">已登出</ZTag>
+            </div>
+            <div class="muted text-xs mt-0.5">{{ d.platform || '未知平台' }}</div>
+          </div>
+
+          <div>
+            <div class="font-medium text-cp-text">{{ d.apps.join('、') || '—' }}</div>
+            <div class="muted text-xs">客户端</div>
+          </div>
+
+          <div>
+            <div class="font-medium tabular-nums text-cp-text">{{ dateTime(d.last_signed_in_ms) }}</div>
+            <div class="muted text-xs">最近登录</div>
+          </div>
+
+          <div>
+            <div class="flex items-center gap-1 text-cp-text">
+              <MapPin v-if="where(d)" :size="12" class="muted" aria-hidden="true" />
+              <span>{{ where(d) || '—' }}</span>
+            </div>
+            <div class="muted text-xs">地点</div>
+          </div>
+
+          <div class="flex justify-end">
+            <ZButton
+              v-if="!d.signed_out && !d.in_use"
+              size="small"
+              :disabled="working"
+              @click="askDevice(d)"
+            >
+              登出
+            </ZButton>
+            <span v-else-if="d.in_use" class="muted text-xs">CPR 占用中</span>
+          </div>
+        </div>
+      </div>
     </template>
-    <ZDialog v-model="confirmOpen" :title="pending?.title ?? '登出'" width="28rem" :close-on-click-modal="!working" :close-on-press-escape="!working" :before-close="() => !working">
+
+    <ZDialog
+      v-model="confirmOpen"
+      :title="pending?.title ?? '登出'"
+      width="28rem"
+      :close-on-click-modal="!working"
+      :close-on-press-escape="!working"
+      :before-close="() => !working"
+    >
       <p class="dialog-text">{{ pending?.message }}</p>
       <template #footer>
         <ZButton :disabled="working" @click="confirmOpen = false">取消</ZButton>

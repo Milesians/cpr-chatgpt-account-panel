@@ -2,6 +2,7 @@
 import type { ApiError } from '../api'
 import type { AccountLoginStatus } from './helpers'
 import { ZButton, ZTag } from '@codex-proxy/ui'
+import { Check, Copy, KeyRound, Link2, Lock, Trash2 } from '@lucide/vue'
 import { computed, onMounted, ref, watch } from 'vue'
 import { dateTime } from '../format'
 import { loginApi } from './client'
@@ -245,37 +246,46 @@ onMounted(loadStatus)
 <template>
   <section id="account-login-section" class="detail-card" aria-labelledby="account-login-title">
     <div class="detail-card-head">
-      <h3 id="account-login-title" class="card-title">重新登录与凭据管理</h3>
-      <template v-if="status">
-        <ZTag size="small" :type="status.hasPassword ? 'success' : 'default'">
-          {{ status.hasPassword ? '已存加密密码' : '未存密码' }}
-        </ZTag>
-        <ZTag size="small" :type="status.hasTotp ? 'success' : 'default'">
-          {{ status.hasTotp ? '已存加密 2FA' : '未存 2FA' }}
-        </ZTag>
-        <ZTag v-if="!encryptionConfigured" size="small" type="warning">
-          未配加密密钥
-        </ZTag>
-      </template>
-      <ZButton
-        type="primary"
-        size="small"
-        :loading="runningLogin"
-        :disabled="!canQuickRelogin"
-        @click="handleRunLogin"
-      >
-        {{ status?.hasPassword && !password ? '用已存凭据重新登录' : '登录并写回 CPR' }}
-      </ZButton>
-      <ZButton
-        size="small"
-        :disabled="blockedByDisabled"
-        @click="showManualOAuth = !showManualOAuth"
-      >
-        {{ showManualOAuth ? '收起手动授权' : '手动 OAuth 链接兜底' }}
-      </ZButton>
-      <span v-if="status?.lastLoginAtMs" class="muted">
-        上次登录于 {{ dateTime(status.lastLoginAtMs) }}
-      </span>
+      <div class="card-title-group">
+        <h3 id="account-login-title" class="card-title">
+          重新登录与凭据管理
+        </h3>
+        <template v-if="status">
+          <ZTag size="small" :type="status.hasPassword ? 'success' : 'default'">
+            {{ status.hasPassword ? '已存加密密码' : '未存密码' }}
+          </ZTag>
+          <ZTag size="small" :type="status.hasTotp ? 'success' : 'default'">
+            {{ status.hasTotp ? '已存加密 2FA' : '未存 2FA' }}
+          </ZTag>
+          <ZTag v-if="!encryptionConfigured" size="small" type="warning">
+            未配加密密钥
+          </ZTag>
+        </template>
+        <span v-if="status?.lastLoginAtMs" class="muted">
+          上次登录于 {{ dateTime(status.lastLoginAtMs) }}
+        </span>
+      </div>
+
+      <div class="card-actions">
+        <ZButton
+          type="primary"
+          size="small"
+          :loading="runningLogin"
+          :disabled="!canQuickRelogin"
+          @click="handleRunLogin"
+        >
+          <KeyRound :size="13" aria-hidden="true" />
+          {{ status?.hasPassword && !password ? '用已存凭据重新登录' : '登录并写回 CPR' }}
+        </ZButton>
+        <ZButton
+          size="small"
+          :disabled="blockedByDisabled"
+          @click="showManualOAuth = !showManualOAuth"
+        >
+          <Link2 :size="13" aria-hidden="true" />
+          {{ showManualOAuth ? '收起手动授权' : '手动 OAuth 链接兜底' }}
+        </ZButton>
+      </div>
     </div>
 
     <p v-if="blockedByDisabled" class="banner banner-warn">
@@ -290,56 +300,56 @@ onMounted(loadStatus)
     <p v-else-if="status?.lastError" class="banner banner-warn">
       上次登录失败（{{ errorCodeLabel(status.lastError.code) }} · {{ dateTime(status.lastError.atMs) }}）：{{ status.lastError.message }}
     </p>
-    <p v-if="successMsg" class="banner login-banner-ok" role="status">
+    <p v-if="successMsg" class="banner banner-ok" role="status">
       {{ successMsg }}
     </p>
 
-    <div class="login-form-grid">
-      <label class="login-field">
+    <div class="form-grid">
+      <label class="form-field">
         <span>登录密码</span>
         <input
           v-model="password"
           type="password"
           autocomplete="new-password"
-          class="login-input"
+          class="cp-input"
           :placeholder="status?.hasPassword ? '已加密保存，留空则直接使用已保存密码' : '输入 OpenAI 登录密码'"
         >
       </label>
-      <label class="login-field">
+      <label class="form-field">
         <span>2FA 密钥（Base32 或 otpauth://）</span>
         <input
           v-model="totp"
           type="password"
           autocomplete="off"
-          class="login-input"
+          class="cp-input"
           :placeholder="status?.hasTotp ? '已加密保存，留空则直接使用已保存 2FA' : '选填：Base32 密钥或 otpauth://totp/ 链接'"
         >
       </label>
     </div>
 
-    <div v-if="showAdvanced" class="login-form-grid">
-      <label class="login-field">
+    <div v-if="showAdvanced" class="form-grid">
+      <label class="form-field">
         <span>指定 Workspace ID（多工作区时必填）</span>
         <input
           v-model="workspaceId"
           type="text"
-          class="login-input"
+          class="cp-input"
           placeholder="例如：ws-..."
         >
       </label>
-      <label class="login-field">
+      <label class="form-field">
         <span>指定 Organization ID（多组织时选填）</span>
         <input
           v-model="organizationId"
           type="text"
-          class="login-input"
+          class="cp-input"
           placeholder="例如：org-..."
         >
       </label>
     </div>
 
-    <div class="login-toolbar">
-      <label class="login-checkbox">
+    <div class="flex flex-wrap items-center justify-between gap-3 text-xs">
+      <label class="inline-flex cursor-pointer items-center gap-1.5 text-cp-text-secondary">
         <input
           v-model="saveCredentials"
           type="checkbox"
@@ -350,7 +360,7 @@ onMounted(loadStatus)
           <template v-if="!encryptionConfigured">（需先在插件设置中填写 encryptionKey）</template>
         </span>
       </label>
-      <div class="login-actions">
+      <div class="flex flex-wrap gap-2">
         <ZButton size="small" @click="showAdvanced = !showAdvanced">
           {{ showAdvanced ? '隐藏工作区选项' : '指定工作区 ID' }}
         </ZButton>
@@ -360,7 +370,7 @@ onMounted(loadStatus)
           :disabled="!encryptionConfigured || (!password && !totp.trim())"
           @click="handleSaveCredentials"
         >
-          仅加密保存凭据
+          <Lock :size="13" aria-hidden="true" /> 仅加密保存凭据
         </ZButton>
         <ZButton
           v-if="status?.hasPassword || status?.hasTotp"
@@ -368,14 +378,14 @@ onMounted(loadStatus)
           :loading="savingCreds"
           @click="handleClearCredentials"
         >
-          清除已存凭据
+          <Trash2 :size="13" aria-hidden="true" /> 清除已存凭据
         </ZButton>
       </div>
     </div>
 
-    <div v-if="showManualOAuth" class="login-manual-box">
+    <div v-if="showManualOAuth" class="sub-panel">
       <div class="detail-card-head">
-        <strong class="text-xs">手动 OAuth 授权链接兜底（遇到 Cloudflare 验证或邮箱验证码时使用）</strong>
+        <strong class="text-xs text-cp-text">手动 OAuth 授权链接兜底（遇到 Cloudflare 验证或邮箱验证码时使用）</strong>
         <ZButton
           size="small"
           :loading="startingOAuth"
@@ -388,23 +398,25 @@ onMounted(loadStatus)
       <p class="muted note">
         在您自己的浏览器中打开下方授权链接完成登录，浏览器跳转到 <code>http://localhost:1455/auth/callback?code=...</code> 后，复制完整地址贴回下方即可经当前账号的代理换取令牌并写回 CPR。
       </p>
-      <div v-if="authorizeUrl" class="login-inline-row">
+      <div v-if="authorizeUrl" class="inline-copy-row">
         <input
           readonly
           :value="authorizeUrl"
-          class="login-input font-mono text-xs"
+          class="cp-input font-mono text-xs"
           aria-label="OAuth 授权链接"
           @focus="selectInput"
         >
         <ZButton size="small" @click="copyAuthorizeUrl">
+          <Check v-if="copiedUrl" :size="13" aria-hidden="true" />
+          <Copy v-else :size="13" aria-hidden="true" />
           {{ copiedUrl ? '已复制' : '复制链接' }}
         </ZButton>
       </div>
-      <div class="login-inline-row">
+      <div class="inline-copy-row">
         <input
           v-model="callbackUrl"
           type="text"
-          class="login-input font-mono text-xs"
+          class="cp-input font-mono text-xs"
           placeholder="粘贴 http://localhost:1455/auth/callback?code=...&state=..."
           aria-label="OAuth 回调链接"
         >
@@ -421,66 +433,3 @@ onMounted(loadStatus)
     </div>
   </section>
 </template>
-
-<style scoped>
-.login-form-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 12px 16px;
-}
-.login-field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--cp-color-text-secondary);
-}
-.login-input {
-  width: 100%;
-  box-sizing: border-box;
-  padding: 6px 10px;
-  border: 1px solid var(--cp-color-border-secondary);
-  border-radius: 8px;
-  background: var(--cp-color-bg-container);
-  color: var(--cp-color-text);
-  font-size: 13px;
-}
-.login-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 10px;
-  font-size: 12px;
-}
-.login-checkbox {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--cp-color-text-secondary);
-  cursor: pointer;
-}
-.login-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.login-manual-box {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 14px;
-  border-radius: 10px;
-  background: var(--cp-color-fill-quaternary);
-  border: 1px solid var(--cp-color-border-secondary);
-}
-.login-inline-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.login-banner-ok {
-  background: color-mix(in srgb, var(--series-3) 14%, var(--cp-color-bg-container));
-  color: var(--cp-color-text);
-}
-</style>

@@ -5,11 +5,22 @@ import type {
   PasteReport,
   QueuedImportTask,
 } from './helpers'
-import { ZButton, ZTag } from '@codex-proxy/ui'
+import { ZButton, ZEmpty, ZTag } from '@codex-proxy/ui'
+import {
+  Check,
+  Copy,
+  FileSpreadsheet,
+  KeyRound,
+  Link2,
+  Play,
+  Square,
+} from '@lucide/vue'
 import { computed, onMounted, ref } from 'vue'
 import { dateTime, kindLabel } from '../format'
 import { loginApi } from './client'
 import { buildImportQueue, errorCodeLabel, needsManualOAuth } from './helpers'
+
+const emit = defineEmits<{ accountsChanged: [] }>()
 
 interface ImportExecutionState {
   status: 'idle' | 'running' | 'ok' | 'error'
@@ -149,6 +160,7 @@ async function handleStartImport() {
   const stoppedText = stopRequested.value ? '（已手动停止）' : ''
   importNotice.value = `导入执行结束${stoppedText}：成功 ${succeeded} 个，失败 ${failed} 个`
   await loadOverview()
+  emit('accountsChanged')
 }
 
 async function executeImportTask(task: QueuedImportTask) {
@@ -260,6 +272,7 @@ async function submitManualCallback() {
     manualAuthUrl.value = ''
     manualCallbackUrl.value = ''
     await loadOverview()
+    emit('accountsChanged')
   }
   catch (e) {
     manualError.value = (e as ApiError).message
@@ -313,6 +326,7 @@ async function runQuickRelogin(acct: AccountLoginStatus) {
       quickPassword.value = ''
       quickTotp.value = ''
     }
+    emit('accountsChanged')
   }
   catch (e) {
     const err = e as ApiError
@@ -346,44 +360,50 @@ onMounted(loadOverview)
     <!-- 1. 快速导入模块 -->
     <section class="detail-card" aria-labelledby="quick-import-title">
       <div class="detail-card-head">
-        <h2 id="quick-import-title" class="card-title">快速导入账号</h2>
-        <span class="muted">
-          一行一个 <code>邮箱----密码----2FA</code>，行尾可加 <code>----team</code> 或 <code>----personal</code>（2FA 为空写 <code>邮箱----密码--------team</code>）
-        </span>
+        <div class="card-title-group">
+          <h2 id="quick-import-title" class="card-title">
+            快速导入账号
+          </h2>
+          <span class="muted">
+            一行一个 <code>邮箱----密码----2FA</code>，行尾可加 <code>----team</code> 或 <code>----personal</code>（2FA 为空写 <code>邮箱----密码--------team</code>）
+          </span>
+        </div>
       </div>
 
       <textarea
         v-model="pasteText"
         rows="6"
-        class="import-textarea font-mono"
+        class="cp-textarea font-mono"
         placeholder="user1@example.com----password123----JBSWY3DPEHPK3PXP----personal&#10;user2@example.com----password456--------team&#10;user3@example.com----password789----otpauth://totp/OpenAI:user3@example.com?secret=JBSWY3DPEHPK3PXP----个人"
         aria-label="快速导入账号文本"
       />
 
-      <div class="import-controls">
-        <label class="import-select-label">
-          <span>借用代理账号（经 host.http.account 出站）：</span>
-          <select v-model="viaAccountId" class="import-select" aria-label="借用代理账号">
-            <option v-if="!enabledAccounts.length" value="">无启用中的 CPR 账号</option>
-            <option v-for="a in enabledAccounts" :key="a.accountId" :value="a.accountId">
-              {{ a.email || a.name }} ({{ a.accountId }})
-            </option>
-          </select>
-        </label>
+      <div class="flex flex-wrap items-center justify-between gap-3 text-xs">
+        <div class="flex flex-wrap items-center gap-4">
+          <label class="inline-flex items-center gap-2 text-cp-text-secondary">
+            <span>借用代理账号（经 host.http.account 出站）：</span>
+            <select v-model="viaAccountId" class="cp-select w-64" aria-label="借用代理账号">
+              <option v-if="!enabledAccounts.length" value="">无启用中的 CPR 账号</option>
+              <option v-for="a in enabledAccounts" :key="a.accountId" :value="a.accountId">
+                {{ a.email || a.name }} ({{ a.accountId }})
+              </option>
+            </select>
+          </label>
 
-        <label class="import-checkbox">
-          <input v-model="includeExistingUpdates" type="checkbox">
-          <span>同时对 CPR 中已存在的同邮箱同类型账号重新登录并更新</span>
-        </label>
+          <label class="inline-flex cursor-pointer items-center gap-1.5 text-cp-text-secondary">
+            <input v-model="includeExistingUpdates" type="checkbox">
+            <span>同时对 CPR 中已存在的同邮箱同类型账号重新登录并更新</span>
+          </label>
+        </div>
 
-        <div class="import-buttons">
+        <div class="flex flex-wrap items-center gap-2">
           <ZButton
             size="small"
             :loading="previewing"
             :disabled="importing"
             @click="handlePreview"
           >
-            1. 解析并预览
+            <FileSpreadsheet :size="13" aria-hidden="true" /> 1. 解析并预览
           </ZButton>
           <ZButton
             type="primary"
@@ -392,14 +412,15 @@ onMounted(loadOverview)
             :disabled="!importQueue.length || importing"
             @click="handleStartImport"
           >
-            2. 确认逐个导入 ({{ importQueue.length }})
+            <Play :size="13" aria-hidden="true" /> 2. 确认逐个导入 ({{ importQueue.length }})
           </ZButton>
           <ZButton
             v-if="importing"
             size="small"
+            type="danger"
             @click="handleStopImport"
           >
-            停止导入 ({{ importProgress.done }}/{{ importProgress.total }})
+            <Square :size="12" aria-hidden="true" /> 停止导入 ({{ importProgress.done }}/{{ importProgress.total }})
           </ZButton>
         </div>
       </div>
@@ -407,81 +428,100 @@ onMounted(loadOverview)
       <p v-if="importError" class="banner banner-error" role="alert">
         {{ importError }}
       </p>
-      <p v-if="importNotice" class="banner import-banner-ok" role="status">
+      <p v-if="importNotice" class="banner banner-ok" role="status">
         {{ importNotice }}
       </p>
 
       <template v-if="previewReport">
-        <div class="detail-card-head">
-          <ZTag size="small">共 {{ previewReport.lines }} 行</ZTag>
-          <ZTag size="small" type="success">待新建 {{ previewReport.created }}</ZTag>
-          <ZTag size="small" type="info">已在 CPR {{ previewReport.updated }}</ZTag>
-          <ZTag v-if="previewReport.skipped" size="small" type="warning">
-            跳过 {{ previewReport.skipped }}
-          </ZTag>
+        <div class="filter-bar !mb-0">
+          <span class="filter-chip is-active">
+            <span>总行数</span>
+            <span class="filter-count">{{ previewReport.lines }}</span>
+          </span>
+          <span class="filter-chip">
+            <span class="state-dot ok" />
+            <span>待新建</span>
+            <span class="filter-count">{{ previewReport.created }}</span>
+          </span>
+          <span class="filter-chip">
+            <span class="state-dot work" />
+            <span>已在 CPR</span>
+            <span class="filter-count">{{ previewReport.updated }}</span>
+          </span>
+          <span v-if="previewReport.skipped" class="filter-chip">
+            <span class="state-dot warn" />
+            <span>跳过</span>
+            <span class="filter-count">{{ previewReport.skipped }}</span>
+          </span>
         </div>
 
-        <table v-if="previewReport.items.length" class="data-table">
-          <thead>
-            <tr>
-              <th>行号</th>
-              <th>邮箱</th>
-              <th>类型</th>
-              <th>2FA</th>
-              <th>预览查重</th>
-              <th>导入结果</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="item in previewReport.items" :key="item.line">
-              <td class="num">#{{ item.line }}</td>
-              <td>{{ item.email || '—' }}</td>
-              <td>
-                <ZTag size="small" :type="item.kind === 'team' ? 'info' : 'default'">
-                  {{ item.kind === 'team' ? 'Team' : '个人' }}
-                </ZTag>
-              </td>
-              <td>{{ item.hasTotp ? '已提供' : '无' }}</td>
-              <td>
+        <div v-if="previewReport.items.length" class="card-list" role="list" aria-label="导入预览列表">
+          <div
+            v-for="item in previewReport.items"
+            :key="item.line"
+            role="listitem"
+            class="card-row import-preview-row"
+          >
+            <div class="font-mono font-semibold text-cp-text-secondary">
+              #{{ item.line }}
+            </div>
+
+            <div class="min-w-0">
+              <div class="font-semibold truncate text-cp-text">{{ item.email || '—' }}</div>
+              <div class="muted text-xs">账号邮箱</div>
+            </div>
+
+            <div>
+              <ZTag size="small" :type="item.kind === 'team' ? 'info' : 'default'">
+                {{ item.kind === 'team' ? 'Team' : '个人' }}
+              </ZTag>
+            </div>
+
+            <div>
+              <span class="text-xs" :class="item.hasTotp ? 'text-cp-text font-medium' : 'muted'">
+                {{ item.hasTotp ? '含 2FA' : '无 2FA' }}
+              </span>
+            </div>
+
+            <div>
+              <ZTag
+                size="small"
+                :type="item.action === 'create' ? 'success' : item.action === 'update' ? 'info' : 'warning'"
+              >
+                {{ item.action === 'create' ? '待新建' : item.action === 'update' ? '已在 CPR' : '跳过' }}
+              </ZTag>
+              <div v-if="item.message" class="muted text-xs mt-0.5">
+                {{ item.message }}
+              </div>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-1.5">
+              <template v-if="rowStates[item.line]">
                 <ZTag
                   size="small"
-                  :type="item.action === 'create' ? 'success' : item.action === 'update' ? 'info' : 'warning'"
+                  :type="rowStates[item.line]?.status === 'ok' ? 'success' : rowStates[item.line]?.status === 'error' ? 'danger' : 'default'"
                 >
-                  {{ item.action === 'create' ? '待新建' : item.action === 'update' ? '已在 CPR' : '跳过' }}
+                  {{
+                    rowStates[item.line]?.status === 'running'
+                      ? '正在登录导入…'
+                      : rowStates[item.line]?.status === 'ok'
+                        ? '成功'
+                        : errorCodeLabel(rowStates[item.line]?.code)
+                  }}
                 </ZTag>
-                <span v-if="item.message" class="muted ml-2 text-xs">
-                  {{ item.message }}
-                </span>
-              </td>
-              <td>
-                <template v-if="rowStates[item.line]">
-                  <ZTag
-                    size="small"
-                    :type="rowStates[item.line]?.status === 'ok' ? 'success' : rowStates[item.line]?.status === 'error' ? 'danger' : 'default'"
-                  >
-                    {{
-                      rowStates[item.line]?.status === 'running'
-                        ? '正在登录导入…'
-                        : rowStates[item.line]?.status === 'ok'
-                          ? '成功'
-                          : errorCodeLabel(rowStates[item.line]?.code)
-                    }}
-                  </ZTag>
-                  <span class="muted ml-2 text-xs">{{ rowStates[item.line]?.message }}</span>
-                  <ZButton
-                    v-if="rowStates[item.line]?.status === 'error' && needsManualOAuth(rowStates[item.line]?.code)"
-                    size="small"
-                    class="ml-2"
-                    @click="openManualForImport(item.line, item.email, item.kind)"
-                  >
-                    手动 OAuth 兜底
-                  </ZButton>
-                </template>
-                <span v-else class="muted">—</span>
-              </td>
-            </tr>
-          </tbody>
-        </table>
+                <span class="muted text-xs">{{ rowStates[item.line]?.message }}</span>
+                <ZButton
+                  v-if="rowStates[item.line]?.status === 'error' && needsManualOAuth(rowStates[item.line]?.code)"
+                  size="small"
+                  @click="openManualForImport(item.line, item.email, item.kind)"
+                >
+                  手动 OAuth 兜底
+                </ZButton>
+              </template>
+              <span v-else class="muted text-xs">待执行</span>
+            </div>
+          </div>
+        </div>
       </template>
     </section>
 
@@ -491,7 +531,9 @@ onMounted(loadOverview)
         <h3 id="manual-oauth-title" class="card-title">
           手动 OAuth 授权链接兜底：{{ manualTarget.email }} ({{ manualTarget.kind === 'team' ? 'Team' : '个人' }})
         </h3>
-        <ZButton size="small" @click="manualTarget = null">关闭</ZButton>
+        <ZButton size="small" @click="manualTarget = null">
+          关闭
+        </ZButton>
       </div>
       <p class="muted note">
         请复制下方授权链接在浏览器中打开并完成验证，然后将跳转后的 <code>http://localhost:1455/auth/callback?code=...&amp;state=...</code> 完整地址粘贴到下方完成令牌写回。
@@ -499,22 +541,24 @@ onMounted(loadOverview)
       <p v-if="manualError" class="banner banner-error" role="alert">
         {{ manualError }}
       </p>
-      <div v-if="manualAuthUrl" class="import-inline-row">
+      <div v-if="manualAuthUrl" class="inline-copy-row">
         <input
           readonly
           :value="manualAuthUrl"
-          class="import-input font-mono text-xs"
+          class="cp-input font-mono text-xs"
           aria-label="手动 OAuth 授权链接"
         >
         <ZButton size="small" @click="copyManualUrl">
+          <Check v-if="manualCopied" :size="13" aria-hidden="true" />
+          <Copy v-else :size="13" aria-hidden="true" />
           {{ manualCopied ? '已复制' : '复制授权链接' }}
         </ZButton>
       </div>
-      <div class="import-inline-row">
+      <div class="inline-copy-row">
         <input
           v-model="manualCallbackUrl"
           type="text"
-          class="import-input font-mono text-xs"
+          class="cp-input font-mono text-xs"
           placeholder="粘贴 http://localhost:1455/auth/callback?code=...&state=..."
           aria-label="手动 OAuth 回调链接"
         >
@@ -533,208 +577,151 @@ onMounted(loadOverview)
     <!-- 2. 已有账号快速登录列表 -->
     <section class="detail-card" aria-labelledby="existing-login-title">
       <div class="detail-card-head">
-        <h2 id="existing-login-title" class="card-title">CPR 已有账号快速重新登录</h2>
-        <span class="muted">
-          支持直接使用已加密保存的凭据免输重登，或输入新凭据登录并写回 CPR
-        </span>
+        <div class="card-title-group">
+          <h2 id="existing-login-title" class="card-title">
+            CPR 已有账号快速重新登录
+          </h2>
+          <span class="muted">
+            支持直接使用已加密保存的凭据免输重登，或输入新凭据登录并写回 CPR
+          </span>
+        </div>
       </div>
 
-      <p v-if="!accounts.length && !loadingOverview" class="muted">
-        当前 CPR 中还没有 OpenAI OAuth 账号。
-      </p>
+      <ZEmpty
+        v-if="!accounts.length && !loadingOverview"
+        size="small"
+        title="当前 CPR 中还没有 OpenAI OAuth 账号"
+      />
 
-      <table v-else class="data-table">
-        <thead>
-          <tr>
-            <th>账号</th>
-            <th>类型</th>
-            <th>CPR 状态</th>
-            <th>已存加密凭据</th>
-            <th>最近登录 / 状态</th>
-            <th class="actions">操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          <template v-for="acct in accounts" :key="acct.accountId">
-            <tr>
-              <td>
-                <div class="font-semibold">{{ acct.email || acct.name }}</div>
-                <div class="muted text-xs">{{ acct.accountId }}</div>
-              </td>
-              <td>
-                <ZTag size="small" :type="acct.kind === 'team' ? 'info' : 'default'">
-                  {{ kindLabel[acct.kind] ?? acct.kind }}
-                </ZTag>
-              </td>
-              <td>
-                <ZTag v-if="!acct.enabled" size="small" type="warning">已停用</ZTag>
-                <ZTag
-                  v-else
-                  size="small"
-                  :type="acct.credentialState === 'ready' ? 'success' : 'danger'"
+      <div v-else class="card-list" role="list" aria-label="已有账号快速登录列表">
+        <template v-for="acct in accounts" :key="acct.accountId">
+          <div role="listitem" class="card-row login-account-row">
+            <div class="min-w-0">
+              <div class="font-semibold truncate text-cp-text">{{ acct.email || acct.name }}</div>
+              <div class="muted text-xs font-mono">{{ acct.accountId }}</div>
+            </div>
+
+            <div>
+              <ZTag size="small" :type="acct.kind === 'team' ? 'info' : 'default'">
+                {{ kindLabel[acct.kind] ?? acct.kind }}
+              </ZTag>
+            </div>
+
+            <div>
+              <ZTag v-if="!acct.enabled" size="small" type="warning">已停用</ZTag>
+              <ZTag
+                v-else
+                size="small"
+                :type="acct.credentialState === 'ready' ? 'success' : 'danger'"
+              >
+                {{ acct.credentialState }}
+              </ZTag>
+            </div>
+
+            <div class="flex flex-wrap gap-1">
+              <ZTag size="small" :type="acct.hasPassword ? 'success' : 'default'">
+                {{ acct.hasPassword ? '密码已存' : '无密码' }}
+              </ZTag>
+              <ZTag size="small" :type="acct.hasTotp ? 'success' : 'default'">
+                {{ acct.hasTotp ? '2FA 已存' : '无 2FA' }}
+              </ZTag>
+            </div>
+
+            <div class="min-w-0">
+              <div v-if="accountFeedback[acct.accountId]" :class="accountFeedback[acct.accountId]?.ok ? 'text-xs text-cp-text' : 'text-bad text-xs'">
+                <strong v-if="accountFeedback[acct.accountId]?.code">
+                  [{{ errorCodeLabel(accountFeedback[acct.accountId]?.code) }}]
+                </strong>
+                {{ accountFeedback[acct.accountId]?.text }}
+              </div>
+              <div v-else-if="acct.lastError" class="text-bad text-xs">
+                [{{ errorCodeLabel(acct.lastError.code) }}] {{ acct.lastError.message }}
+              </div>
+              <div v-else-if="acct.lastLoginAtMs" class="muted text-xs">
+                上次登录 {{ dateTime(acct.lastLoginAtMs) }}
+              </div>
+              <span v-else class="muted text-xs">尚未在此插件重登</span>
+            </div>
+
+            <div class="flex flex-wrap justify-end gap-1.5">
+              <ZButton
+                v-if="acct.hasPassword"
+                type="primary"
+                size="small"
+                :loading="runningAccountId === acct.accountId"
+                :disabled="!acct.enabled"
+                @click="runQuickRelogin(acct)"
+              >
+                <KeyRound :size="13" aria-hidden="true" /> 免输重登
+              </ZButton>
+              <ZButton
+                size="small"
+                :disabled="!acct.enabled"
+                @click="toggleAccountRow(acct)"
+              >
+                {{ activeAccountId === acct.accountId ? '收起' : '输入凭据登录' }}
+              </ZButton>
+              <ZButton
+                size="small"
+                :disabled="!acct.enabled"
+                @click="openManualForAccount(acct)"
+              >
+                <Link2 :size="13" aria-hidden="true" /> 手动 OAuth
+              </ZButton>
+            </div>
+          </div>
+
+          <div v-if="activeAccountId === acct.accountId" class="sub-panel">
+            <div class="form-grid">
+              <label class="form-field">
+                <span>登录密码</span>
+                <input
+                  v-model="quickPassword"
+                  type="password"
+                  class="cp-input"
+                  :placeholder="acct.hasPassword ? '留空则使用已保存密码' : '输入登录密码'"
+                  aria-label="登录密码"
                 >
-                  {{ acct.credentialState }}
-                </ZTag>
-              </td>
-              <td>
-                <div class="flex flex-wrap gap-1">
-                  <ZTag size="small" :type="acct.hasPassword ? 'success' : 'default'">
-                    {{ acct.hasPassword ? '密码已存' : '无密码' }}
-                  </ZTag>
-                  <ZTag size="small" :type="acct.hasTotp ? 'success' : 'default'">
-                    {{ acct.hasTotp ? '2FA 已存' : '无 2FA' }}
-                  </ZTag>
-                </div>
-              </td>
-              <td>
-                <div v-if="accountFeedback[acct.accountId]" :class="accountFeedback[acct.accountId]?.ok ? 'text-xs' : 'text-bad text-xs'">
-                  <strong v-if="accountFeedback[acct.accountId]?.code">
-                    [{{ errorCodeLabel(accountFeedback[acct.accountId]?.code) }}]
-                  </strong>
-                  {{ accountFeedback[acct.accountId]?.text }}
-                </div>
-                <div v-else-if="acct.lastError" class="text-bad text-xs">
-                  [{{ errorCodeLabel(acct.lastError.code) }}] {{ acct.lastError.message }}
-                </div>
-                <div v-else-if="acct.lastLoginAtMs" class="muted text-xs">
-                  上次登录 {{ dateTime(acct.lastLoginAtMs) }}
-                </div>
-                <span v-else class="muted text-xs">—</span>
-              </td>
-              <td class="actions">
-                <div class="inline-flex flex-wrap justify-end gap-2">
-                  <ZButton
-                    v-if="acct.hasPassword"
-                    type="primary"
-                    size="small"
-                    :loading="runningAccountId === acct.accountId"
-                    :disabled="!acct.enabled"
-                    @click="runQuickRelogin(acct)"
-                  >
-                    免输重登
-                  </ZButton>
-                  <ZButton
-                    size="small"
-                    :disabled="!acct.enabled"
-                    @click="toggleAccountRow(acct)"
-                  >
-                    {{ activeAccountId === acct.accountId ? '收起' : '输入凭据登录' }}
-                  </ZButton>
-                  <ZButton
-                    size="small"
-                    :disabled="!acct.enabled"
-                    @click="openManualForAccount(acct)"
-                  >
-                    手动 OAuth
-                  </ZButton>
-                </div>
-              </td>
-            </tr>
-            <tr v-if="activeAccountId === acct.accountId">
-              <td colspan="6" class="bg-cp-fill-quaternary p-4">
-                <div class="import-controls">
-                  <input
-                    v-model="quickPassword"
-                    type="password"
-                    class="import-input"
-                    :placeholder="acct.hasPassword ? '留空则使用已保存密码' : '输入登录密码'"
-                    aria-label="登录密码"
-                  >
-                  <input
-                    v-model="quickTotp"
-                    type="password"
-                    class="import-input"
-                    :placeholder="acct.hasTotp ? '留空则使用已保存 2FA' : '2FA 密钥（可选）'"
-                    aria-label="2FA 密钥"
-                  >
-                  <input
-                    v-model="quickWorkspaceId"
-                    type="text"
-                    class="import-input"
-                    placeholder="Workspace ID（可选）"
-                    aria-label="Workspace ID"
-                  >
-                  <label class="import-checkbox">
-                    <input v-model="quickSave" type="checkbox" :disabled="!encryptionConfigured">
-                    <span>加密保存凭据</span>
-                  </label>
-                  <ZButton
-                    type="primary"
-                    size="small"
-                    :loading="runningAccountId === acct.accountId"
-                    :disabled="!quickPassword && !acct.hasPassword"
-                    @click="runQuickRelogin(acct)"
-                  >
-                    立即登录并写回
-                  </ZButton>
-                </div>
-              </td>
-            </tr>
-          </template>
-        </tbody>
-      </table>
+              </label>
+              <label class="form-field">
+                <span>2FA 密钥（可选）</span>
+                <input
+                  v-model="quickTotp"
+                  type="password"
+                  class="cp-input"
+                  :placeholder="acct.hasTotp ? '留空则使用已保存 2FA' : '2FA 密钥（可选）'"
+                  aria-label="2FA 密钥"
+                >
+              </label>
+              <label class="form-field">
+                <span>Workspace ID（可选）</span>
+                <input
+                  v-model="quickWorkspaceId"
+                  type="text"
+                  class="cp-input"
+                  placeholder="Workspace ID（可选）"
+                  aria-label="Workspace ID"
+                >
+              </label>
+            </div>
+            <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <label class="inline-flex cursor-pointer items-center gap-1.5 text-cp-text-secondary">
+                <input v-model="quickSave" type="checkbox" :disabled="!encryptionConfigured">
+                <span>加密保存凭据到插件私有状态</span>
+              </label>
+              <ZButton
+                type="primary"
+                size="small"
+                :loading="runningAccountId === acct.accountId"
+                :disabled="!quickPassword && !acct.hasPassword"
+                @click="runQuickRelogin(acct)"
+              >
+                立即登录并写回
+              </ZButton>
+            </div>
+          </div>
+        </template>
+      </div>
     </section>
   </div>
 </template>
-
-<style scoped>
-.import-textarea {
-  width: 100%;
-  box-sizing: border-box;
-  padding: 10px 12px;
-  border: 1px solid var(--cp-color-border-secondary);
-  border-radius: 10px;
-  background: var(--cp-color-bg-container);
-  color: var(--cp-color-text);
-  font-size: 12px;
-  line-height: 1.5;
-  resize: vertical;
-}
-.import-controls {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 12px;
-  font-size: 12px;
-}
-.import-select-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--cp-color-text-secondary);
-}
-.import-select,
-.import-input {
-  padding: 6px 10px;
-  border: 1px solid var(--cp-color-border-secondary);
-  border-radius: 8px;
-  background: var(--cp-color-bg-container);
-  color: var(--cp-color-text);
-  font-size: 12px;
-}
-.import-inline-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.import-inline-row .import-input {
-  flex: 1;
-}
-.import-checkbox {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--cp-color-text-secondary);
-  cursor: pointer;
-}
-.import-buttons {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-left: auto;
-}
-.import-banner-ok {
-  background: color-mix(in srgb, var(--series-3) 14%, var(--cp-color-bg-container));
-  color: var(--cp-color-text);
-}
-</style>

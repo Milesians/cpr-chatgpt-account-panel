@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { CodexUsage, UsageSummary } from '../api'
 import { ZButton, ZSegmented } from '@codex-proxy/ui'
+import { Sparkles } from '@lucide/vue'
 import { computed, ref } from 'vue'
 import { api } from '../api'
 import { ago, compact, dateTime, percent, shortDate, unitNote, windowName } from '../format'
@@ -38,38 +39,78 @@ const work = computed(() => usage.value?.work ?? null)
 const unit = computed(() => unitNote(usage.value?.breakdown?.unit))
 const problems = computed(() => Object.entries(usage.value?.problems ?? {}))
 const partName: Record<string, string> = { limits: '额度窗口', tokens: '每日 Token', breakdown: '用量明细' }
-const tokenMax = computed(() => Math.max(0, ...(usage.value?.tokens?.daily ?? []).map(d => d.tokens)))
+
+const tokenDaily = computed(() => usage.value?.tokens?.daily ?? [])
+const tokenMax = computed(() => Math.max(0, ...tokenDaily.value.map(d => d.tokens)))
+const tokenTotal = computed(() => tokenDaily.value.reduce((s, d) => s + d.tokens, 0))
+const hoveredTokenIndex = ref<number | null>(null)
+const activeTokenIndex = computed(() => {
+  if (hoveredTokenIndex.value !== null && tokenDaily.value[hoveredTokenIndex.value])
+    return hoveredTokenIndex.value
+  return tokenDaily.value.length > 0 ? tokenDaily.value.length - 1 : null
+})
+const activeTokenDay = computed(() =>
+  activeTokenIndex.value !== null ? tokenDaily.value[activeTokenIndex.value] ?? null : null,
+)
+
 const surfaceColour = (k: string) => slotColour(slotOf(k))
 </script>
 
 <template>
   <section class="detail-card" aria-labelledby="usage-title">
     <div class="detail-card-head">
-      <h3 id="usage-title" class="card-title">ChatGPT 官方用量</h3>
-      <ZSegmented v-model="days" :options="ranges" size="small" aria-label="时间范围" :disabled="loading" />
-      <ZButton type="primary" size="small" :loading="loading" :disabled="!!blocked" :title="blocked ?? undefined" @click="load">查询</ZButton>
-      <span v-if="usage" class="muted">查询于 {{ dateTime(usage.checked_at_ms) }}</span>
-      <span v-else-if="summary" class="muted">上次查询 {{ ago(summary.checked_at_ms) }}（最近 {{ summary.days }} 天）</span>
+      <div class="card-title-group">
+        <h3 id="usage-title" class="card-title">
+          ChatGPT 官方用量
+        </h3>
+        <span v-if="usage" class="muted">查询于 {{ dateTime(usage.checked_at_ms) }}</span>
+        <span v-else-if="summary" class="muted">上次查询 {{ ago(summary.checked_at_ms) }}（最近 {{ summary.days }} 天）</span>
+      </div>
+      <div class="card-actions">
+        <ZSegmented v-model="days" :options="ranges" size="small" aria-label="时间范围" :disabled="loading" />
+        <ZButton type="primary" size="small" :loading="loading" :disabled="!!blocked" :title="blocked ?? undefined" @click="load">
+          <Sparkles :size="13" aria-hidden="true" /> 查询
+        </ZButton>
+      </div>
     </div>
+
     <p class="muted note">
       经账号在 CPR 绑定的代理读 ChatGPT 自己的用量统计，只发 GET、不消耗额度，点了才查。ChatGPT 按请求方的身份记使用位置；CPR 以 Codex 的身份转发，所以记在 Work 下的用量一定不是经 CPR 用的。
     </p>
-    <p v-if="blocked" class="banner banner-warn">{{ blocked }}</p>
-    <p v-if="error" class="banner banner-error" role="alert">{{ error }}</p>
-    <p v-else-if="!usage && summary?.error" class="banner banner-error">上次查询失败：{{ summary.error.message }}</p>
+
+    <p v-if="blocked" class="banner banner-warn">
+      {{ blocked }}
+    </p>
+    <p v-if="error" class="banner banner-error" role="alert">
+      {{ error }}
+    </p>
+    <p v-else-if="!usage && summary?.error" class="banner banner-error">
+      上次查询失败：{{ summary.error.message }}
+    </p>
 
     <template v-if="usage">
       <div v-if="work" class="work-callout" :data-used="work.total > 0">
         <template v-if="work.total > 0">
           <strong>最近 {{ usage.days }} 天 Work 有用量：占 {{ percent(work.share, work.share < 0.1 ? 1 : 0) }}</strong>
-          <span>{{ work.days_with_use }} 天有用量，最近一次 {{ work.last_day ? shortDate(work.last_day) : '—' }} · {{ work.surfaces.map(s => `${surfaceLabel(s.key)} ${compact(s.value)}`).join('、') }}</span>
+          <span class="text-cp-text-secondary">
+            {{ work.days_with_use }} 天有用量，最近一次 {{ work.last_day ? shortDate(work.last_day) : '—' }}
+            · {{ work.surfaces.map(s => `${surfaceLabel(s.key)} ${compact(s.value)}`).join('、') }}
+          </span>
         </template>
         <strong v-else>最近 {{ usage.days }} 天 Work 没有用量</strong>
       </div>
-      <p v-else class="banner banner-warn">用量明细没读到，判断不了 Work 有没有用量</p>
+      <p v-else class="banner banner-warn">
+        用量明细没读到，判断不了 Work 有没有用量
+      </p>
 
       <div v-if="usage.limits?.windows.length" class="meters">
-        <WindowMeter v-for="w in usage.limits.windows" :key="w.window_minutes" :label="windowName(w.window_minutes)" :used="w.used_percent" :resets-at="w.resets_at_ms" />
+        <WindowMeter
+          v-for="w in usage.limits.windows"
+          :key="w.window_minutes"
+          :label="windowName(w.window_minutes)"
+          :used="w.used_percent"
+          :resets-at="w.resets_at_ms"
+        />
         <span v-if="usage.limits.limit_reached" class="chip-bad">已触顶</span>
       </div>
 
@@ -80,26 +121,67 @@ const surfaceColour = (k: string) => slotColour(slotOf(k))
           <ShareBars title="发起方式" :items="usage.breakdown.features" :label="featureLabel" />
           <ShareBars title="模型" :items="usage.breakdown.models" :label="k => k" />
         </div>
-        <p v-if="usage.breakdown.surfaces.some(s => isWork(s.key))" class="muted note">Work 的几个位置（Work、Work 网页、Work 桌面版、Work 移动端）在图上合成一种颜色。</p>
-        <p v-if="usage.breakdown.updated_at_ms" class="muted note">ChatGPT 的统计更新于 {{ dateTime(usage.breakdown.updated_at_ms) }}，单位：{{ unit }}</p>
+        <p v-if="usage.breakdown.surfaces.some(s => isWork(s.key))" class="muted note">
+          Work 的几个位置（Work、Work 网页、Work 桌面版、Work 移动端）在图上合成一种颜色。
+        </p>
+        <p v-if="usage.breakdown.updated_at_ms" class="muted note">
+          ChatGPT 的统计更新于 {{ dateTime(usage.breakdown.updated_at_ms) }}，单位：{{ unit }}
+        </p>
       </template>
 
-      <section v-if="usage.tokens" class="tokens" aria-label="每日 Token">
-        <h4>每日 Token</h4>
-        <div class="token-bars">
-          <span v-for="d in usage.tokens.daily" :key="d.date" class="token-bar" :title="`${d.date}：${compact(d.tokens)}`">
-            <i :style="{ height: `${tokenMax ? (d.tokens / tokenMax) * 100 : 0}%` }" />
+      <figure v-if="usage.tokens" class="trend-chart tokens" aria-label="每日 Token">
+        <div class="trend-head">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="font-semibold text-cp-text">每日 Token</span>
+            <span class="muted">
+              区间合计 {{ compact(tokenTotal) }}
+              <template v-if="usage.tokens.lifetime !== undefined"> · 累计 {{ compact(usage.tokens.lifetime) }}</template>
+              <template v-if="usage.tokens.threads !== undefined"> · {{ usage.tokens.threads }} 个对话</template>
+            </span>
+          </div>
+          <span v-if="activeTokenDay" class="font-mono text-cp-xs text-cp-text">
+            <strong>{{ activeTokenDay.date }}</strong> · {{ compact(activeTokenDay.tokens) }} Token
+            <template v-if="tokenTotal > 0">
+              （占区间 {{ percent(activeTokenDay.tokens / tokenTotal, 0) }}）
+            </template>
           </span>
         </div>
-        <p class="muted note">
-          这段时间 {{ compact(usage.tokens.daily.reduce((s, d) => s + d.tokens, 0)) }}
-          <template v-if="usage.tokens.lifetime !== undefined"> · 累计 {{ compact(usage.tokens.lifetime) }}</template>
-          <template v-if="usage.tokens.threads !== undefined"> · {{ usage.tokens.threads }} 个对话</template>
-        </p>
-      </section>
+
+        <div class="trend-bars is-compact" @mouseleave="hoveredTokenIndex = null">
+          <button
+            v-for="(d, idx) in tokenDaily"
+            :key="d.date"
+            type="button"
+            class="trend-bar"
+            :class="{ 'is-active': activeTokenIndex === idx }"
+            :aria-label="`${d.date}：${compact(d.tokens)} Token`"
+            @mouseenter="hoveredTokenIndex = idx"
+            @focus="hoveredTokenIndex = idx"
+            @click="hoveredTokenIndex = idx"
+          >
+            <span
+              class="trend-bar-stack"
+              :style="{ height: `${tokenMax ? Math.max(d.tokens > 0 ? 8 : 0, (d.tokens / tokenMax) * 100) : 0}%` }"
+            >
+              <i
+                class="trend-bar-seg"
+                :style="{ flexGrow: 1, background: activeTokenIndex === idx ? 'var(--series-1)' : 'var(--cp-color-text-tertiary)' }"
+              />
+            </span>
+          </button>
+        </div>
+
+        <div v-if="tokenDaily.length" class="trend-axis">
+          <span>{{ shortDate(tokenDaily[0]!.date) }}</span>
+          <span v-if="tokenDaily.length > 2">{{ shortDate(tokenDaily[Math.floor(tokenDaily.length / 2)]!.date) }}</span>
+          <span>{{ shortDate(tokenDaily[tokenDaily.length - 1]!.date) }}</span>
+        </div>
+      </figure>
 
       <ul v-if="problems.length" class="problems">
-        <li v-for="[part, msg] in problems" :key="part">{{ partName[part] ?? part }}没读到：{{ msg }}</li>
+        <li v-for="[part, msg] in problems" :key="part">
+          {{ partName[part] ?? part }}没读到：{{ msg }}
+        </li>
       </ul>
     </template>
   </section>
