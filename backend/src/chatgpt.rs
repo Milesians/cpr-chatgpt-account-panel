@@ -1,8 +1,8 @@
 //! 以单个 CPR 账号的身份读 ChatGPT 的内部接口
 //!
 //! 每次请求前现读账号的凭据（只放内存），经 `host.http.account` 走账号在 CPR 绑定的
-//! 代理（没绑就直连；绑了但不可用就失败，不回退直连），只发 GET、不跟随跳转、
-//! 不刷新令牌。User-Agent 和 Originator 取 CPR 当前的 Codex 客户端身份：宿主的 TLS
+//! 代理（没绑就直连；绑了但不可用就失败，不回退直连），不跟随跳转、不刷新令牌。除了
+//! 管理员点了的登出设备（POST）只发 GET。User-Agent 和 Originator 取 CPR 当前的 Codex 客户端身份：宿主的 TLS
 //! 栈是 rustls，和 Codex CLI 一致，不冒充浏览器
 
 use gateway_plugin_sdk::{
@@ -218,10 +218,34 @@ impl<'a> Session<'a> {
     /// # Errors
     /// 宿主、网络或上游拒绝时返回浏览器安全的错误
     pub async fn get(&self, path_and_query: &str) -> Result<Vec<u8>, Problem> {
+        self.send("GET", path_and_query, None).await
+    }
+
+    /// POST 一段 JSON。插件唯一的写入是登出设备（`devices`），只在管理员点了之后发；
+    /// 200 和 204 都算成功，返回正文（可能为空）
+    ///
+    /// # Errors
+    /// 宿主、网络或上游拒绝时返回浏览器安全的错误
+    pub async fn post_json(&self, path: &str, body: &Value) -> Result<Vec<u8>, Problem> {
+        self.send("POST", path, Some(body)).await
+    }
+
+    /// 访问令牌 claims 里的 `session_id`（不校验签名，只用来认出 CPR 自己的登录会话）
+    #[must_use]
+    pub fn token_session(&self) -> String {
+        token_session_id(&self.token)
+    }
+
+    async fn send(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        body: Option<&Value>,
+    ) -> Result<Vec<u8>, Problem> {
         if !path_and_query.starts_with("/backend-api/") || !header_safe(path_and_query) {
             return Err(Problem::new("invalid_request", "请求地址无效"));
         }
-        let headers = vec![
+        let mut headers = vec![
             (
                 "Authorization".to_owned(),
                 format!("Bearer {}", self.token).into_bytes(),
@@ -234,6 +258,14 @@ impl<'a> Session<'a> {
                 self.workspace.as_bytes().to_vec(),
             ),
         ];
+        let payload = match body {
+            Some(v) => {
+                headers.push(("Content-Type".to_owned(), b"application/json".to_vec()));
+                serde_json::to_vec(v)
+                    .map_err(|_| Problem::new("invalid_request", "无法创建请求"))?
+            }
+            None => Vec::new(),
+        };
         let response = self
             .host
             .account_http(
@@ -241,12 +273,12 @@ impl<'a> Session<'a> {
                     account_id: self.account.account_id.clone(),
                     credential_revision: self.revision,
                     request: HttpRequest {
-                        method: "GET".into(),
+                        method: method.into(),
                         url: format!("{BASE}{path_and_query}"),
                         headers,
                     },
                 },
-                Vec::new(),
+                payload,
             )
             .await
             .map_err(|e| host_problem(&e))?;
@@ -254,13 +286,10 @@ impl<'a> Session<'a> {
         let challenge = response.headers.iter().any(|(k, v)| {
             k.eq_ignore_ascii_case("cf-mitigated") && v.eq_ignore_ascii_case(b"challenge")
         });
-        let limit = if status == 200 {
-            MAX_BODY
-        } else {
-            MAX_REFUSAL_BODY
-        };
+        let success = status == 200 || (method == "POST" && status == 204);
+        let limit = if success { MAX_BODY } else { MAX_REFUSAL_BODY };
         let body = response.body.collect(limit + 1).await;
-        if status == 200 {
+        if success {
             return body.map_err(|e| {
                 if e.code == ErrorCode::Capacity {
                     Problem::new("invalid_response", "ChatGPT 返回的数据太大")
@@ -367,6 +396,52 @@ pub fn refusal_reason(body: &[u8]) -> String {
         .collect()
 }
 
+/// JWT 中段的 `session_id`；格式不对就是空
+#[must_use]
+pub fn token_session_id(token: &str) -> String {
+    let mut parts = token.split('.');
+    let (Some(_), Some(claims), Some(_), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return String::new();
+    };
+    let Some(raw) = base64url(claims) else {
+        return String::new();
+    };
+    let sid = serde_json::from_slice::<Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("session_id")?.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    if sid.len() <= 512 && sid.bytes().all(|b| b > b' ' && b != 0x7f) {
+        sid
+    } else {
+        String::new()
+    }
+}
+
+/// 不带填充的 base64url 解码
+fn base64url(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(u8::try_from((acc >> bits) & 0xff).ok()?);
+        }
+    }
+    Some(out)
+}
+
 fn header_safe(s: &str) -> bool {
     !s.is_empty() && s.len() <= 16 * 1024 && s.bytes().all(|b| (32..=126).contains(&b))
 }
@@ -424,6 +499,16 @@ mod tests {
         assert_eq!(is_team(Some("plus")), Some(false));
         assert_eq!(is_team(Some(" ")), None);
         assert_eq!(is_team(None), None);
+    }
+
+    #[test]
+    fn reads_session_claim() {
+        // {"session_id":"sess_1"}
+        let token = "e30.eyJzZXNzaW9uX2lkIjoic2Vzc18xIn0.sig";
+        assert_eq!(token_session_id(token), "sess_1");
+        assert_eq!(token_session_id("not-a-jwt"), "");
+        assert_eq!(token_session_id("a.@@.c"), "");
+        assert_eq!(token_session_id("a.e30.c"), "");
     }
 
     #[test]

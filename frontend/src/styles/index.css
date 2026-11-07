@@ -151,3 +151,8 @@ body {
   .accounts-table tr[data-work=true] { box-shadow: inset 3px 0 0 var(--series-6); }
   .accounts-table tr[data-work=true] td:first-child { box-shadow: none; }
 }
+
+/* 登录设备 */
+.banner-ok { background: color-mix(in srgb, var(--series-3) 12%, var(--cp-color-bg-container)); color: var(--cp-color-text); }
+.device-name { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-weight: 600; }
+.dialog-text { margin: 0; font-size: 13px; line-height: 1.6; }

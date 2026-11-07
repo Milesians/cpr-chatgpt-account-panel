@@ -71,7 +71,12 @@ impl From<Problem> for ApiError {
             | "account_unavailable"
             | "credential_state"
             | "token_expired"
-            | "no_credentials" => 409,
+            | "no_credentials"
+            | "device_not_found"
+            | "device_in_use"
+            | "device_signed_out"
+            | "in_use_unknown"
+            | "devices_changed" => 409,
             _ => 502,
         };
         Self::new(status, p.code, p.message)

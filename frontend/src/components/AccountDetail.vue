@@ -6,6 +6,7 @@ import { computed } from 'vue'
 import { dateTime, kindLabel, title } from '../format'
 import AccountLogin from '../login/AccountLogin.vue'
 import BillingPanel from './BillingPanel.vue'
+import DevicesPanel from './DevicesPanel.vue'
 import UsagePanel from './UsagePanel.vue'
 
 const props = defineProps<{ account: Account }>()
@@ -25,6 +26,7 @@ const blocked = computed(() => props.account.blocker?.message ?? null)
     </header>
     <UsagePanel :account-id="account.id" :summary="account.usage" :blocked="blocked" @checked="s => emit('patch', account.id, { usage: s })" />
     <BillingPanel :account-id="account.id" :payment="account.payment" :blocked="blocked" @payment="p => emit('patch', account.id, { payment: p })" />
+    <DevicesPanel :account-id="account.id" :blocked="blocked" />
     <AccountLogin :account-id="account.id" />
   </div>
 </template>

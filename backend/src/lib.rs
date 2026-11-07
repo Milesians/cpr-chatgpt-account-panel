@@ -1,5 +1,6 @@
 //! CPR 插件“ChatGPT 账号面板”：按账号查看 ChatGPT 官方用量（按使用位置，重点看 Work）、
-//! 订阅与账单。只发 GET，经账号在 CPR 绑定的代理，不刷新令牌、不改 CPR 里的账号
+//! 订阅与账单、登录设备。经账号在 CPR 绑定的代理，除了管理员点了的登出设备只发 GET；
+//! 不刷新令牌、不改 CPR 里的账号
 //!
 //! 登录（用登录凭据换令牌、快速导入）在 `login` 模块，单独维护
 
@@ -8,6 +9,7 @@ pub mod billing;
 pub mod chatgpt;
 pub mod clock;
 pub mod config;
+pub mod devices;
 mod host;
 pub mod login;
 mod management;

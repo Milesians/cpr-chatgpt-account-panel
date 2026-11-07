@@ -11,7 +11,7 @@ use gateway_plugin_sdk::{
     },
     client::{HostClient, TypedCall},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::App;
@@ -19,6 +19,7 @@ use crate::api::{self, ApiError, Reply, parse_query, required};
 use crate::billing::{self, LastPayment};
 use crate::chatgpt::{self, Problem, Session};
 use crate::clock::now_ms;
+use crate::devices;
 use crate::host;
 use crate::login;
 use crate::store;
@@ -33,6 +34,8 @@ pub fn registration() -> ManagementRegistration {
         api::route("GET", "api/usage"),
         api::route("GET", "api/subscription"),
         api::route("GET", "api/billing"),
+        api::route("GET", "api/devices"),
+        api::route("POST", "api/devices/sign-out"),
     ];
     routes.extend(login::routes());
     ManagementRegistration {
@@ -47,7 +50,7 @@ pub fn registration() -> ManagementRegistration {
         pages: vec![ManagementPage {
             id: "chatgpt-accounts".to_owned(),
             title: "ChatGPT 账号".to_owned(),
-            description: Some("官方用量（看 Work）、订阅与账单".to_owned()),
+            description: Some("官方用量（看 Work）、订阅与账单、登录设备".to_owned()),
             entry: "web/index.html".to_owned(),
             icon: None,
         }],
@@ -89,7 +92,55 @@ async fn route(app: &App, call: &TypedCall<ManagementRequest>) -> Result<Value, 
             let cursor = query.get("cursor").map_or("", String::as_str);
             read_billing(host, id, cursor).await
         }
+        ("GET", "api/devices") => {
+            let session = Session::open(host, required(&query, "id")?).await?;
+            Ok(json!({"devices": devices::devices(&session).await?}))
+        }
+        ("POST", "api/devices/sign-out") => sign_out(host, api::decode(call)?).await,
         _ => Err(ApiError::new(404, "not_found", "没有这个接口")),
+    }
+}
+
+/// 登出请求：`device`（一台）、`others: true`（CPR 会话以外的全部）或 `all: true`（全部，
+/// 连 CPR 的会话）三选一
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignOut {
+    id: String,
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    others: bool,
+    #[serde(default)]
+    all: bool,
+}
+
+async fn sign_out(host: &HostClient, req: SignOut) -> Result<Value, ApiError> {
+    let chosen = usize::from(req.device.is_some()) + usize::from(req.others) + usize::from(req.all);
+    if chosen != 1 {
+        return Err(ApiError::invalid("device、others、all 只能选一个"));
+    }
+    let session = Session::open(host, &req.id).await?;
+    let partial = |done: usize, p: Problem| {
+        let mut e = ApiError::from(p);
+        if done > 0 {
+            e.message = format!("已登出 {done} 台。{}", e.message);
+        }
+        e
+    };
+    if let Some(device) = req.device {
+        devices::sign_out(&session, &device).await?;
+        Ok(json!({"signed_out": 1}))
+    } else if req.others {
+        let done = devices::sign_out_others(&session)
+            .await
+            .map_err(|(n, p)| partial(n, p))?;
+        Ok(json!({"signed_out": done}))
+    } else {
+        let out = devices::sign_out_all(&session)
+            .await
+            .map_err(|(o, p)| partial(o.signed_out, p))?;
+        Ok(json!({"signed_out": out.signed_out, "cpr_voided": out.cpr_voided}))
     }
 }
 

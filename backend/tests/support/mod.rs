@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! 经公开 RPC 会话驱动插件，模拟宿主回调：账号、凭据、私有状态、额度观测和受管账号 HTTP
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -50,6 +51,7 @@ pub struct SeenRequest {
     pub url: String,
     pub headers: Vec<(String, Vec<u8>)>,
     pub body_len: usize,
+    pub body: Vec<u8>,
 }
 
 impl SeenRequest {
@@ -215,6 +217,7 @@ impl FakeHost {
                     url: params["request"]["url"].as_str().unwrap().to_owned(),
                     headers: serde_json::from_value(params["request"]["headers"].clone()).unwrap(),
                     body_len: payload.len(),
+                    body: payload.to_vec(),
                 });
                 let id = format!("stream-{}", self.seen_http.len());
                 self.streams.insert(id.clone(), reply.body);

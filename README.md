@@ -1,13 +1,13 @@
 # ChatGPT 账号面板（CPR 插件）
 
-[Codex Proxy RS](https://github.com/zyycn/codex-proxy-rs)（CPR）的插件：在 CPR 的“插件”导航里按账号查看 OpenAI OAuth 账号的 **ChatGPT 官方用量**（按使用位置，重点看 **Work** 有没有用量）、**订阅与账单**。登录（用登录凭据换令牌、快速导入）在 `login` 模块，单独维护，见[模块分工](#模块分工)。
+[Codex Proxy RS](https://github.com/zyycn/codex-proxy-rs)（CPR）的插件：在 CPR 的“插件”导航里按账号查看 OpenAI OAuth 账号的 **ChatGPT 官方用量**（按使用位置，重点看 **Work** 有没有用量）、**订阅与账单**和**登录设备**。登录（用登录凭据换令牌、快速导入）在 `login` 模块，单独维护，见[模块分工](#模块分工)。
 
 插件 ID `milesians.cpr-chatgpt-account-panel`（发布者 `milesians`），要求 CPR `>=3.34.0, <4.0.0`（清单 v2、RPC v7、`management` v2）。SDK 和打包 CLI 都固定在 CPR 的 `v3.34.0`（`47d30474af7c3e1fab433f2d4a70430fae548ff2`），和 [cpr-turnstate](https://github.com/Milesians/cpr-turnstate) 一致。
 
 ## 怎么读
 
 - 每次查询前经 `host.auth.get` 现读这个账号的凭据，只放内存；经 `host.http.account` 走账号在 CPR 绑定的代理（没绑就直连；绑了但不可用就失败，不回退直连），带凭据版本号，凭据刚变就失败、让人重试
-- **只发 GET**，不跟随跳转，不刷新令牌（访问令牌过期或 30 秒内过期就不查，等 CPR 自己刷新），不改 CPR 里的账号
+- **只发 GET**（唯一的例外是管理员点了的登出设备，见下），不跟随跳转，不刷新令牌（访问令牌过期或 30 秒内过期就不查，等 CPR 自己刷新），不改 CPR 里的账号
 - 请求头只有 `Authorization`、`Accept`、`User-Agent`、`Originator`、`Chatgpt-Account-Id`。UA 和 Originator 实时取 CPR 的 Codex 客户端身份：宿主的 TLS 栈是 rustls，和 Codex CLI 一致，不冒充浏览器
 - 停用的账号、CPR 标记 expired/banned/invalid 的账号、缺 ChatGPT 账号 ID 的账号不查；API Key 账号不列出
 - 令牌被拒（`token_revoked` 单独说明）、Cloudflare 挑战页、限流时整次查询停下，不再发后面的请求；回答里的 `account_id` 和这个账号对不上就拒绝（`account_mismatch`）
@@ -36,17 +36,27 @@
 - 查第一页时把最新一笔（日期、金额、状态、套餐，不含发票链接）记在插件私有状态 `payments` 里，列表显示“最近支付”
 - 发票只给 HTTPS 的 `invoice.stripe.com/i/` 链接。插件页面在 CPR 的隔离 iframe 里（`sandbox="allow-scripts"`），不能开新标签，所以页面给出链接让人复制
 
+## 登录设备
+
+点了才查：`GET /backend-api/accounts/sessions` 列出 ChatGPT 设置页里这个登录的设备，`POST /backend-api/accounts/sessions/revoke` 登出。都是 ChatGPT 的内部接口，回答不像设置页的（有分页、缺 `is_current_device`、会话 ID 重复或不合法）就拒绝，不猜。
+
+- 会话 ID 不出插件：页面只拿它的哈希；登出前重新列一次、按哈希找，只能登出现在列着的设备，登出后再列一次确认
+- CPR 令牌所在的会话（`is_current_device`，或令牌 claims 里的 `session_id`）不能单独登出
+- **登出其他设备**：只有唯一认出了 CPR 的会话时才能做；每登出一台前都重新核对列表，出现新设备或 CPR 的会话不在了就停
+- **登出所有设备**：连 CPR 的会话一起登出，放在最后（请求用的就是它的令牌），期间新登录的设备也登出；之后 CPR 里这个账号的令牌失效，要重新登录写回 CPR。没认出 CPR 的会话、令牌中途失效的报 `cpr_voided_early`
+- 页面点之前在应用内确认一次；中途停下时错误里说明已经登出了几台
+
 ## 页面
 
 - **列表**：每个 OpenAI OAuth 账号一行：账号（邮箱、套餐、个人/Team、查不了的原因）、CPR 自己记下的额度（`host.data.quota.get`，不访问上游）、最近一次官方用量（各位置占比条、Work 占比）、最近支付。Work 有用量的排最前，其次周额度超过 90% 的、没查过或查失败的。可按个人/Team、“Work 有用量”“扣款异常”筛选、搜索
 - **查询全部用量 / 查询全部账单**：一个接一个查（用量查最近 7 天，账单查第一页），可以中途停；跳过现在查不了的账号
-- **账号详情**：官方用量（7/14/30 天，额度窗口、Work 提示、每天按位置的堆叠图、位置/发起方式/模型占比、每日 Token）和订阅与账单
+- **账号详情**：官方用量（7/14/30 天，额度窗口、Work 提示、每天按位置的堆叠图、位置/发起方式/模型占比、每日 Token）、订阅与账单、登录设备
 
 使用位置的颜色跟着位置走、不跟名次，浅色和深色都用 dataviz 校验脚本检查过（浅色下有 3 个颜色对底色不到 3:1，所以每处都有文字图例和数值）。
 
 ## 模块分工
 
-- **面板**（用量、账单、列表、详情）：`backend/src/{chatgpt,usage,billing,store,management,api,host}.rs`、`frontend/src/{App.vue,api.ts,format.ts,surfaces.ts,components/}`
+- **面板**（用量、账单、登录设备、列表、详情）：`backend/src/{chatgpt,usage,billing,devices,store,management,api,host}.rs`、`frontend/src/{App.vue,api.ts,format.ts,surfaces.ts,components/}`
 - **登录**（用登录凭据换令牌并写回 CPR、快速导入新账号）：`backend/src/login/`、`frontend/src/login/`，单独维护。和面板的接口：
   - 后端：`login::routes()` 返回本模块的管理路由（路径都以 `api/login/` 开头，`management` 合进注册），`api/login/` 开头的请求交给 `login::handle`；`login::Login` 是进程内状态，用 `Config` 建一次。错误用 `api::ApiError`，路由用 `api::route`
   - 前端：`login/LoginPage.vue` 是顶部“登录与导入”页，`login/AccountLogin.vue` 放在账号详情页最下面（props `accountId`）。请求用 `api.ts` 的 `call`
@@ -64,7 +74,7 @@ pnpm --dir frontend test
 cargo test --manifest-path backend/Cargo.toml
 ```
 
-`backend/tests/panel.rs` 经公开 RPC 会话驱动插件、模拟宿主回调，检查只发 GET、走账号代理并带凭据版本号、请求头、令牌不进响应/私有状态/日志、遇到拒绝就停、账号对不上就拒绝、列表不读凭据。
+`backend/tests/panel.rs` 和 `devices.rs` 经公开 RPC 会话驱动插件、模拟宿主回调，检查只发 GET（登出设备的顺序、核对和停下的条件另测）、走账号代理并带凭据版本号、请求头、令牌不进响应/私有状态/日志、遇到拒绝就停、账号对不上就拒绝、列表不读凭据。
 
 ## 打包与安装
 

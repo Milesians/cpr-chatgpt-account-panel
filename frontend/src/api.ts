@@ -142,6 +142,32 @@ export interface History {
   subscription?: Subscription
 }
 
+export interface Device {
+  /** 登出时用来指认设备；不是会话 ID */
+  id: string
+  name: string
+  platform: string
+  apps: string[]
+  current: boolean
+  /** CPR 令牌所在的会话：不能单独登出 */
+  in_use: boolean
+  trusted: boolean
+  signed_out: boolean
+  last_signed_in_ms?: number
+  city: string
+  region: string
+  country: string
+}
+
+export interface Devices {
+  devices: Device[]
+  /** 恰好一台是 CPR 的会话：只有这时才能一起登出其他设备 */
+  in_use_known: boolean
+  checked_at_ms: number
+}
+
+export type SignOutTarget = { device: string } | { others: true } | { all: true }
+
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code = '') {
     super(message)
@@ -180,5 +206,7 @@ export const api = {
   accounts: () => call<{ accounts: Account[], checked_at_ms: number }>('GET', 'api/accounts'),
   usage: (id: string, days: number) => call<{ usage: CodexUsage, summary: UsageSummary }>('GET', 'api/usage', { id, days: String(days) }),
   subscription: (id: string) => call<{ subscription: Subscription }>('GET', 'api/subscription', { id }),
+  devices: (id: string) => call<{ devices: Devices }>('GET', 'api/devices', { id }),
+  signOut: (id: string, target: SignOutTarget) => call<{ signed_out: number, cpr_voided?: boolean }>('POST', 'api/devices/sign-out', undefined, { id, ...target }),
   billing: (id: string, cursor = '') => call<{ history: History, payment: LastPayment | null }>('GET', 'api/billing', cursor ? { id, cursor } : { id }),
 }
