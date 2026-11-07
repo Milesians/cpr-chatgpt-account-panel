@@ -199,18 +199,16 @@ export function shareOf(s: Share, total: number): string {
 }
 
 /**
- * 列表排序：Work 有用量的最前，其次周额度超过 90% 的、没查过或查失败的，最后按名字。
+ * 列表排序：周额度超过 90% 的最前，其次没查过或查失败的，最后按名字。
  * 返回越小越靠前
  */
 export function attention(a: Account): number {
   const u = a.usage
-  if (u?.work && u.work.total > 0)
-    return 0
   if (u?.windows.some(([m, p]) => m === 10080 && p >= 90))
-    return 1
+    return 0
   if (!u || u.error)
-    return 2
-  return 3
+    return 1
+  return 2
 }
 
 export function hasWork(u: UsageSummary | null | undefined): boolean {
@@ -252,14 +250,12 @@ export function needsCredentialRelogin(a: Account): boolean {
     || a.blocker.code === 'no_credentials'
 }
 
-export type AccountFilterKey = 'all' | 'work' | 'payment' | 'quota90' | 'unchecked' | 'blocked'
+export type AccountFilterKey = 'all' | 'payment' | 'quota90' | 'unchecked' | 'blocked'
 
 export function matchesAccountFilter(a: Account, filter: AccountFilterKey): boolean {
   switch (filter) {
     case 'all':
       return true
-    case 'work':
-      return hasWork(a.usage)
     case 'payment':
       return hasPaymentAnomaly(a)
     case 'quota90':
@@ -279,12 +275,10 @@ export function weeklyQuotaPercent(a: Account): number {
   return fromQuota ?? -1
 }
 
-/** 行左竖条优先级：红（扣款失败/逾期/查询报错）> 紫（Work 有用量）> 黄（待续费/周额度 >90%/令牌过期或凭据不可查） */
-export function rowAccentTone(a: Account): 'work' | 'bad' | 'warn' | 'none' {
+/** 行左竖条优先级：红（扣款失败/逾期/查询报错）> 黄（待续费/周额度 >90%/令牌过期或凭据不可查） */
+export function rowAccentTone(a: Account): 'bad' | 'warn' | 'none' {
   if ((hasPaymentAnomaly(a) && paymentIssue(a.payment?.status) === 'failed') || Boolean(a.usage?.error))
     return 'bad'
-  if (hasWork(a.usage))
-    return 'work'
   if (hasPaymentAnomaly(a) || hasHighWeeklyQuota(a) || Boolean(a.blocker))
     return 'warn'
   return 'none'

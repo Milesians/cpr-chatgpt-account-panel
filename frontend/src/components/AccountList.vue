@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import type { Account, ApiError } from '../api'
+import type { Account, ApiError, Share } from '../api'
+import type { Slice } from '../surfaces'
 import type { AccountFilterKey } from '../format'
 import type { AccountLoginStatus } from '../login/helpers'
 import {
@@ -17,7 +18,6 @@ import {
   AlertTriangle,
   ArrowRight,
   CreditCard,
-  Info,
   KeyRound,
   Search,
   Sparkles,
@@ -33,13 +33,11 @@ import {
   formatPlanWithKind,
   hasHighWeeklyQuota,
   hasPaymentAnomaly,
-  hasWork,
   isUnchecked,
   isUnqueryable,
   matchesAccountFilter,
   needsCredentialRelogin,
   paymentText,
-  percent,
   rowAccentTone,
   shareOf,
   title,
@@ -48,7 +46,9 @@ import {
 } from '../format'
 import { loginApi } from '../login/client'
 import { formatLoginError } from '../login/helpers'
-import { slotColour, slotOf, surfaceLabel } from '../surfaces'
+import { slices, SURFACE_ORDER, surfaceLabel } from '../surfaces'
+import MiniDonut from './MiniDonut.vue'
+import MiniTokenBars from './MiniTokenBars.vue'
 import WindowMeter from './WindowMeter.vue'
 
 const props = defineProps<{
@@ -71,10 +71,10 @@ const kinds = [
 ]
 
 const filter = ref<AccountFilterKey>('all')
-const sortBy = ref<'attention' | 'work_share' | 'weekly_quota' | 'name'>('attention')
+const sortBy = ref<'attention' | 'tokens' | 'weekly_quota' | 'name'>('attention')
 const sortOptions = [
   { label: '按关注度排序', value: 'attention' },
-  { label: '按 Work 占比排序', value: 'work_share' },
+  { label: '按 Token 用量排序', value: 'tokens' },
   { label: '按周额度排序', value: 'weekly_quota' },
   { label: '按账号名称排序', value: 'name' },
 ]
@@ -95,13 +95,12 @@ function hasSavedPassword(id: string): boolean {
 const filterChips = computed<Array<{
   key: AccountFilterKey
   label: string
-  dot?: 'work' | 'bad' | 'warn' | 'neutral'
+  dot?: 'bad' | 'warn' | 'neutral'
   count: number
 }>>(() => {
   const list = props.accounts ?? []
   return [
     { key: 'all', label: '全部', count: list.length },
-    { key: 'work', label: 'Work 有用量', dot: 'work', count: list.filter(a => hasWork(a.usage)).length },
     { key: 'payment', label: '扣款异常', dot: 'bad', count: list.filter(a => hasPaymentAnomaly(a)).length },
     { key: 'quota90', label: '周额度 >90%', dot: 'warn', count: list.filter(a => hasHighWeeklyQuota(a)).length },
     { key: 'unchecked', label: '未查询', dot: 'neutral', count: list.filter(a => isUnchecked(a)).length },
@@ -116,8 +115,8 @@ const rows = computed(() => {
     .filter(a => matchesAccountFilter(a, filter.value))
     .filter(a => !q || `${a.email ?? ''} ${a.name} ${a.plan_type ?? ''} ${a.id}`.toLowerCase().includes(q))
     .sort((a, b) => {
-      if (sortBy.value === 'work_share') {
-        const diff = (b.usage?.work?.share ?? -1) - (a.usage?.work?.share ?? -1)
+      if (sortBy.value === 'tokens') {
+        const diff = tokenSum(b) - tokenSum(a)
         if (diff !== 0)
           return diff
       }
@@ -205,8 +204,24 @@ function quota(a: Account) {
     .sort((x, y) => (x.window_seconds ?? Infinity) - (y.window_seconds ?? Infinity))
 }
 
+/** 摘要只记了用量最多的几个位置，剩下的算进“其他” */
+function surfaceItems(a: Account): Share[] {
+  const items = a.usage?.surfaces ?? []
+  const listed = items.reduce((s, i) => s + i.value, 0)
+  const rest = (a.usage?.total ?? listed) - listed
+  return rest > 1e-9 ? [...items, { key: 'other', value: rest }] : items
+}
+
 function surfaceTotal(a: Account): number {
-  return (a.usage?.surfaces ?? []).reduce((s, item) => s + item.value, 0)
+  return surfaceItems(a).reduce((s, i) => s + i.value, 0)
+}
+
+function surfaceSlices(a: Account): Slice[] {
+  return slices(surfaceItems(a), SURFACE_ORDER)
+}
+
+function tokenSum(a: Account): number {
+  return (a.usage?.daily_tokens ?? []).reduce((s, d) => s + d.tokens, 0)
 }
 
 // 单行「免输重登」
@@ -464,7 +479,7 @@ onBeforeUnmount(() => { stop = true })
           <span />
           <span>账号与状态</span>
           <span>CPR 额度</span>
-          <span>官方用量（使用位置）</span>
+          <span>官方用量（每日 Token · 使用位置）</span>
           <span>最近支付</span>
           <span class="text-right">操作</span>
         </div>
@@ -475,7 +490,6 @@ onBeforeUnmount(() => { stop = true })
           class="monitor-row"
           :class="{ 'is-selected': selectedIds.has(a.id) }"
           :data-tone="rowAccentTone(a)"
-          :data-work="hasWork(a.usage)"
         >
           <div>
             <ZCheckbox
@@ -485,7 +499,7 @@ onBeforeUnmount(() => { stop = true })
             />
           </div>
 
-          <!-- 1. 账号信息 + 状态胶囊（去掉账号列的 Work 胶囊，只留用量列） -->
+          <!-- 1. 账号信息 + 状态胶囊 -->
           <div class="min-w-0">
             <button type="button" class="row-title-btn" @click="emit('open', a.id)">
               <div class="flex flex-wrap items-center gap-1.5">
@@ -515,7 +529,7 @@ onBeforeUnmount(() => { stop = true })
             <span v-if="!quota(a).length" class="muted text-xs">—</span>
           </div>
 
-          <!-- 3. 官方用量（使用位置占比条 + 悬停卡片） -->
+          <!-- 3. 官方用量（每日 Token 柱状图 + 使用位置占比饼图） -->
           <div class="usage-cell row-col-usage">
             <template v-if="a.usage?.error">
               <div class="flex items-center gap-1.5">
@@ -524,68 +538,47 @@ onBeforeUnmount(() => { stop = true })
               </div>
             </template>
             <template v-else-if="a.usage">
-              <ZPopover
-                v-if="a.usage.surfaces.length"
-                trigger="hover"
-                placement="top"
-                :width="270"
-              >
-                <template #reference>
-                  <button
-                    type="button"
-                    class="surface-strip-trigger"
-                    :aria-label="`${title(a)} 官方用量位置分布`"
-                    @click="emit('open', a.id)"
-                  >
-                    <div class="mini-stack">
-                      <i
-                        v-for="s in a.usage.surfaces"
-                        :key="s.key"
-                        :style="{ flexGrow: s.value, background: slotColour(slotOf(s.key)) }"
-                      />
-                    </div>
-                    <div class="inline-flex items-center gap-1.5 text-xs whitespace-nowrap">
-                      <span v-if="hasWork(a.usage)" class="font-semibold" style="color: var(--series-6)">
-                        Work 占 {{ percent(a.usage.work!.share, a.usage.work!.share < 0.1 ? 1 : 0) }}
-                      </span>
-                      <span v-else-if="a.usage.work" class="muted">无 Work</span>
-                      <span v-else class="muted">明细未读到</span>
-                      <span class="muted">· 近 {{ a.usage.days }} 天 · {{ ago(a.usage.checked_at_ms) }}查</span>
-                      <Info :size="11" class="muted shrink-0" aria-hidden="true" />
-                    </div>
-                  </button>
-                </template>
-
-                <div class="surface-popover">
-                  <div class="surface-popover-head">
-                    <strong>近 {{ a.usage.days }} 天使用位置</strong>
-                    <span v-if="a.usage.work" :class="hasWork(a.usage) ? 'verdict-pill work' : 'verdict-pill neutral'">
-                      Work {{ percent(a.usage.work.share, a.usage.work.share < 0.1 ? 1 : 0) }}
-                    </span>
-                  </div>
-                  <ul class="surface-popover-list">
-                    <li v-for="s in a.usage.surfaces" :key="s.key" class="surface-popover-row">
-                      <span class="legend-item truncate">
-                        <i class="swatch" :style="{ background: slotColour(slotOf(s.key)) }" />
-                        {{ surfaceLabel(s.key) }}
-                      </span>
-                      <span class="muted">{{ compact(s.value) }}</span>
-                      <span class="font-semibold">{{ shareOf(s, surfaceTotal(a)) }}</span>
-                    </li>
-                  </ul>
-                  <div v-if="a.usage.work && a.usage.work.total > 0" class="muted border-t border-cp-border-secondary pt-1.5 text-[11px]">
-                    Work 共 {{ a.usage.work.days_with_use }} 天有用量，合计 {{ compact(a.usage.work.total) }}
-                  </div>
+              <div class="usage-mini">
+                <div class="usage-mini-tokens">
+                  <MiniTokenBars v-if="a.usage.daily_tokens?.length" :days="a.usage.daily_tokens" />
+                  <span v-else class="muted text-xs">每日 Token 未读到</span>
+                  <span class="usage-mini-caption">
+                    <strong v-if="a.usage.daily_tokens?.length">{{ compact(tokenSum(a)) }} Token</strong>
+                    <span class="muted">近 {{ a.usage.days }} 天 · {{ ago(a.usage.checked_at_ms) }}查</span>
+                  </span>
                 </div>
-              </ZPopover>
-
-              <div v-else class="flex flex-wrap items-center gap-1.5 text-xs">
-                <span v-if="hasWork(a.usage)" class="verdict-pill work">
-                  Work 占 {{ percent(a.usage.work!.share, a.usage.work!.share < 0.1 ? 1 : 0) }}
-                </span>
-                <span v-else-if="a.usage.work" class="muted">近 {{ a.usage.days }} 天无用量</span>
-                <span v-else class="muted">明细未读到</span>
-                <span class="muted">· {{ ago(a.usage.checked_at_ms) }}查</span>
+                <ZPopover
+                  v-if="surfaceSlices(a).length"
+                  trigger="hover"
+                  placement="top"
+                  :width="250"
+                >
+                  <template #reference>
+                    <button
+                      type="button"
+                      class="usage-mini-pie"
+                      :aria-label="`${title(a)} 使用位置占比`"
+                      @click="emit('open', a.id)"
+                    >
+                      <MiniDonut :parts="surfaceSlices(a)" :label="surfaceSlices(a).map(s => `${surfaceLabel(s.key)} ${shareOf(s, surfaceTotal(a))}`).join('，')" />
+                    </button>
+                  </template>
+                  <div class="surface-popover">
+                    <div class="surface-popover-head">
+                      <strong>近 {{ a.usage.days }} 天使用位置</strong>
+                    </div>
+                    <ul class="surface-popover-list">
+                      <li v-for="s in surfaceSlices(a)" :key="s.key" class="surface-popover-row">
+                        <span class="legend-item truncate">
+                          <i class="swatch" :style="{ background: s.colour }" />
+                          {{ surfaceLabel(s.key) }}
+                        </span>
+                        <span class="font-semibold">{{ shareOf(s, surfaceTotal(a)) }}</span>
+                      </li>
+                    </ul>
+                  </div>
+                </ZPopover>
+                <span v-else class="muted text-xs">占比未读到</span>
               </div>
             </template>
             <span v-else class="muted text-xs">用量未查询</span>
@@ -633,18 +626,9 @@ onBeforeUnmount(() => { stop = true })
         </div>
       </template>
 
-      <!-- 底部色块图例 -->
       <p class="list-legend muted">
-        <span
-          v-for="s in (['cli', 'vscode', 'desktop_app', 'web', 'exec', 'work', 'other'] as const)"
-          :key="s"
-          class="legend-item"
-        >
-          <i class="swatch" :style="{ background: slotColour(s) }" />
-          {{ s === 'work' ? 'Work' : s === 'other' ? '其他' : surfaceLabel(s) }}
-        </span>
         <span class="legend-note">
-          行左竖条：红=扣款失败/查询报错，紫=Work 有用量，黄=待续费/周额度 &gt;90%/令牌过期。CPR 额度是 CPR 自己记下的观测值；官方用量和账单点了才查。
+          行左竖条：红=扣款失败/查询报错，黄=待续费/周额度 &gt;90%/令牌过期。CPR 额度是 CPR 自己记下的观测值；官方用量和账单点了才查。悬停饼图看各使用位置的占比。
         </span>
       </p>
     </div>

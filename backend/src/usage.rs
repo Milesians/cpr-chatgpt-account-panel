@@ -71,7 +71,7 @@ pub struct Tokens {
     pub stats_as_of_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenDay {
     pub date: String,
     pub tokens: u64,
@@ -557,6 +557,9 @@ pub struct Summary {
     /// 用量最多的几个位置
     #[serde(default)]
     pub surfaces: Vec<Share>,
+    /// 每天的 Token（列表上的柱状图）；Token 没读到时为空
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub daily_tokens: Vec<TokenDay>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<f64>,
     /// 各窗口（分钟）用了百分之多少
@@ -590,6 +593,11 @@ impl Summary {
                 .map(|b| b.surfaces.iter().take(8).cloned().collect())
                 .unwrap_or_default(),
             total: u.breakdown.as_ref().map(|b| b.total),
+            daily_tokens: u
+                .tokens
+                .as_ref()
+                .map(|t| t.daily.clone())
+                .unwrap_or_default(),
             windows: u
                 .limits
                 .as_ref()
@@ -614,6 +622,7 @@ impl Summary {
             work: None,
             surfaces: Vec::new(),
             total: None,
+            daily_tokens: Vec::new(),
             windows: Vec::new(),
             problems: Vec::new(),
             error: Some(SummaryError {
@@ -672,6 +681,22 @@ mod tests {
         );
         assert_eq!(t.lifetime, Some(9));
         assert!(t.stats_as_of_ms.is_some());
+
+        let u = CodexUsage {
+            checked_at_ms: 1,
+            days: 3,
+            limits: None,
+            tokens: Some(t),
+            breakdown: None,
+            work: None,
+            problems: BTreeMap::new(),
+        };
+        let s = Summary::of(&u);
+        assert_eq!(s.daily_tokens.len(), 3);
+        assert_eq!(s.daily_tokens[1].tokens, 5);
+        // 旧版本记下的摘要没有每日 Token
+        let old: Summary = serde_json::from_str(r#"{"checked_at_ms":1,"days":7}"#).unwrap();
+        assert!(old.daily_tokens.is_empty());
     }
 
     #[test]

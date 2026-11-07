@@ -63,6 +63,16 @@ const mockAccounts = [
         { key: 'work_desktop', value: 6.3 },
         { key: 'desktop_app', value: 3.9 },
       ],
+      total: 58.0,
+      daily_tokens: [
+        { date: '2026-10-31', tokens: 820000 },
+        { date: '2026-11-01', tokens: 1430000 },
+        { date: '2026-11-02', tokens: 0 },
+        { date: '2026-11-03', tokens: 2610000 },
+        { date: '2026-11-04', tokens: 1180000 },
+        { date: '2026-11-05', tokens: 1960000 },
+        { date: '2026-11-06', tokens: 540000 },
+      ],
       windows: [[300, 42], [10080, 78]],
       problems: [],
     },
@@ -97,6 +107,16 @@ const mockAccounts = [
         { key: 'cli', value: 64 },
         { key: 'vscode', value: 21 },
         { key: 'exec', value: 8 },
+      ],
+      total: 93,
+      daily_tokens: [
+        { date: '2026-10-31', tokens: 3100000 },
+        { date: '2026-11-01', tokens: 2900000 },
+        { date: '2026-11-02', tokens: 4200000 },
+        { date: '2026-11-03', tokens: 3800000 },
+        { date: '2026-11-04', tokens: 5100000 },
+        { date: '2026-11-05', tokens: 4700000 },
+        { date: '2026-11-06', tokens: 2300000 },
       ],
       windows: [[300, 18], [10080, 93]],
       problems: [],
@@ -648,7 +668,7 @@ try {
     return { chips, rows, actionButtons, lightBg };
   `)
   assert.equal(listStats.rows, 4, '列表应渲染 4 个账号监控行')
-  assert.equal(listStats.chips.length, 6, '列表顶部应有 6 个分类计数筛选芯片')
+  assert.equal(listStats.chips.length, 5, '列表顶部应有 5 个分类计数筛选芯片')
   assert.ok(listStats.chips.some(c => c.includes('无法查询')), '筛选芯片应显示「无法查询」')
   assert.ok(listStats.actionButtons.includes('免输重登'), '令牌过期且有已存密码的账号行应显示「免输重登」')
   assert.ok(listStats.actionButtons.includes('去重新登录'), '令牌过期且未存密码的账号行应显示「去重新登录」')
@@ -689,8 +709,8 @@ try {
   // 验证筛选芯片点击与恢复
   await setViewport(1440, 900, 'light')
   const filteredRows = await evaluate(`
-    const workChip = [...document.querySelectorAll('.filter-chip')].find(el => el.textContent.includes('Work 有用量'));
-    workChip.click();
+    const payChip = [...document.querySelectorAll('.filter-chip')].find(el => el.textContent.includes('扣款异常'));
+    payChip.click();
     await new Promise(r => setTimeout(r, 80));
     const count = document.querySelectorAll('.monitor-row').length;
     const allChip = [...document.querySelectorAll('.filter-chip')].find(el => el.textContent.includes('全部'));
@@ -698,7 +718,21 @@ try {
     await new Promise(r => setTimeout(r, 80));
     return count;
   `)
-  assert.equal(filteredRows, 1, '点击「Work 有用量」芯片后应只显示 1 行')
+  assert.equal(filteredRows, 1, '点击「扣款异常」芯片后应只显示 1 行')
+  const listUsage = await evaluate(`
+    return {
+      chips: [...document.querySelectorAll('.filter-chip')].map(el => el.textContent),
+      bars: document.querySelectorAll('.monitor-row .mini-bars').length,
+      donuts: document.querySelectorAll('.monitor-row .mini-donut').length,
+      firstBars: document.querySelector('.monitor-row .mini-bars')?.querySelectorAll('.mini-bar-fill').length ?? 0,
+      tones: [...document.querySelectorAll('.monitor-row')].map(el => el.dataset.tone),
+    };
+  `)
+  assert.ok(!listUsage.chips.some(t => t.includes('Work')), '列表不再有 Work 筛选')
+  assert.equal(listUsage.bars, 2, '查过用量的两行都有每日 Token 柱状图')
+  assert.equal(listUsage.donuts, 2, '查过用量的两行都有使用位置饼图')
+  assert.ok(listUsage.firstBars >= 6, '有 Token 的日子各一根柱子')
+  assert.ok(!listUsage.tones.includes('work'), '行左竖条不再有 Work 紫色')
 
   // ── 2. 详情页（官方用量 + 订阅账单）验收与截图 ──
   await evaluate(`

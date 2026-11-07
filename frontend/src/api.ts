@@ -45,6 +45,8 @@ export interface UsageSummary {
   work?: Work
   surfaces: Share[]
   total?: number
+  /** 每天的 Token；旧记录和 Token 没读到时没有 */
+  daily_tokens?: { date: string, tokens: number }[]
   /** [窗口分钟数, 已用百分比] */
   windows: [number, number][]
   problems: string[]

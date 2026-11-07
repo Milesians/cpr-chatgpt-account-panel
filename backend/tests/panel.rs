@@ -115,6 +115,8 @@ async fn usage_reads_three_gets_through_the_account_proxy() {
     // 列表上记下的摘要
     let saved = host.get("usage", "acct_a").unwrap();
     assert_eq!(saved["work"]["total"], 2.0);
+    assert_eq!(saved["daily_tokens"].as_array().unwrap().len(), 7);
+    assert_eq!(saved["daily_tokens"][6]["tokens"], 300);
     assert_eq!(saved["windows"][1], json!([10080, 93.0]));
     let (_, list) = peer.api("GET", "api/accounts", "", None, &mut host).await;
     assert_eq!(list["accounts"][0]["usage"]["work"]["share"], 0.4);
@@ -178,6 +180,12 @@ async fn a_missing_part_leaves_the_others() {
     assert_eq!(code, 200, "{body}");
     assert!(body["usage"]["tokens"].is_null());
     assert!(body["usage"]["problems"]["tokens"].is_string());
+    assert!(
+        host.get("usage", "acct_a")
+            .unwrap()
+            .get("daily_tokens")
+            .is_none()
+    );
     assert_eq!(body["usage"]["work"]["total"], 0.0);
 }
 

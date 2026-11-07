@@ -101,14 +101,14 @@ test('dates', () => {
   assert.equal(daysLeft(Date.now() - 1000), 0)
 })
 
-test('work usage sorts first, then a nearly full week, then unchecked', () => {
+test('a nearly full week sorts first, then unchecked; work usage is not special', () => {
   const base = { checked_at_ms: 1, days: 7, surfaces: [], windows: [] as [number, number][], problems: [] }
   const acct = (usage: any) => ({ usage }) as any
-  assert.equal(attention(acct({ ...base, work: { total: 1, share: 0.1, days_with_use: 1, surfaces: [] } })), 0)
-  assert.equal(attention(acct({ ...base, windows: [[10080, 95]] })), 1)
-  assert.equal(attention(acct(null)), 2)
-  assert.equal(attention(acct({ ...base, error: { code: 'x', message: 'y' } })), 2)
-  assert.equal(attention(acct({ ...base, work: { total: 0, share: 0, days_with_use: 0, surfaces: [] } })), 3)
+  assert.equal(attention(acct({ ...base, windows: [[10080, 95]] })), 0)
+  assert.equal(attention(acct(null)), 1)
+  assert.equal(attention(acct({ ...base, error: { code: 'x', message: 'y' } })), 1)
+  assert.equal(attention(acct({ ...base, work: { total: 1, share: 0.1, days_with_use: 1, surfaces: [] } })), 2)
+  assert.equal(attention(acct(base)), 2)
 })
 
 test('account filter classification and row accent tones', () => {
@@ -141,9 +141,8 @@ test('account filter classification and row accent tones', () => {
     payment: null,
   } as any
 
-  assert.equal(matchesAccountFilter(workAcct, 'work'), true)
   assert.equal(matchesAccountFilter(workAcct, 'payment'), false)
-  assert.equal(rowAccentTone(workAcct), 'work')
+  assert.equal(rowAccentTone(workAcct), 'none')
 
   assert.equal(hasPaymentAnomaly(failedAcct), true)
   assert.equal(matchesAccountFilter(failedAcct, 'payment'), true)

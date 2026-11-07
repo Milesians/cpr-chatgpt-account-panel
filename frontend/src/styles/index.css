@@ -318,10 +318,6 @@ body {
   background: color-mix(in srgb, var(--series-6) 7%, var(--cp-color-bg-container));
 }
 
-.monitor-row[data-tone='work'] {
-  box-shadow: inset 3px 0 0 var(--series-6);
-}
-
 .monitor-row[data-tone='bad'] {
   box-shadow: inset 3px 0 0 var(--tone-bad);
 }
@@ -425,39 +421,82 @@ body {
   font-size: 12px;
 }
 
-.surface-strip-trigger {
+/* ─── 列表行的官方用量：每日 Token 柱状图 + 使用位置饼图 ─── */
+.usage-mini {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.usage-mini-tokens {
   display: flex;
   flex-direction: column;
-  gap: 5px;
-  width: 100%;
-  padding: 4px 6px;
-  margin: -4px -6px;
+  gap: 4px;
+  min-width: 0;
+}
+
+.usage-mini-caption {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 6px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.usage-mini-caption strong {
+  color: var(--cp-color-text);
+  font-weight: 600;
+}
+
+.mini-bars {
+  display: block;
+  overflow: visible;
+}
+
+.mini-bars-base {
+  stroke: var(--cp-color-border-secondary);
+  stroke-width: 1;
+}
+
+.mini-bar-hit {
+  fill: transparent;
+}
+
+.mini-bar-fill {
+  fill: var(--series-1);
+  opacity: 0.8;
+}
+
+.mini-bar:hover .mini-bar-fill {
+  opacity: 1;
+}
+
+.usage-mini-pie {
+  display: inline-flex;
+  flex-shrink: 0;
+  padding: 3px;
   border: 0;
-  border-radius: var(--cp-radius-sm);
+  border-radius: 999px;
   background: transparent;
-  color: inherit;
-  text-align: left;
   cursor: pointer;
 }
 
-.surface-strip-trigger:hover {
+.usage-mini-pie:hover,
+.usage-mini-pie:focus-visible {
   background: var(--cp-color-fill-tertiary);
 }
 
-.mini-stack {
-  display: flex;
-  gap: 2px;
-  width: 100%;
-  max-width: 260px;
-  height: 8px;
-  border-radius: 3px;
-  overflow: hidden;
-  background: var(--cp-color-fill-tertiary);
+.mini-donut {
+  display: block;
 }
 
-.mini-stack i {
-  min-width: 3px;
-  height: 100%;
+.mini-donut-slice {
+  stroke: var(--cp-color-bg-container);
+  stroke-width: 1;
+  stroke-linejoin: round;
 }
 
 .surface-popover {
@@ -488,7 +527,7 @@ body {
 
 .surface-popover-row {
   display: grid;
-  grid-template-columns: minmax(90px, 1fr) auto auto;
+  grid-template-columns: minmax(90px, 1fr) auto;
   align-items: center;
   gap: 10px;
   font-variant-numeric: tabular-nums;

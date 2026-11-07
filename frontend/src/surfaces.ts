@@ -85,3 +85,37 @@ export function bySlot(surfaces: Record<string, number>): Map<Slot, number> {
   }
   return out
 }
+
+/** 饼图最多分几块（多的合成“其他”）；和 index.css 的 --series-1…6 一一对应 */
+export const SERIES = 6
+
+/** 常见的使用位置固定用自己的颜色（和详情页的颜色一致），换范围、换账号颜色不变 */
+export const SURFACE_ORDER = ['cli', 'vscode', 'desktop_app', 'web', 'exec', 'work'] as const
+
+export interface Slice {
+  key: string
+  value: number
+  colour: string
+}
+
+/**
+ * 按占比从大到小取前几块，其余合成 `other`。
+ * 颜色跟着名字走：`fixed` 里的名字用它自己的位置；不在里面的，按大小依次用这次没被占的位置
+ */
+export function slices(items: { key: string, value: number }[], fixed: readonly string[] = []): Slice[] {
+  const sorted = items.filter(i => i.value > 0).sort((a, b) => b.value - a.value || a.key.localeCompare(b.key))
+  const named = sorted.filter(i => i.key !== 'other')
+  const head = named.length > SERIES ? named.slice(0, SERIES - 1) : named
+  const rest = sorted.filter(i => !head.includes(i)).reduce((s, i) => s + i.value, 0)
+  const taken = new Set(head.map(i => fixed.indexOf(i.key)).filter(n => n >= 0 && n < SERIES))
+  const free = Array.from({ length: SERIES }, (_, n) => n).filter(n => !taken.has(n))
+  const out = head.map((i) => {
+    let n = fixed.indexOf(i.key)
+    if (n < 0 || n >= SERIES)
+      n = free.shift()!
+    return { key: i.key, value: i.value, colour: `var(--series-${n + 1})` }
+  })
+  if (rest > 0)
+    out.push({ key: 'other', value: rest, colour: 'var(--series-other)' })
+  return out
+}
