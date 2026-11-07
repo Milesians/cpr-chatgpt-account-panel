@@ -6,8 +6,8 @@ use gateway_plugin_sdk::{
         data::{QuotaFacts, QuotaFactsQuery},
         host::{
             AuthCredential, AuthGetRequest, AuthListRequest, AuthListResult, AuthRuntimeAccount,
-            LogLevel, LogRequest, StateGetRequest, StateGetResult, StatePutRequest, StatePutResult,
-            StateRecord,
+            AuthSaveRequest, AuthSaveResult, LogLevel, LogRequest, StateGetRequest, StateGetResult,
+            StatePutRequest, StatePutResult, StateRecord,
         },
     },
     client::{HostClient, SessionError},
@@ -114,6 +114,17 @@ pub async fn credential(
         },
     )
     .await
+}
+
+/// 创建新账号或替换已有账号的凭据
+///
+/// # Errors
+/// 版本冲突（`Conflict`）、校验拒绝（`Rejected`）或宿主回调失败时返回错误
+pub async fn auth_save(
+    host: &HostClient,
+    request: &AuthSaveRequest,
+) -> Result<AuthSaveResult, PluginFault> {
+    payload_call(host, "host.auth.save", request).await
 }
 
 /// CPR 已记下的额度观测，不访问上游

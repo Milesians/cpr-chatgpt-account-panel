@@ -4,6 +4,7 @@ import { ZButton, ZDialog, ZTag } from '@codex-proxy/ui'
 import { computed, ref } from 'vue'
 import { api } from '../api'
 import { dateTime } from '../format'
+import { loginApi } from '../login/client'
 
 const props = defineProps<{ accountId: string, blocked: string | null }>()
 
@@ -53,14 +54,43 @@ function askAll() {
   ask({ all: true }, '登出所有设备', '连 CPR 正在使用的登录一起登出（放在最后）。之后 CPR 里这个账号的令牌会失效，需要重新登录写回 CPR。期间新登录的设备也会登出。')
 }
 
+const cprVoided = ref(false)
+const relogging = ref(false)
+
+function scrollToLogin() {
+  const el = document.querySelector<HTMLElement>('#account-login-section')
+  el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  const input = el?.querySelector<HTMLInputElement>('input')
+  input?.focus()
+}
+
+async function quickRelogin() {
+  relogging.value = true
+  error.value = ''
+  try {
+    await loginApi.runLogin({ accountId: props.accountId })
+    cprVoided.value = false
+    notice.value = '已使用保存的加密凭据重新登录并写回 CPR'
+    await load()
+  }
+  catch {
+    scrollToLogin()
+  }
+  finally {
+    relogging.value = false
+  }
+}
+
 async function confirm() {
   if (!pending.value)
     return
   working.value = true
   error.value = ''
   notice.value = ''
+  cprVoided.value = false
   try {
     const r = await api.signOut(props.accountId, pending.value.target)
+    cprVoided.value = Boolean(r.cpr_voided)
     notice.value = r.cpr_voided
       ? `已登出 ${r.signed_out} 台设备，CPR 的令牌已失效，需要重新登录写回 CPR`
       : `已登出 ${r.signed_out} 台设备`
@@ -72,7 +102,7 @@ async function confirm() {
     working.value = false
     confirmOpen.value = false
   }
-  if (!notice.value.includes('令牌已失效'))
+  if (!cprVoided.value)
     await load()
   else
     devices.value = null
@@ -93,7 +123,13 @@ async function confirm() {
     <p class="muted note">ChatGPT 设置页里这个登录的设备，点了才查。CPR 正在使用的登录不能单独登出；“登出所有设备”会连它一起登出，之后要重新登录。</p>
     <p v-if="blocked" class="banner banner-warn">{{ blocked }}</p>
     <p v-if="error" class="banner banner-error" role="alert">{{ error }}</p>
-    <p v-if="notice" class="banner banner-ok" role="status">{{ notice }}</p>
+    <div v-if="notice" class="banner banner-ok flex flex-wrap items-center justify-between gap-2" role="status">
+      <span>{{ notice }}</span>
+      <div v-if="cprVoided || notice.includes('重新登录')" class="inline-flex items-center gap-2">
+        <ZButton type="primary" size="small" :loading="relogging" @click="quickRelogin">一键重新登录</ZButton>
+        <ZButton size="small" @click="scrollToLogin">前往快速登录区</ZButton>
+      </div>
+    </div>
     <template v-if="devices">
       <p v-if="!devices.devices.length" class="muted">没有设备</p>
       <table v-else class="data-table">

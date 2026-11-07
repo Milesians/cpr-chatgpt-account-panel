@@ -19,10 +19,30 @@
   },
   "configurationSchema": {
     "type": "object",
-    "properties": {},
+    "properties": {
+      "encryptionKey": {
+        "type": "string",
+        "description": "AES-256-GCM 凭据加密密钥（32 字节 Base64/Hex 密钥，或 kid:base64key 多密钥格式）"
+      },
+      "encryptionKeys": {
+        "type": "string",
+        "description": "AES-256-GCM 凭据加密密钥环（kid1:base64key1,kid2:base64key2）"
+      },
+      "activeKey": {
+        "type": "string",
+        "description": "当前用于加密新凭据的密钥 ID（单密钥时可留空）"
+      },
+      "oauthRedirect": {
+        "type": "string",
+        "description": "OAuth 回调地址（默认 http://localhost:1455/auth/callback）"
+      }
+    },
     "additionalProperties": false
   },
-  "secretFields": [],
+  "secretFields": [
+    "encryptionKey",
+    "encryptionKeys"
+  ],
   "resources": {
     "web/index.html": "text/html",
     "web/app.js": "text/javascript",
@@ -45,6 +65,15 @@
       "maximumRecords": 2000,
       "maximumBytes": 2097152,
       "maximumValueBytes": 4096,
+      "migratesFrom": []
+    },
+    {
+      "namespace": "login",
+      "schemaVersion": 1,
+      "schema": { "type": "object" },
+      "maximumRecords": 2000,
+      "maximumBytes": 4194304,
+      "maximumValueBytes": 16384,
       "migratesFrom": []
     }
   ]

@@ -44,6 +44,7 @@ pub fn status(status: u16, body: Value) -> HttpReply {
 }
 
 /// 一次 `host.http.account` 收到的请求
+#[allow(dead_code)]
 pub struct SeenRequest {
     pub account_id: String,
     pub revision: u64,
@@ -54,6 +55,7 @@ pub struct SeenRequest {
     pub body: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl SeenRequest {
     pub fn header(&self, name: &str) -> Option<String> {
         self.headers
@@ -68,12 +70,16 @@ impl SeenRequest {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 pub struct FakeHost {
     pub state: HashMap<(String, String), (Value, u64)>,
     pub accounts: Vec<Value>,
+    pub saved_credentials: HashMap<String, Value>,
+    pub forbidden_secrets: Vec<String>,
     pub http: VecDeque<HttpReply>,
     pub seen_http: Vec<SeenRequest>,
     pub calls: Vec<String>,
+    pub last_oauth_state: String,
     streams: HashMap<String, Vec<u8>>,
     next_version: u64,
 }
@@ -89,6 +95,7 @@ pub fn account(id: &str) -> Value {
     })
 }
 
+#[allow(dead_code)]
 impl FakeHost {
     pub fn new(accounts: &[&str]) -> Self {
         Self {
@@ -101,6 +108,16 @@ impl FakeHost {
         self.state
             .get(&(namespace.to_owned(), key.to_owned()))
             .map(|(v, _)| v)
+    }
+
+    fn check_no_leaks(&self, text: &str, target: &str) {
+        assert!(!text.contains(TOKEN), "a credential reached {target}");
+        for secret in &self.forbidden_secrets {
+            assert!(
+                !secret.is_empty() && !text.contains(secret),
+                "secret {secret} reached {target}: {text}"
+            );
+        }
     }
 
     fn find(&self, payload: &[u8]) -> Result<Value, PluginFault> {
@@ -130,17 +147,80 @@ impl FakeHost {
             }
             "host.auth.get" => {
                 let a = self.find(payload)?;
-                let body = json!({
-                    "account_id": a["account_id"], "provider_id": "openai", "credential_revision": a["credential_revision"],
-                    "facts": {
+                let id = a["account_id"].as_str().unwrap();
+                let facts = self.saved_credentials.get(id).cloned().unwrap_or_else(|| {
+                    json!({
                         "name": a["name"], "authentication_kind": "oauth",
                         "material": {"access_token": TOKEN, "refresh_token": "secret-refresh-token"},
                         "email": a["email"], "upstream_user_id": null, "upstream_account_id": a["upstream_account_id"],
                         "plan_type": a["plan_type"], "has_refresh_token": true,
                         "access_token_expires_at_ms": a["access_token_expires_at_ms"], "next_refresh_at_ms": null,
-                    },
+                    })
+                });
+                let body = json!({
+                    "account_id": a["account_id"], "provider_id": "openai", "credential_revision": a["credential_revision"],
+                    "facts": facts,
                 });
                 Ok((json!({}), serde_json::to_vec(&body).unwrap()))
+            }
+            "host.auth.save" => {
+                use gateway_plugin_sdk::call::host::AuthSaveRequest;
+                let req: AuthSaveRequest = serde_json::from_slice(payload).unwrap();
+                match req {
+                    AuthSaveRequest::Replace {
+                        account_id: id,
+                        credential_revision: expected_rev,
+                        facts,
+                    } => {
+                        let facts_val = serde_json::to_value(&facts).unwrap();
+                        let acct = self
+                            .accounts
+                            .iter_mut()
+                            .find(|a| a["account_id"] == id.as_str())
+                            .ok_or_else(|| PluginFault::new(ErrorCode::Rejected, "not found"))?;
+                        if acct["credential_revision"].as_u64().unwrap() != expected_rev {
+                            return Err(PluginFault::new(ErrorCode::Conflict, "revision conflict"));
+                        }
+                        let new_rev = expected_rev + 1;
+                        acct["credential_revision"] = json!(new_rev);
+                        acct["name"] = facts_val["name"].clone();
+                        acct["email"] = facts_val["email"].clone();
+                        acct["upstream_user_id"] = facts_val["upstream_user_id"].clone();
+                        acct["upstream_account_id"] = facts_val["upstream_account_id"].clone();
+                        acct["plan_type"] = facts_val["plan_type"].clone();
+                        acct["has_refresh_token"] = facts_val["has_refresh_token"].clone();
+                        acct["access_token_expires_at_ms"] =
+                            facts_val["access_token_expires_at_ms"].clone();
+                        acct["credential_state"] = json!("ready");
+                        self.saved_credentials.insert(id.clone(), facts_val);
+                        let out = json!({"account_id": id, "credential_revision": new_rev});
+                        Ok((json!({}), serde_json::to_vec(&out).unwrap()))
+                    }
+                    AuthSaveRequest::Create { provider_id, facts } => {
+                        assert_eq!(provider_id, "openai");
+                        let facts_val = serde_json::to_value(&facts).unwrap();
+                        let id = format!("acct_created_{}", self.accounts.len() + 1);
+                        self.accounts.push(json!({
+                            "account_id": id,
+                            "provider_id": "openai",
+                            "credential_revision": 1,
+                            "name": facts_val["name"],
+                            "email": facts_val["email"],
+                            "upstream_user_id": facts_val["upstream_user_id"],
+                            "upstream_account_id": facts_val["upstream_account_id"],
+                            "plan_type": facts_val["plan_type"],
+                            "authentication_kind": facts_val["authentication_kind"],
+                            "enabled": true,
+                            "credential_state": "ready",
+                            "has_refresh_token": facts_val["has_refresh_token"],
+                            "access_token_expires_at_ms": facts_val["access_token_expires_at_ms"],
+                            "next_refresh_at_ms": null,
+                        }));
+                        self.saved_credentials.insert(id.clone(), facts_val);
+                        let out = json!({"account_id": id, "credential_revision": 1});
+                        Ok((json!({}), serde_json::to_vec(&out).unwrap()))
+                    }
+                }
             }
             "host.data.quota.get" => {
                 let a = self.find(payload)?;
@@ -188,7 +268,7 @@ impl FakeHost {
                     key.1,
                     text.len()
                 );
-                assert!(!text.contains(TOKEN), "a credential reached private state");
+                self.check_no_leaks(&text, "private state");
                 self.next_version += 1;
                 self.state
                     .insert(key, (params["value"].clone(), self.next_version));
@@ -206,15 +286,40 @@ impl FakeHost {
                 Ok((json!({"Ok":profile}), Vec::new()))
             }
             "host.http.account" => {
-                let reply = self
+                let mut reply = self
                     .http
                     .pop_front()
                     .expect("unscripted account HTTP request");
+                let url = params["request"]["url"].as_str().unwrap().to_owned();
+                if let Some((_, q)) = url.split_once('?') {
+                    let parsed = cpr_chatgpt_account_panel::api::parse_query(q);
+                    if let Some(st) = parsed.get("state") {
+                        self.last_oauth_state.clone_from(st);
+                    }
+                }
+                if !self.last_oauth_state.is_empty() {
+                    for (_, v) in &mut reply.headers {
+                        if let Ok(s) = std::str::from_utf8(v)
+                            && s.contains("__OAUTH_STATE__")
+                        {
+                            *v = s
+                                .replace("__OAUTH_STATE__", &self.last_oauth_state)
+                                .into_bytes();
+                        }
+                    }
+                    if let Ok(s) = std::str::from_utf8(&reply.body)
+                        && s.contains("__OAUTH_STATE__")
+                    {
+                        reply.body = s
+                            .replace("__OAUTH_STATE__", &self.last_oauth_state)
+                            .into_bytes();
+                    }
+                }
                 self.seen_http.push(SeenRequest {
                     account_id: params["account_id"].as_str().unwrap().to_owned(),
                     revision: params["credential_revision"].as_u64().unwrap(),
                     method: params["request"]["method"].as_str().unwrap().to_owned(),
-                    url: params["request"]["url"].as_str().unwrap().to_owned(),
+                    url,
                     headers: serde_json::from_value(params["request"]["headers"].clone()).unwrap(),
                     body_len: payload.len(),
                     body: payload.to_vec(),
@@ -243,10 +348,7 @@ impl FakeHost {
                 Ok((json!({}), Vec::new()))
             }
             "host.log" => {
-                assert!(
-                    !params.to_string().contains(TOKEN),
-                    "a credential reached the log"
-                );
+                self.check_no_leaks(&params.to_string(), "log");
                 Ok((json!({"recorded": true}), Vec::new()))
             }
             _ => panic!("unexpected host callback {method}"),
