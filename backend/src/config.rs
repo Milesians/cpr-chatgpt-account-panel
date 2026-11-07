@@ -8,12 +8,9 @@ use serde_json::Value;
 #[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
-    /// 单密钥或密钥环配置（敏感字段，不输出到日志或调试信息）
-    pub encryption_key: String,
-    /// 多密钥环配置（`kid1:base64key1,kid2:base64key2`）
-    pub encryption_keys: String,
-    /// 当前用于加密新凭据的密钥 ID（单密钥时可留空）
-    pub active_key: String,
+    pub cpr_admin_url: String,
+    /// 敏感字段，不挂 `Debug`
+    pub cpr_admin_api_key: String,
     /// OAuth 回调地址（留空时默认 `http://localhost:1455/auth/callback`）
     pub oauth_redirect: String,
 }
@@ -23,15 +20,5 @@ impl Config {
     #[must_use]
     pub fn from_handshake(value: &Value) -> Self {
         serde_json::from_value(value.clone()).unwrap_or_default()
-    }
-
-    /// 合并 `encryptionKeys` 与 `encryptionKey` 的原始密钥配置
-    #[must_use]
-    pub fn raw_encryption_keys(&self) -> &str {
-        if !self.encryption_keys.trim().is_empty() {
-            self.encryption_keys.trim()
-        } else {
-            self.encryption_key.trim()
-        }
     }
 }

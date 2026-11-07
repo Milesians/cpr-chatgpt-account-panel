@@ -3,19 +3,17 @@ mod support;
 use serde_json::{Value, json};
 use support::{FakeHost, HttpReply, Peer, TOKEN, ok, status};
 
-use cpr_chatgpt_account_panel::login::crypto::{Keyring, base64_url_encode, credential_aad};
+use cpr_chatgpt_account_panel::login::sentinel::base64_url_encode;
 
-const TEST_KEY_RAW: [u8; 32] = [9u8; 32];
 const TEST_PASSWORD: &str = "MyS3cretP@ssw0rd!";
 const TEST_TOTP: &str = "JBSWY3DPEHPK3PXP";
 const NEW_ACCESS_TOKEN_SIG: &str = "new-secret-jwt-signature-part";
 const NEW_REFRESH_TOKEN: &str = "new-secret-refresh-token-value";
 
 fn test_config() -> Value {
-    let key_b64 = base64_url_encode(&TEST_KEY_RAW);
     json!({
-        "encryptionKey": format!("k1:{key_b64}"),
-        "activeKey": "k1",
+        "cprAdminUrl": "http://cpr.test",
+        "cprAdminApiKey": "test-admin-key",
         "oauthRedirect": "http://localhost:1455/auth/callback"
     })
 }
@@ -64,7 +62,7 @@ fn assert_no_secret_in_value(val: &Value, extra_secrets: &[&str]) {
 }
 
 #[tokio::test]
-async fn saving_credentials_requires_encryption_key_and_encrypts_with_aad_in_state() {
+async fn saving_credentials_stores_plaintext_in_state_and_treats_legacy_encrypted_as_none() {
     let mut host = FakeHost::new(&["acct_a"]);
     host.forbidden_secrets = vec![
         TEST_PASSWORD.to_owned(),
@@ -73,29 +71,29 @@ async fn saving_credentials_requires_encryption_key_and_encrypts_with_aad_in_sta
         NEW_REFRESH_TOKEN.to_owned(),
     ];
 
-    // 1. 未配置加密密钥时拒绝保存凭据
-    let mut peer_no_key = Peer::start(json!({})).await;
-    let (code, body) = peer_no_key
-        .api(
-            "POST",
-            "api/login/credentials",
-            "",
-            Some(json!({
-                "accountId": "acct_a",
-                "password": TEST_PASSWORD,
-                "totp": TEST_TOTP,
-            })),
-            &mut host,
-        )
-        .await;
-    assert_eq!(code, 400, "{body}");
-    assert_eq!(body["error"]["code"], "encryption_key_missing");
-    assert!(host.get("login", "acct_a").is_none());
+    // 1. 库里已有旧加密记录（只有 passwordEnc / totpEnc，无明文 password / totp）时，反序列化自然视为未存过密码
+    host.state.insert(
+        ("login".to_owned(), "acct_a".to_owned()),
+        (
+            json!({
+                "email": "acct_a@example.com",
+                "kind": "personal",
+                "passwordEnc": "v1.k1.oldnonce.oldcipher",
+                "totpEnc": "v1.k1.oldnonce.oldtotp"
+            }),
+            1,
+        ),
+    );
 
-    // 2. 配置加密密钥后，用 AES-256-GCM 加密写入私有状态，且绑定 AAD
-    let key_b64 = base64_url_encode(&TEST_KEY_RAW);
-    host.forbidden_secrets.push(key_b64.clone());
-    let mut peer = Peer::start(test_config()).await;
+    let mut peer = Peer::start(json!({})).await;
+    let (code, status_body) = peer
+        .api("GET", "api/login/status", "id=acct_a", None, &mut host)
+        .await;
+    assert_eq!(code, 200, "{status_body}");
+    assert_eq!(status_body["account"]["hasPassword"], false);
+    assert_eq!(status_body["account"]["hasTotp"], false);
+
+    // 2. 不需要加密密钥即可直接保存明文密码与 2FA，且接口响应绝不回显明文
     let (code, body) = peer
         .api(
             "POST",
@@ -110,50 +108,30 @@ async fn saving_credentials_requires_encryption_key_and_encrypts_with_aad_in_sta
         )
         .await;
     assert_eq!(code, 200, "{body}");
-    assert_no_secret_in_value(&body, &[&key_b64]);
+    assert_no_secret_in_value(&body, &[]);
     assert_eq!(body["account"]["hasPassword"], true);
     assert_eq!(body["account"]["hasTotp"], true);
 
     let saved = host.get("login", "acct_a").expect("saved login record");
-    let pw_enc = saved["passwordEnc"].as_str().unwrap();
-    let totp_enc = saved["totpEnc"].as_str().unwrap();
-    assert!(pw_enc.starts_with("v1.k1."));
-    assert!(totp_enc.starts_with("v1.k1."));
-
-    let kr = Keyring::from_config(&format!("k1:{key_b64}"), "k1");
-    assert_eq!(
-        kr.open(pw_enc, &credential_aad("acct_a", "password"))
-            .unwrap(),
-        TEST_PASSWORD
-    );
-    assert_eq!(
-        kr.open(totp_enc, &credential_aad("acct_a", "totp"))
-            .unwrap(),
-        TEST_TOTP
-    );
-    // 跨账号或跨字段 AAD 校验必须失败
-    assert!(
-        kr.open(pw_enc, &credential_aad("acct_b", "password"))
-            .is_err()
-    );
-    assert!(kr.open(pw_enc, &credential_aad("acct_a", "totp")).is_err());
+    assert_eq!(saved["password"], TEST_PASSWORD);
+    assert_eq!(saved["totp"], TEST_TOTP);
+    assert!(saved.get("passwordEnc").is_none());
+    assert!(saved.get("totpEnc").is_none());
 }
 
 #[tokio::test]
 async fn full_login_flow_runs_strictly_through_account_http_and_replaces_cpr_credentials() {
     let mut host = FakeHost::new(&["acct_a"]);
-    let key_b64 = base64_url_encode(&TEST_KEY_RAW);
     host.forbidden_secrets = vec![
         TEST_PASSWORD.to_owned(),
         TEST_TOTP.to_owned(),
-        key_b64.clone(),
         NEW_ACCESS_TOKEN_SIG.to_owned(),
         NEW_REFRESH_TOKEN.to_owned(),
     ];
 
     let mut peer = Peer::start(test_config()).await;
 
-    // 先保存加密凭据
+    // 先保存明文凭据
     let (code, _) = peer
         .api(
             "POST",
@@ -243,7 +221,7 @@ async fn full_login_flow_runs_strictly_through_account_http_and_replaces_cpr_cre
         })),
     ]);
 
-    // 免输密码直接用已保存的加密凭据重新登录
+    // 免输密码直接用已保存的凭据重新登录
     let (code, body) = peer
         .api(
             "POST",
@@ -254,13 +232,13 @@ async fn full_login_flow_runs_strictly_through_account_http_and_replaces_cpr_cre
         )
         .await;
     assert_eq!(code, 200, "{body}");
-    assert_no_secret_in_value(&body, &[&key_b64]);
+    assert_no_secret_in_value(&body, &[]);
     assert_eq!(body["ok"], true);
     assert_eq!(body["account"]["accountId"], "acct_a");
     assert!(body["account"]["lastLoginAtMs"].is_i64());
     assert!(body["account"]["lastError"].is_null());
 
-    // 证明 1：绝不调用 host.http.do，全部出站请求只经 host.http.account
+    // 证明 1：已有账号重登绝不调用 host.http.do，全部出站请求只经 host.http.account
     assert!(
         !host.calls.iter().any(|c| c.starts_with("host.http.do")),
         "unexpected direct http calls: {:?}",
@@ -303,10 +281,8 @@ async fn full_login_flow_runs_strictly_through_account_http_and_replaces_cpr_cre
 #[tokio::test]
 async fn cloudflare_challenge_triggers_browser_challenge_and_manual_oauth_completes() {
     let mut host = FakeHost::new(&["acct_a"]);
-    let key_b64 = base64_url_encode(&TEST_KEY_RAW);
     host.forbidden_secrets = vec![
         TEST_PASSWORD.to_owned(),
-        key_b64.clone(),
         NEW_ACCESS_TOKEN_SIG.to_owned(),
         NEW_REFRESH_TOKEN.to_owned(),
     ];
@@ -335,7 +311,7 @@ async fn cloudflare_challenge_triggers_browser_challenge_and_manual_oauth_comple
         .await;
     assert_eq!(code, 403, "{body}");
     assert_eq!(body["error"]["code"], "browser_challenge");
-    assert_no_secret_in_value(&body, &[&key_b64]);
+    assert_no_secret_in_value(&body, &[]);
 
     // 走手动 OAuth 授权链接兜底
     let (code, start_body) = peer
@@ -375,7 +351,7 @@ async fn cloudflare_challenge_triggers_browser_challenge_and_manual_oauth_comple
         )
         .await;
     assert_eq!(code, 200, "{complete_body}");
-    assert_no_secret_in_value(&complete_body, &[&key_b64]);
+    assert_no_secret_in_value(&complete_body, &[]);
     assert_eq!(complete_body["ok"], true);
     assert_eq!(host.accounts[0]["credential_revision"], 8);
     assert!(
@@ -386,15 +362,13 @@ async fn cloudflare_challenge_triggers_browser_challenge_and_manual_oauth_comple
 }
 
 #[tokio::test]
-async fn paste_preview_and_quick_import_create_account_and_save_encrypted_secrets() {
+async fn import_uses_cpr_admin_oauth_start_and_complete_with_carrier_proxy_and_deletes_staged_email_record()
+ {
     let mut host = FakeHost::new(&["acct_a"]);
-    let key_b64 = base64_url_encode(&TEST_KEY_RAW);
     host.forbidden_secrets = vec![
         TEST_PASSWORD.to_owned(),
         TEST_TOTP.to_owned(),
-        key_b64.clone(),
-        NEW_ACCESS_TOKEN_SIG.to_owned(),
-        NEW_REFRESH_TOKEN.to_owned(),
+        "test-admin-key".to_owned(),
     ];
 
     let mut peer = Peer::start(test_config()).await;
@@ -419,7 +393,7 @@ async fn paste_preview_and_quick_import_create_account_and_save_encrypted_secret
         )
         .await;
     assert_eq!(code, 200, "{preview}");
-    assert_no_secret_in_value(&preview, &[&key_b64]);
+    assert_no_secret_in_value(&preview, &["test-admin-key"]);
     assert_eq!(preview["applied"], false);
     assert_eq!(preview["lines"], 3);
     assert_eq!(preview["created"], 1);
@@ -428,8 +402,33 @@ async fn paste_preview_and_quick_import_create_account_and_save_encrypted_secret
     assert!(host.state.is_empty());
     assert!(host.seen_http.is_empty());
 
-    // 2. 逐个导入新账号到 CPR（借用启用中的 acct_a 代理走 host.http.account）
-    let new_jwt = make_jwt("team_new@example.com", "ws-team-99", "team");
+    // 2. apply = true 暂存到 email:<邮箱>:<kind>
+    let (code, applied) = peer
+        .api(
+            "POST",
+            "api/login/paste",
+            "",
+            Some(json!({
+                "text": paste_text,
+                "apply": true,
+            })),
+            &mut host,
+        )
+        .await;
+    assert_eq!(code, 200, "{applied}");
+    assert_eq!(applied["applied"], true);
+    let staged = host
+        .get("login", "email:team_new@example.com:team")
+        .expect("staged email record should exist before import");
+    assert_eq!(staged["password"], TEST_PASSWORD);
+    assert_eq!(staged["totp"], TEST_TOTP);
+
+    // 3. 逐个导入新账号到 CPR：
+    //    - 先经管理接口 GET /api/admin/accounts 查借道账号 acct_a 的 outboundProxyId ("proxy-acct_a")
+    //    - 再经管理接口 POST /api/admin/accounts/oauth/start（带 outboundProxyId，不带 accountId，name 为邮箱）
+    //    - 借道 acct_a 的 host.http.account 跑完登录步骤截获回调 URL（插件自己不调 /oauth/token）
+    //    - 交给管理接口 POST /api/admin/accounts/oauth/complete 由 CPR 用该代理换码建号
+    //    - 完成后把明文密码/2FA 存到新账号 ID 下，并用 host.state.delete 删掉 email:team_new@example.com:team 暂存记录
     host.http.extend([
         redirect("https://auth.openai.com/log-in"),
         status(200, json!({})),
@@ -437,11 +436,6 @@ async fn paste_preview_and_quick_import_create_account_and_save_encrypted_secret
         ok(json!({"page": {"type": "password"}})),
         ok(json!({"token": "t2", "proofofwork": {"required": false}})),
         redirect("http://localhost:1455/auth/callback?code=import_code_1&state=__OAUTH_STATE__"),
-        ok(json!({
-            "access_token": new_jwt,
-            "refresh_token": NEW_REFRESH_TOKEN,
-            "id_token": ""
-        })),
     ]);
 
     let (code, imported) = peer
@@ -451,8 +445,6 @@ async fn paste_preview_and_quick_import_create_account_and_save_encrypted_secret
             "",
             Some(json!({
                 "email": "team_new@example.com",
-                "password": TEST_PASSWORD,
-                "totp": TEST_TOTP,
                 "kind": "team",
                 "viaAccountId": "acct_a",
             })),
@@ -460,7 +452,7 @@ async fn paste_preview_and_quick_import_create_account_and_save_encrypted_secret
         )
         .await;
     assert_eq!(code, 200, "{imported}");
-    assert_no_secret_in_value(&imported, &[&key_b64]);
+    assert_no_secret_in_value(&imported, &["test-admin-key"]);
     assert_eq!(imported["ok"], true);
     let new_id = imported["accountId"].as_str().unwrap();
     assert_eq!(new_id, "acct_created_2");
@@ -468,26 +460,56 @@ async fn paste_preview_and_quick_import_create_account_and_save_encrypted_secret
     assert_eq!(imported["hasPassword"], true);
     assert_eq!(imported["hasTotp"], true);
 
-    // 确认加密后的凭据已关联保存到新账号 ID 下
+    // 证明 1：导入只调了 GET /api/admin/accounts、POST /api/admin/accounts/oauth/start 和 POST /api/admin/accounts/oauth/complete
+    assert_eq!(
+        host.cpr_admin_calls,
+        vec![
+            "GET /api/admin/accounts",
+            "POST /api/admin/accounts/oauth/start",
+            "POST /api/admin/accounts/oauth/complete",
+        ]
+    );
+    assert_eq!(host.cpr_oauth_starts.len(), 1);
+    assert_eq!(
+        host.cpr_oauth_starts[0],
+        json!({
+            "provider": "openai",
+            "name": "team_new@example.com",
+            "outboundProxyId": "proxy-acct_a",
+        })
+    );
+    assert!(host.cpr_oauth_starts[0].get("accountId").is_none());
+    assert_eq!(host.cpr_oauth_completes.len(), 1);
+    assert_eq!(host.cpr_oauth_completes[0]["provider"], "openai");
+    assert_eq!(host.cpr_oauth_completes[0]["flowId"], "flow_1");
+    assert!(
+        host.cpr_oauth_completes[0]["callbackUrl"]
+            .as_str()
+            .unwrap()
+            .contains("code=import_code_1")
+    );
+
+    // 证明 2：没有调用 host.auth.save Create
+    assert!(
+        !host.calls.iter().any(|c| c == "host.auth.save"),
+        "import must not call host.auth.save: {:?}",
+        host.calls
+    );
+
+    // 证明 3：确认明文凭据已关联保存到新账号 ID 下，且暂存的 email:<邮箱>:<kind> 键已被 host.state.delete 删除
     let saved = host
         .get("login", new_id)
         .expect("saved new account login record");
-    let kr = Keyring::from_config(&format!("k1:{key_b64}"), "k1");
-    assert_eq!(
-        kr.open(
-            saved["passwordEnc"].as_str().unwrap(),
-            &credential_aad(new_id, "password")
-        )
-        .unwrap(),
-        TEST_PASSWORD
+    assert_eq!(saved["password"], TEST_PASSWORD);
+    assert_eq!(saved["totp"], TEST_TOTP);
+    assert!(
+        host.get("login", "email:team_new@example.com:team")
+            .is_none(),
+        "staged email: key must be deleted after import"
     );
-    assert_eq!(
-        kr.open(
-            saved["totpEnc"].as_str().unwrap(),
-            &credential_aad(new_id, "totp")
-        )
-        .unwrap(),
-        TEST_TOTP
+    assert!(
+        host.calls.iter().any(|c| c == "host.state.delete"),
+        "expected host.state.delete call"
     );
 
     // 再次导入同一邮箱 + 类型时返回 already_in_source
@@ -508,9 +530,34 @@ async fn paste_preview_and_quick_import_create_account_and_save_encrypted_secret
         .await;
     assert_eq!(code, 409, "{dup}");
     assert_eq!(dup["error"]["code"], "already_in_source");
-    assert!(
-        !host.calls.iter().any(|c| c.starts_with("host.http.do")),
-        "unexpected direct http calls: {:?}",
-        host.calls
-    );
+}
+
+#[tokio::test]
+async fn import_rejects_when_carrier_account_has_no_bound_proxy() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    // 借道账号未绑定代理（outboundProxyId 为 null）
+    host.cpr_account_proxies.insert("acct_a".to_owned(), None);
+
+    let mut peer = Peer::start(test_config()).await;
+    let (code, body) = peer
+        .api(
+            "POST",
+            "api/login/import",
+            "",
+            Some(json!({
+                "email": "direct_forbidden@example.com",
+                "password": TEST_PASSWORD,
+                "kind": "personal",
+                "viaAccountId": "acct_a",
+            })),
+            &mut host,
+        )
+        .await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(body["error"]["code"], "source_proxy_unavailable");
+    assert_eq!(host.cpr_admin_calls, vec!["GET /api/admin/accounts"]);
+    assert!(host.cpr_oauth_starts.is_empty());
+    assert!(host.cpr_oauth_completes.is_empty());
+    assert!(host.seen_http.is_empty());
+    assert!(!host.calls.iter().any(|c| c == "host.auth.save"));
 }

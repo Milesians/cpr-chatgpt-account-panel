@@ -4,6 +4,7 @@
 //!
 //! 登录（用登录凭据换令牌、快速导入）在 `login` 模块，单独维护
 
+pub mod admin;
 pub mod api;
 pub mod billing;
 pub mod chatgpt;

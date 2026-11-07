@@ -6,8 +6,9 @@ use gateway_plugin_sdk::{
         data::{QuotaFacts, QuotaFactsQuery},
         host::{
             AuthCredential, AuthGetRequest, AuthListRequest, AuthListResult, AuthRuntimeAccount,
-            AuthSaveRequest, AuthSaveResult, LogLevel, LogRequest, StateGetRequest, StateGetResult,
-            StatePutRequest, StatePutResult, StateRecord,
+            AuthSaveRequest, AuthSaveResult, LogLevel, LogRequest, StateDeleteRequest,
+            StateDeleteResult, StateGetRequest, StateGetResult, StatePutRequest, StatePutResult,
+            StateRecord,
         },
     },
     client::{HostClient, SessionError},
@@ -182,6 +183,29 @@ pub async fn state_put(
     )
     .await?;
     Ok(result.version)
+}
+
+/// 删一条私有状态（带版本号 `expected_version`）
+///
+/// # Errors
+/// 版本冲突（`Conflict`）或回调失败时返回错误
+pub async fn state_delete(
+    host: &HostClient,
+    namespace: &str,
+    key: &str,
+    expected_version: u64,
+) -> Result<bool, PluginFault> {
+    let result: StateDeleteResult = metadata_call(
+        host,
+        "host.state.delete",
+        &StateDeleteRequest {
+            namespace: namespace.to_owned(),
+            key: key.to_owned(),
+            expected_version,
+        },
+    )
+    .await?;
+    Ok(result.deleted)
 }
 
 /// 读取 CPR 当前使用的 OpenAI 全局客户端身份（UA、originator），不发出上游请求

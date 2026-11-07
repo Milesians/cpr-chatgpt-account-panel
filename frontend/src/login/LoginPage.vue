@@ -30,8 +30,6 @@ interface ImportExecutionState {
 }
 
 const loadingOverview = ref(false)
-const encryptionConfigured = ref(false)
-const encryptionError = ref<string | null>(null)
 const accounts = ref<AccountLoginStatus[]>([])
 const overviewError = ref('')
 
@@ -82,10 +80,7 @@ async function loadOverview() {
   overviewError.value = ''
   try {
     const r = await loginApi.overview()
-    encryptionConfigured.value = r.encryptionConfigured
-    encryptionError.value = r.encryptionError
     accounts.value = r.accounts
-    quickSave.value = r.encryptionConfigured
     if (!viaAccountId.value) {
       const firstEnabled = r.accounts.find(a => a.enabled)
       if (firstEnabled)
@@ -172,7 +167,7 @@ async function executeImportTask(task: QueuedImportTask) {
       kind: task.kind,
       ...(viaAccountId.value ? { viaAccountId: viaAccountId.value } : {}),
       replaceExisting: task.action === 'update',
-      saveCredentials: encryptionConfigured.value,
+      saveCredentials: true,
     })
     rowStates.value[task.line] = {
       status: 'ok',
@@ -315,7 +310,7 @@ async function runQuickRelogin(acct: AccountLoginStatus) {
       ...(isExpanded && quickPassword.value ? { password: quickPassword.value } : {}),
       ...(isExpanded && quickTotp.value.trim() ? { totp: quickTotp.value.trim() } : {}),
       ...(isExpanded && quickWorkspaceId.value.trim() ? { workspaceId: quickWorkspaceId.value.trim() } : {}),
-      saveCredentials: isExpanded && quickSave.value && encryptionConfigured.value,
+      saveCredentials: isExpanded && quickSave.value,
     })
     accounts.value = accounts.value.map(a => a.accountId === acct.accountId ? r.account : a)
     accountFeedback.value[acct.accountId] = {
@@ -349,12 +344,6 @@ onMounted(loadOverview)
   <div class="detail-page">
     <p v-if="overviewError" class="banner banner-error" role="alert">
       {{ overviewError }}
-    </p>
-    <p v-if="encryptionError" class="banner banner-error" role="alert">
-      加密配置错误：{{ encryptionError }}
-    </p>
-    <p v-else-if="!encryptionConfigured && !loadingOverview" class="banner banner-warn">
-      提示：当前尚未在插件敏感设置中配置 <code>encryptionKey</code>。单次输入密码登录或导入仍可运行，但若需持久化保存密码与 2FA 密钥（免输重登），请先在插件设置中填写 32 字节密钥。
     </p>
 
     <!-- 1. 快速导入模块 -->
@@ -582,7 +571,7 @@ onMounted(loadOverview)
             CPR 已有账号快速重新登录
           </h2>
           <span class="muted">
-            支持直接使用已加密保存的凭据免输重登，或输入新凭据登录并写回 CPR
+            支持直接使用已保存的凭据免输重登，或输入新凭据登录并写回 CPR
           </span>
         </div>
       </div>
@@ -620,10 +609,10 @@ onMounted(loadOverview)
 
             <div class="flex flex-wrap gap-1">
               <ZTag size="small" :type="acct.hasPassword ? 'success' : 'default'">
-                {{ acct.hasPassword ? '密码已存' : '无密码' }}
+                {{ acct.hasPassword ? '已保存密码' : '无密码' }}
               </ZTag>
               <ZTag size="small" :type="acct.hasTotp ? 'success' : 'default'">
-                {{ acct.hasTotp ? '2FA 已存' : '无 2FA' }}
+                {{ acct.hasTotp ? '已保存 2FA' : '无 2FA' }}
               </ZTag>
             </div>
 
@@ -706,8 +695,8 @@ onMounted(loadOverview)
             </div>
             <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
               <label class="inline-flex cursor-pointer items-center gap-1.5 text-cp-text-secondary">
-                <input v-model="quickSave" type="checkbox" :disabled="!encryptionConfigured">
-                <span>加密保存凭据到插件私有状态</span>
+                <input v-model="quickSave" type="checkbox">
+                <span>保存凭据到插件私有状态</span>
               </label>
               <ZButton
                 type="primary"

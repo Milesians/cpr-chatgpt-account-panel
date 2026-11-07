@@ -64,9 +64,8 @@ export interface QueuedImportTask {
 }
 
 const ERROR_LABELS: Record<string, string> = {
-  encryption_key_missing: '未配置加密密钥',
-  encryption_key_invalid: '加密密钥配置有误',
-  credential_decrypt_failed: '凭据解密失败',
+  admin_config_invalid: 'CPR 管理接口未配置',
+  admin_error: 'CPR 管理接口调用失败',
   source_proxy_unavailable: '账号绑定代理不可用',
   browser_challenge: '需浏览器验证（Cloudflare）',
   rate_limited: '请求过于频繁（429）',

@@ -5,7 +5,7 @@ import { buildImportQueue, errorCodeLabel, needsManualOAuth } from '../src/login
 test('maps login error codes and detects manual OAuth fallback conditions', () => {
   assert.equal(errorCodeLabel('browser_challenge'), '需浏览器验证（Cloudflare）')
   assert.equal(errorCodeLabel('source_proxy_unavailable'), '账号绑定代理不可用')
-  assert.equal(errorCodeLabel('encryption_key_missing'), '未配置加密密钥')
+  assert.equal(errorCodeLabel('admin_config_invalid'), 'CPR 管理接口未配置')
   assert.equal(errorCodeLabel(null), '未知错误')
 
   assert.equal(needsManualOAuth('browser_challenge'), true)

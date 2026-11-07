@@ -11,8 +11,6 @@ import { errorCodeLabel, needsManualOAuth } from './helpers'
 const props = defineProps<{ accountId: string }>()
 
 const status = ref<AccountLoginStatus | null>(null)
-const encryptionConfigured = ref(false)
-const encryptionError = ref<string | null>(null)
 const loadingStatus = ref(false)
 const runningLogin = ref(false)
 const savingCreds = ref(false)
@@ -49,9 +47,6 @@ async function loadStatus() {
   try {
     const r = await loginApi.accountStatus(props.accountId)
     status.value = r.account
-    encryptionConfigured.value = r.encryptionConfigured
-    encryptionError.value = r.encryptionError
-    saveCredentials.value = r.encryptionConfigured
     if (r.account.pendingOauth) {
       authorizeUrl.value = r.account.pendingOauth.authorizeUrl
       showManualOAuth.value = true
@@ -83,7 +78,7 @@ async function handleRunLogin() {
       accountId: props.accountId,
       ...(password.value ? { password: password.value } : {}),
       ...(totp.value.trim() ? { totp: totp.value.trim() } : {}),
-      saveCredentials: saveCredentials.value && encryptionConfigured.value,
+      saveCredentials: saveCredentials.value,
       ...(workspaceId.value.trim() ? { workspaceId: workspaceId.value.trim() } : {}),
       ...(organizationId.value.trim() ? { organizationId: organizationId.value.trim() } : {}),
     })
@@ -127,7 +122,7 @@ async function handleSaveCredentials() {
     status.value = r.account
     password.value = ''
     totp.value = ''
-    successMsg.value = '凭据已使用 AES-256-GCM 加密保存到私有状态'
+    successMsg.value = '凭据已保存到私有状态'
   }
   catch (e) {
     const err = e as ApiError
@@ -151,7 +146,7 @@ async function handleClearCredentials() {
       clearTotp: true,
     })
     status.value = r.account
-    successMsg.value = '已清除该账号保存的加密密码与 2FA 密钥'
+    successMsg.value = '已清除该账号保存的密码与 2FA 密钥'
   }
   catch (e) {
     const err = e as ApiError
@@ -252,13 +247,10 @@ onMounted(loadStatus)
         </h3>
         <template v-if="status">
           <ZTag size="small" :type="status.hasPassword ? 'success' : 'default'">
-            {{ status.hasPassword ? '已存加密密码' : '未存密码' }}
+            {{ status.hasPassword ? '已保存密码' : '未存密码' }}
           </ZTag>
           <ZTag size="small" :type="status.hasTotp ? 'success' : 'default'">
-            {{ status.hasTotp ? '已存加密 2FA' : '未存 2FA' }}
-          </ZTag>
-          <ZTag v-if="!encryptionConfigured" size="small" type="warning">
-            未配加密密钥
+            {{ status.hasTotp ? '已保存 2FA' : '未存 2FA' }}
           </ZTag>
         </template>
         <span v-if="status?.lastLoginAtMs" class="muted">
@@ -291,9 +283,6 @@ onMounted(loadStatus)
     <p v-if="blockedByDisabled" class="banner banner-warn">
       账号在 CPR 里已停用，停用的账号不能经它的绑定代理发起登录请求。
     </p>
-    <p v-if="encryptionError" class="banner banner-error" role="alert">
-      加密配置错误：{{ encryptionError }}
-    </p>
     <p v-if="errorMsg" class="banner banner-error" role="alert">
       <strong v-if="errorCode">[{{ errorCodeLabel(errorCode) }}] </strong>{{ errorMsg }}
     </p>
@@ -312,7 +301,7 @@ onMounted(loadStatus)
           type="password"
           autocomplete="new-password"
           class="cp-input"
-          :placeholder="status?.hasPassword ? '已加密保存，留空则直接使用已保存密码' : '输入 OpenAI 登录密码'"
+          :placeholder="status?.hasPassword ? '已保存密码，留空则直接使用已保存密码' : '输入 OpenAI 登录密码'"
         >
       </label>
       <label class="form-field">
@@ -322,7 +311,7 @@ onMounted(loadStatus)
           type="password"
           autocomplete="off"
           class="cp-input"
-          :placeholder="status?.hasTotp ? '已加密保存，留空则直接使用已保存 2FA' : '选填：Base32 密钥或 otpauth://totp/ 链接'"
+          :placeholder="status?.hasTotp ? '已保存 2FA，留空则直接使用已保存 2FA' : '选填：Base32 密钥或 otpauth://totp/ 链接'"
         >
       </label>
     </div>
@@ -353,11 +342,9 @@ onMounted(loadStatus)
         <input
           v-model="saveCredentials"
           type="checkbox"
-          :disabled="!encryptionConfigured"
         >
         <span>
-          登录时加密保存新输入的密码与 2FA
-          <template v-if="!encryptionConfigured">（需先在插件设置中填写 encryptionKey）</template>
+          登录时保存新输入的密码与 2FA
         </span>
       </label>
       <div class="flex flex-wrap gap-2">
@@ -367,10 +354,10 @@ onMounted(loadStatus)
         <ZButton
           size="small"
           :loading="savingCreds"
-          :disabled="!encryptionConfigured || (!password && !totp.trim())"
+          :disabled="!password && !totp.trim()"
           @click="handleSaveCredentials"
         >
-          <Lock :size="13" aria-hidden="true" /> 仅加密保存凭据
+          <Lock :size="13" aria-hidden="true" /> 仅保存凭据
         </ZButton>
         <ZButton
           v-if="status?.hasPassword || status?.hasTotp"

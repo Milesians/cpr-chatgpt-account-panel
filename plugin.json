@@ -20,17 +20,18 @@
   "configurationSchema": {
     "type": "object",
     "properties": {
-      "encryptionKey": {
+      "cprAdminUrl": {
         "type": "string",
-        "description": "AES-256-GCM 凭据加密密钥（32 字节 Base64/Hex 密钥，或 kid:base64key 多密钥格式）"
+        "title": "CPR 地址（导入新账号复用代理用）",
+        "description": "插件连 CPR 管理接口的地址，如 http://127.0.0.1:8080；导入新账号时用它调 oauth/start 与 oauth/complete 以绑定借道账号的出站代理",
+        "maxLength": 512,
+        "default": ""
       },
-      "encryptionKeys": {
+      "cprAdminApiKey": {
         "type": "string",
-        "description": "AES-256-GCM 凭据加密密钥环（kid1:base64key1,kid2:base64key2）"
-      },
-      "activeKey": {
-        "type": "string",
-        "description": "当前用于加密新凭据的密钥 ID（单密钥时可留空）"
+        "title": "CPR 管理 API Key（敏感字段）",
+        "description": "CPR 设置里生成的管理 API Key；插件只用它读借道账号的代理并完成新账号 OAuth 导入。通过 CPR 独立敏感配置保存",
+        "maxLength": 512
       },
       "oauthRedirect": {
         "type": "string",
@@ -40,8 +41,7 @@
     "additionalProperties": false
   },
   "secretFields": [
-    "encryptionKey",
-    "encryptionKeys"
+    "cprAdminApiKey"
   ],
   "resources": {
     "web/index.html": "text/html",

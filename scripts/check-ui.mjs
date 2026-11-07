@@ -391,13 +391,11 @@ const bridgePayload = {
   devices: { devices: mockDevices },
   signOutVoided: { signed_out: 3, remaining: 0, cpr_voided: true },
   loginOverview: {
-    encryptionConfigured: true,
-    encryptionError: null,
+    oauthRedirect: 'http://localhost:1455/auth/callback',
     accounts: mockLoginAccounts,
   },
   loginAccountStatus: {
-    encryptionConfigured: true,
-    encryptionError: null,
+    oauthRedirect: 'http://localhost:1455/auth/callback',
     account: mockLoginAccounts[0],
   },
   pastePreview: mockPastePreview,
@@ -447,7 +445,7 @@ window.codexProxyPlugin = {
       const id = query.id || payload.accountId;
       if (id) {
         const found = __MOCK__.loginOverview.accounts.find(a => a.accountId === id) || __MOCK__.loginOverview.accounts[0];
-        return __reply({ encryptionConfigured: true, encryptionError: null, account: found });
+        return __reply({ oauthRedirect: 'http://localhost:1455/auth/callback', account: found });
       }
       return __reply(__MOCK__.loginOverview);
     }

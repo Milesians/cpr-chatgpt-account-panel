@@ -5,15 +5,11 @@ import type {
 import { call } from '../api'
 
 export interface LoginStatusOverview {
-  encryptionConfigured: boolean
-  encryptionError: string | null
   oauthRedirect: string
   accounts: AccountLoginStatus[]
 }
 
 export interface SingleAccountLoginStatus {
-  encryptionConfigured: boolean
-  encryptionError: string | null
   oauthRedirect: string
   account: AccountLoginStatus
 }

@@ -80,6 +80,14 @@ pub struct FakeHost {
     pub seen_http: Vec<SeenRequest>,
     pub calls: Vec<String>,
     pub last_oauth_state: String,
+    /// 假的 CPR 管理接口（`http://cpr.test`）
+    pub cpr_admin_key: String,
+    pub cpr_account_proxies: HashMap<String, Option<String>>,
+    pub cpr_admin_calls: Vec<String>,
+    pub cpr_oauth_starts: Vec<Value>,
+    pub cpr_oauth_completes: Vec<Value>,
+    pub cpr_next_plan_type: Option<String>,
+    cpr_pending_flows: HashMap<String, (String, String, String)>,
     streams: HashMap<String, Vec<u8>>,
     next_version: u64,
 }
@@ -98,8 +106,14 @@ pub fn account(id: &str) -> Value {
 #[allow(dead_code)]
 impl FakeHost {
     pub fn new(accounts: &[&str]) -> Self {
+        let mut cpr_account_proxies = HashMap::new();
+        for &id in accounts {
+            cpr_account_proxies.insert(id.to_owned(), Some(format!("proxy-{id}")));
+        }
         Self {
             accounts: accounts.iter().map(|id| account(id)).collect(),
+            cpr_admin_key: "test-admin-key".to_owned(),
+            cpr_account_proxies,
             ..Self::default()
         }
     }
@@ -117,6 +131,125 @@ impl FakeHost {
                 !secret.is_empty() && !text.contains(secret),
                 "secret {secret} reached {target}: {text}"
             );
+        }
+    }
+
+    fn cpr_admin(&mut self, params: &Value, payload: &[u8]) -> (u16, Value) {
+        let method = params["method"].as_str().unwrap().to_owned();
+        let url = params["url"].as_str().unwrap();
+        let path = url
+            .trim_start_matches("http://cpr.test")
+            .split('?')
+            .next()
+            .unwrap()
+            .to_owned();
+        self.cpr_admin_calls.push(format!("{method} {path}"));
+        let key = params["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h[0].as_str().unwrap().eq_ignore_ascii_case("x-api-key"))
+            .map(|h| {
+                let bytes: Vec<u8> = serde_json::from_value(h[1].clone()).unwrap();
+                String::from_utf8(bytes).unwrap()
+            });
+        if key.as_deref() != Some(self.cpr_admin_key.as_str()) || self.cpr_admin_key.is_empty() {
+            return (
+                401,
+                json!({"code": 401, "message": "invalid admin api key", "data": null}),
+            );
+        }
+        let ok = |data: Value| (200, json!({"code": 200, "message": "ok", "data": data}));
+        match (method.as_str(), path.as_str()) {
+            ("GET", "/api/admin/accounts") => {
+                assert!(url.contains("provider=openai"));
+                let items: Vec<Value> = self
+                    .accounts
+                    .iter()
+                    .map(|a| {
+                        let id = a["account_id"].as_str().unwrap();
+                        let proxy = self.cpr_account_proxies.get(id).cloned().unwrap_or(None);
+                        json!({
+                            "id": id,
+                            "name": a["name"],
+                            "email": a["email"],
+                            "planType": a["plan_type"],
+                            "provider": "openai",
+                            "outboundProxyId": proxy,
+                        })
+                    })
+                    .collect();
+                ok(json!({"items": items, "page": {"totalPages": 1}}))
+            }
+            ("POST", "/api/admin/accounts/oauth/start") => {
+                let body: Value = serde_json::from_slice(payload).unwrap();
+                self.cpr_oauth_starts.push(body.clone());
+                assert_eq!(body["provider"], "openai");
+                assert!(
+                    body.get("accountId").is_none(),
+                    "oauth/start for new import must not send accountId: {body}"
+                );
+                let name = body["name"].as_str().unwrap().to_owned();
+                let proxy_id = body["outboundProxyId"].as_str().unwrap().to_owned();
+                assert!(!proxy_id.is_empty(), "outboundProxyId must be non-empty");
+                let idx = self.cpr_oauth_starts.len();
+                let flow_id = format!("flow_{idx}");
+                let state = format!("cpr_oauth_state_{idx}");
+                self.last_oauth_state.clone_from(&state);
+                let auth_url = format!(
+                    "https://auth.openai.com/oauth/authorize?client_id=app_EMoamEEZ73f0CkXaXp7hrann&code_challenge=ch_{idx}&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&response_type=code&scope=openid+profile+email+offline_access&state={state}"
+                );
+                self.cpr_pending_flows
+                    .insert(flow_id.clone(), (name, proxy_id, state));
+                ok(json!({
+                    "flowId": flow_id,
+                    "authorizationUrl": auth_url,
+                    "expiresAt": "2026-11-07T12:00:00Z",
+                }))
+            }
+            ("POST", "/api/admin/accounts/oauth/complete") => {
+                let body: Value = serde_json::from_slice(payload).unwrap();
+                self.cpr_oauth_completes.push(body.clone());
+                assert_eq!(body["provider"], "openai");
+                let flow_id = body["flowId"].as_str().unwrap();
+                let callback_url = body["callbackUrl"].as_str().unwrap();
+                let (email, proxy_id, expected_state) = self
+                    .cpr_pending_flows
+                    .remove(flow_id)
+                    .expect("unknown or already completed flowId");
+                assert!(
+                    callback_url.contains(&format!("state={expected_state}")),
+                    "callbackUrl {callback_url} did not contain expected state {expected_state}"
+                );
+                assert!(
+                    callback_url.contains("code="),
+                    "callbackUrl {callback_url} did not contain code"
+                );
+                let id = format!("acct_created_{}", self.accounts.len() + 1);
+                let plan_type = self
+                    .cpr_next_plan_type
+                    .clone()
+                    .unwrap_or_else(|| "team".to_owned());
+                self.accounts.push(json!({
+                    "account_id": id,
+                    "provider_id": "openai",
+                    "credential_revision": 1,
+                    "name": email,
+                    "email": email,
+                    "upstream_user_id": "user-imported",
+                    "upstream_account_id": format!("chatgpt-{id}"),
+                    "plan_type": plan_type,
+                    "authentication_kind": "oauth",
+                    "enabled": true,
+                    "credential_state": "ready",
+                    "has_refresh_token": true,
+                    "access_token_expires_at_ms": 4_102_444_800_000_i64,
+                    "next_refresh_at_ms": null,
+                }));
+                self.cpr_account_proxies.insert(id.clone(), Some(proxy_id));
+                ok(json!({ "accountId": id }))
+            }
+            _ => panic!("plugin called an unexpected CPR admin route: {method} {path}"),
         }
     }
 
@@ -196,29 +329,10 @@ impl FakeHost {
                         let out = json!({"account_id": id, "credential_revision": new_rev});
                         Ok((json!({}), serde_json::to_vec(&out).unwrap()))
                     }
-                    AuthSaveRequest::Create { provider_id, facts } => {
-                        assert_eq!(provider_id, "openai");
-                        let facts_val = serde_json::to_value(&facts).unwrap();
-                        let id = format!("acct_created_{}", self.accounts.len() + 1);
-                        self.accounts.push(json!({
-                            "account_id": id,
-                            "provider_id": "openai",
-                            "credential_revision": 1,
-                            "name": facts_val["name"],
-                            "email": facts_val["email"],
-                            "upstream_user_id": facts_val["upstream_user_id"],
-                            "upstream_account_id": facts_val["upstream_account_id"],
-                            "plan_type": facts_val["plan_type"],
-                            "authentication_kind": facts_val["authentication_kind"],
-                            "enabled": true,
-                            "credential_state": "ready",
-                            "has_refresh_token": facts_val["has_refresh_token"],
-                            "access_token_expires_at_ms": facts_val["access_token_expires_at_ms"],
-                            "next_refresh_at_ms": null,
-                        }));
-                        self.saved_credentials.insert(id.clone(), facts_val);
-                        let out = json!({"account_id": id, "credential_revision": 1});
-                        Ok((json!({}), serde_json::to_vec(&out).unwrap()))
+                    AuthSaveRequest::Create { .. } => {
+                        panic!(
+                            "host.auth.save Create should not be called; use CPR Admin oauth/start + oauth/complete instead"
+                        );
                     }
                 }
             }
@@ -268,11 +382,32 @@ impl FakeHost {
                     key.1,
                     text.len()
                 );
-                self.check_no_leaks(&text, "private state");
+                // 对 usage、payments 两个命名空间保留“访问令牌不能进来”的断言；
+                // 对 login 命名空间放开登录凭据（但仍不允许访问令牌进入）
+                assert!(!text.contains(TOKEN), "a credential reached private state");
+                if key.0 != "login" {
+                    self.check_no_leaks(&text, "private state");
+                }
                 self.next_version += 1;
                 self.state
                     .insert(key, (params["value"].clone(), self.next_version));
                 Ok((json!({"version": self.next_version}), Vec::new()))
+            }
+            "host.state.delete" => {
+                let key = (
+                    params["namespace"].as_str().unwrap().to_owned(),
+                    params["key"].as_str().unwrap().to_owned(),
+                );
+                let expected = params["expected_version"].as_u64().unwrap();
+                match self.state.get(&key) {
+                    Some((_, ver)) if *ver != expected => {
+                        return Err(PluginFault::new(ErrorCode::Conflict, "version"));
+                    }
+                    None => return Ok((json!({"deleted": false}), Vec::new())),
+                    _ => {}
+                }
+                let deleted = self.state.remove(&key).is_some();
+                Ok((json!({"deleted": deleted}), Vec::new()))
             }
             "host.services.call" => {
                 assert_eq!(
@@ -284,6 +419,20 @@ impl FakeHost {
                     "originator":"codex_cli_rs", "codexVersion":"0.156.1", "source":"global"
                 });
                 Ok((json!({"Ok":profile}), Vec::new()))
+            }
+            "host.http.do_stream"
+                if params["url"]
+                    .as_str()
+                    .is_some_and(|u| u.starts_with("http://cpr.test/")) =>
+            {
+                let (status, body) = self.cpr_admin(params, payload);
+                let id = format!("cpr-stream-{}", self.cpr_admin_calls.len());
+                self.streams
+                    .insert(id.clone(), serde_json::to_vec(&body).unwrap());
+                Ok((
+                    json!({"status": status, "http_version": "HTTP/1.1", "headers": [], "stream": id, "trailers": []}),
+                    Vec::new(),
+                ))
             }
             "host.http.account" => {
                 let mut reply = self

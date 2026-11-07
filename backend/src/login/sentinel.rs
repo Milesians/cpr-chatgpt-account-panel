@@ -1,10 +1,134 @@
 //! 浏览器身份画像（`Identity`）与 OpenAI Sentinel PoW 令牌计算
 
+use std::fs::File;
+use std::io::Read;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::clock::now_ms;
-use crate::login::crypto::{base64_std_encode, fill_random_bytes, random_uuid_v4};
+
+const STD_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const URL_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// 标准 Base64 编码（带 `=` 填充）
+#[must_use]
+pub fn base64_std_encode(input: &[u8]) -> String {
+    base64_encode_with(input, STD_ALPHABET, true)
+}
+
+/// URL 安全 Base64 编码（无 `=` 填充）
+#[must_use]
+pub fn base64_url_encode(input: &[u8]) -> String {
+    base64_encode_with(input, URL_ALPHABET, false)
+}
+
+fn base64_encode_with(input: &[u8], alphabet: &[u8; 64], pad: bool) -> String {
+    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
+    let (chunks, rem) = input.as_chunks::<3>();
+    for chunk in chunks {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+        out.push(alphabet[((n >> 18) & 0x3f) as usize]);
+        out.push(alphabet[((n >> 12) & 0x3f) as usize]);
+        out.push(alphabet[((n >> 6) & 0x3f) as usize]);
+        out.push(alphabet[(n & 0x3f) as usize]);
+    }
+    match rem.len() {
+        1 => {
+            let n = u32::from(rem[0]) << 16;
+            out.push(alphabet[((n >> 18) & 0x3f) as usize]);
+            out.push(alphabet[((n >> 12) & 0x3f) as usize]);
+            if pad {
+                out.push(b'=');
+                out.push(b'=');
+            }
+        }
+        2 => {
+            let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
+            out.push(alphabet[((n >> 18) & 0x3f) as usize]);
+            out.push(alphabet[((n >> 12) & 0x3f) as usize]);
+            out.push(alphabet[((n >> 6) & 0x3f) as usize]);
+            if pad {
+                out.push(b'=');
+            }
+        }
+        _ => {}
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// 兼容标准与 URL 安全 Base64 解码（自动处理有无 `=` 填充）
+///
+/// # Errors
+/// 非法 Base64 字符或长度时返回错误
+pub fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
+    let trimmed = input.trim().trim_end_matches('=');
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if trimmed.len() % 4 == 1 {
+        return Err("invalid base64 length");
+    }
+    let mut out = Vec::with_capacity(trimmed.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for b in trimmed.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return Err("invalid base64 character"),
+        };
+        buf = (buf << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// 从操作系统熵源读取随机字节
+///
+/// # Errors
+/// 读取 `/dev/urandom` 失败时返回错误
+pub fn fill_random_bytes(dest: &mut [u8]) -> Result<(), &'static str> {
+    let mut f = File::open("/dev/urandom").map_err(|_| "random failed")?;
+    f.read_exact(dest).map_err(|_| "random failed")
+}
+
+/// 生成符合 RFC 4122 的随机 UUID v4
+///
+/// # Errors
+/// 熵源不可用时返回错误
+pub fn random_uuid_v4() -> Result<String, &'static str> {
+    let mut b = [0u8; 16];
+    fill_random_bytes(&mut b)?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
+        b[15]
+    ))
+}
 
 pub const DEFAULT_SENTINEL_URL: &str = "https://sentinel.openai.com/backend-api/sentinel/req";
 pub const DEFAULT_SENTINEL_SDK: &str = "https://sentinel.openai.com/sentinel/sdk.js";

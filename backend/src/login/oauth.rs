@@ -17,10 +17,10 @@ use sha2::{Digest, Sha256};
 use crate::api::parse_query;
 use crate::chatgpt::encode;
 use crate::clock::now_ms;
-use crate::login::crypto::{base64_decode, base64_url_encode, fill_random_bytes};
 use crate::login::sentinel::{
     BrowserProfile, DEFAULT_SENTINEL_ORIGIN, DEFAULT_SENTINEL_REFERER, DEFAULT_SENTINEL_URL,
-    Identity, SentinelChallenge, build_sentinel_token, ensure_identity, requirements_token,
+    Identity, SentinelChallenge, base64_decode, base64_url_encode, build_sentinel_token,
+    ensure_identity, fill_random_bytes, requirements_token,
 };
 use crate::login::totp::totp_code;
 
@@ -74,6 +74,14 @@ pub struct TokenIdentity {
 pub struct LoginOutput {
     pub callback_url: String,
     pub tokens: Tokens,
+    pub identity: Identity,
+    pub identity_changed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoginCallbackOutput {
+    pub callback_url: String,
+    pub code: String,
     pub identity: Identity,
     pub identity_changed: bool,
 }
@@ -150,6 +158,78 @@ pub fn normalize_redirect_url(raw: &str) -> String {
     }
 }
 
+/// 使用外部提供的 OAuth `authorize` 地址（如 CPR `oauth/start` 返回的 `authorizationUrl`）
+/// 执行邮箱 + 密码 + 2FA 登录状态机，截下回调地址后返回（不换取令牌）
+///
+/// # Errors
+/// 任一步骤失败时返回结构化 [`LoginError`]
+pub async fn login_with_authorize_url(
+    host: &HostClient,
+    carrier: &Carrier,
+    input: &LoginInput,
+    auth_url: &str,
+) -> Result<LoginCallbackOutput, LoginError> {
+    let email = input.email.trim().to_ascii_lowercase();
+    if email.is_empty() {
+        return Err(LoginError::new("identify", "email_missing", "缺少登录邮箱"));
+    }
+    if input.password.is_empty() {
+        return Err(LoginError::new(
+            "password",
+            "password_missing",
+            "缺少登录密码",
+        ));
+    }
+    let query_str = auth_url.split_once('?').map_or("", |(_, q)| q);
+    let query = parse_query(query_str);
+    let state = query
+        .get("state")
+        .map_or("", String::as_str)
+        .trim()
+        .to_owned();
+    let redirect = query
+        .get("redirect_uri")
+        .map(String::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map_or_else(
+            || normalize_redirect_url(&input.redirect_url),
+            |s| s.trim().to_owned(),
+        );
+    if !is_valid_callback_base(&redirect) {
+        return Err(LoginError::new(
+            "connect",
+            "invalid_redirect",
+            "OAuth 回调地址配置无效",
+        ));
+    }
+    let (identity, profile, identity_changed) = ensure_identity(&input.identity);
+
+    let mut flow = Flow {
+        host,
+        carrier,
+        email: &email,
+        password: &input.password,
+        totp_secret: input.totp_secret.trim(),
+        workspace_id: input.workspace_id.trim(),
+        organization_id: input.organization_id.trim(),
+        expected_workspace_id: input.expected_workspace_id.as_deref(),
+        redirect_url: &redirect,
+        state: &state,
+        profile,
+        device_id: &identity.device_id,
+        cookies: BTreeMap::from([("oai-did".to_owned(), identity.device_id.clone())]),
+        stage: "connect",
+    };
+
+    let (callback_url, code) = flow.run_from_url(auth_url).await?;
+    Ok(LoginCallbackOutput {
+        callback_url,
+        code,
+        identity,
+        identity_changed,
+    })
+}
+
 /// 执行完整的邮箱 + 密码 + 2FA 登录状态机并换取 OAuth 令牌
 ///
 /// # Errors
@@ -180,6 +260,7 @@ pub async fn login_and_exchange(
     }
     let (identity, profile, identity_changed) = ensure_identity(&input.identity);
     let (state, verifier, challenge) = new_pkce()?;
+    let auth_url = authorize_url(&redirect, &state, &challenge);
 
     let mut flow = Flow {
         host,
@@ -198,7 +279,7 @@ pub async fn login_and_exchange(
         stage: "connect",
     };
 
-    let (callback_url, code) = flow.run(&challenge).await?;
+    let (callback_url, code) = flow.run_from_url(&auth_url).await?;
     let tokens = exchange_authorization_code(
         host,
         carrier,
@@ -386,10 +467,9 @@ struct Page {
 }
 
 impl Flow<'_> {
-    async fn run(&mut self, challenge: &str) -> Result<(String, String), LoginError> {
+    async fn run_from_url(&mut self, auth_url: &str) -> Result<(String, String), LoginError> {
         self.stage = "connect";
-        let auth_url = authorize_url(self.redirect_url, self.state, challenge);
-        let mut p = self.get(&auth_url, "").await?;
+        let mut p = self.get(auth_url, "").await?;
         for _ in 0..MAX_STEPS {
             if p.next.is_empty() {
                 break;
@@ -401,7 +481,7 @@ impl Flow<'_> {
                     "尚未提交凭据即收到 OAuth 回调跳转",
                 ));
             }
-            p = self.get(&p.next, &auth_url).await?;
+            p = self.get(&p.next, auth_url).await?;
         }
 
         self.stage = "identify";

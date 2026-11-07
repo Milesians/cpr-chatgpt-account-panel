@@ -54,13 +54,23 @@
 
 使用位置的颜色跟着位置走、不跟名次，浅色和深色都用 dataviz 校验脚本检查过（浅色下有 3 个颜色对底色不到 3:1，所以每处都有文字图例和数值）。
 
+## 登录与快速导入
+
+- **凭据存储**：账号的密码与 2FA 密钥（Base32 或 `otpauth://totp/` 链接）以**明文**存在 CPR 数据库 `plugin_state_records` 表的 `login` 命名空间里（键为 CPR 账号 ID；粘贴待导入时暂存在 `email:<邮箱>:<kind>` 下）。密码与 2FA 绝不写入宿主日志 `host.log` 或错误信息，前端页面也绝不回显明文（只返回 `hasPassword` / `hasTotp` 显示“已保存密码 / 已保存 2FA”）。库里若有旧版加密字段（`passwordEnc` / `totpEnc`），反序列化时自然当作未保存密码（`None`）。
+- **已有账号重登**：经该账号在 CPR 绑定的出站代理（`host.http.account`）跑完 OpenAI OAuth PKCE 登录状态机（含 Sentinel PoW、TOTP 验证、Workspace 选择）并换取新令牌，经 `host.auth.save`（`Replace`）写回 CPR。
+- **新账号快速导入（复用借道账号代理）**：
+  1. 先经 CPR 管理接口 `GET /api/admin/accounts` 读取所选借道账号（carrier）绑定的 `outboundProxyId`；若借道账号未绑定出站代理则直接拒绝导入（不创建直连账号）。
+  2. 调 CPR 管理接口 `POST /api/admin/accounts/oauth/start`（不带 `accountId`，带 `outboundProxyId`，`name` 为邮箱），获取 CPR 生成的授权链接与 `flowId`。
+  3. 借道账号经 `host.http.account` 跑完登录步骤，截下回调地址 `callbackUrl` 后交给 `POST /api/admin/accounts/oauth/complete`，由 CPR 自己通过该代理换码并一步建好已绑定代理的新账号（套餐由 CPR 自己从令牌解析，不调 `host.auth.save Create`）。
+  4. 建号完成后核对新账号邮箱，将明文密码与 2FA 保存到新账号 ID 下，并用 `host.state.delete`（带 `expectedVersion`）删掉 `email:<邮箱>:<kind>` 暂存记录。
+
 ## 模块分工
 
 - **面板**（用量、账单、登录设备、列表、详情）：`backend/src/{chatgpt,usage,billing,devices,store,management,api,host}.rs`、`frontend/src/{App.vue,api.ts,format.ts,surfaces.ts,components/}`
-- **登录**（用登录凭据换令牌并写回 CPR、快速导入新账号）：`backend/src/login/`、`frontend/src/login/`，单独维护。和面板的接口：
+- **登录**（用登录凭据换令牌并写回 CPR、快速导入新账号）：`backend/src/{admin.rs,login/}`、`frontend/src/login/`，单独维护。和面板的接口：
   - 后端：`login::routes()` 返回本模块的管理路由（路径都以 `api/login/` 开头，`management` 合进注册），`api/login/` 开头的请求交给 `login::handle`；`login::Login` 是进程内状态，用 `Config` 建一次。错误用 `api::ApiError`，路由用 `api::route`
   - 前端：`login/LoginPage.vue` 是顶部“登录与导入”页，`login/AccountLogin.vue` 放在账号详情页最下面（props `accountId`）。请求用 `api.ts` 的 `call`
-  - 设置项加在 `config::Config` 和 `plugin.json` 的 `configurationSchema`（敏感的进 `secretFields`）；私有状态的命名空间加在 `plugin.json` 的 `state`
+  - 设置项加在 `config::Config` 和 `plugin.json` 的 `configurationSchema`（普通设置 `cprAdminUrl`、`oauthRedirect`，敏感设置 `cprAdminApiKey` 进 `secretFields`）；私有状态的命名空间加在 `plugin.json` 的 `state`
   - 共用的：`chatgpt::supported` / `chatgpt::is_team`（个人号和 Team 按 CPR 给的套餐区分）、`host.rs` 的宿主回调封装
 
 ## 开发

@@ -4,7 +4,6 @@
 //! - [`handle`]：`api/login/` 开头的请求交给它，返回 JSON 或 [`ApiError`]
 //! - [`Login`]：进程内状态，插件启动时用 [`Config`] 建一次
 
-pub mod crypto;
 pub mod oauth;
 pub mod paste;
 pub mod sentinel;
@@ -22,18 +21,19 @@ use gateway_plugin_sdk::{
     client::{HostClient, TypedCall},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
+use crate::admin::Admin;
 use crate::api::{self, ApiError};
 use crate::chatgpt::supported;
 use crate::clock::now_ms;
 use crate::config::Config;
 use crate::host;
 
-use self::crypto::{CryptoError, Keyring, credential_aad};
 use self::oauth::{
     Carrier, LoginError, LoginInput, Tokens, authorize_url, exchange_authorization_code,
-    login_and_exchange, new_pkce, normalize_redirect_url, parse_callback_url,
+    login_and_exchange, login_with_authorize_url, new_pkce, normalize_redirect_url,
+    parse_callback_url,
 };
 use self::paste::{account_kind, is_valid_email, normalize_kind, parse_paste_lines};
 use self::sentinel::{Identity, ensure_identity, is_uuid_v4};
@@ -47,19 +47,19 @@ const OAUTH_SESSION_TTL_MS: i64 = 15 * 60 * 1000;
 
 /// 登录模块的进程内状态
 pub struct Login {
-    keyring: Keyring,
+    config: Config,
     redirect_url: String,
     pending_oauth: Mutex<HashMap<String, PendingOAuth>>,
 }
 
 #[derive(Debug, Clone)]
 struct PendingOAuth {
+    flow_id: Option<String>,
     state: String,
     verifier: String,
     authorize_url: String,
     email: String,
     kind: String,
-    via_account_id: String,
     expires_at_ms: i64,
 }
 
@@ -69,9 +69,9 @@ struct StoredLoginRecord {
     pub email: String,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub password_enc: Option<String>,
+    pub password: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub totp_enc: Option<String>,
+    pub totp: Option<String>,
     pub identity: Identity,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_login_at_ms: Option<i64>,
@@ -119,24 +119,10 @@ impl Login {
     #[must_use]
     pub fn new(config: &Config) -> Self {
         Self {
-            keyring: Keyring::from_config(config.raw_encryption_keys(), &config.active_key),
+            config: config.clone(),
             redirect_url: normalize_redirect_url(&config.oauth_redirect),
             pending_oauth: Mutex::new(HashMap::new()),
         }
-    }
-
-    fn require_keyring(&self) -> Result<&Keyring, ApiError> {
-        if let Some(err) = self.keyring.config_error() {
-            return Err(ApiError::new(400, "encryption_key_invalid", err));
-        }
-        if !self.keyring.is_configured() {
-            return Err(ApiError::new(
-                400,
-                "encryption_key_missing",
-                "尚未配置凭据加密密钥，请先在插件设置中填写 encryptionKey",
-            ));
-        }
-        Ok(&self.keyring)
     }
 
     fn get_pending_oauth(&self, key: &str, now: i64) -> Option<PendingOAuth> {
@@ -209,7 +195,7 @@ pub async fn handle(login: &Login, call: &TypedCall<ManagementRequest>) -> Resul
         }
         ("POST", "api/login/paste") => {
             let body: PasteRequest = api::decode(call)?;
-            handle_paste(login, host, body).await
+            handle_paste(host, body).await
         }
         ("POST", "api/login/import") => {
             let body: ImportRequest = api::decode(call)?;
@@ -237,8 +223,6 @@ async fn handle_status(
         let (rec, _) = load_record(host, id).await?;
         let status = build_account_status(login, &acct, &rec, now);
         return Ok(json!({
-            "encryptionConfigured": login.keyring.is_configured(),
-            "encryptionError": login.keyring.config_error(),
             "oauthRedirect": login.redirect_url,
             "account": status,
         }));
@@ -251,16 +235,13 @@ async fn handle_status(
         accounts.push(build_account_status(login, &acct, &rec, now));
     }
     Ok(json!({
-        "encryptionConfigured": login.keyring.is_configured(),
-        "encryptionError": login.keyring.config_error(),
         "oauthRedirect": login.redirect_url,
         "accounts": accounts,
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
-#[derive(Default)]
 struct CredentialsRequest {
     account_id: String,
     email: Option<String>,
@@ -292,20 +273,14 @@ async fn handle_save_credentials(
     let new_pw = req.password.as_deref().map(str::trim).unwrap_or_default();
     let new_totp = req.totp.as_deref().map(str::trim).unwrap_or_default();
 
-    if (!new_pw.is_empty() || !new_totp.is_empty()) && !login.keyring.is_configured() {
-        let _ = login.require_keyring()?;
-    }
-
     if req.clear_password {
-        rec.password_enc = None;
+        rec.password = None;
     } else if !new_pw.is_empty() {
-        let kr = login.require_keyring()?;
-        let aad = credential_aad(account_id, "password");
-        rec.password_enc = Some(kr.seal(new_pw, &aad).map_err(crypto_api_error)?);
+        rec.password = Some(new_pw.to_owned());
     }
 
     if req.clear_totp {
-        rec.totp_enc = None;
+        rec.totp = None;
     } else if !new_totp.is_empty() {
         let normalized = validate_totp_secret(new_totp).map_err(|code| {
             ApiError::new(
@@ -314,9 +289,7 @@ async fn handle_save_credentials(
                 "2FA 密钥格式无效（需为 Base32 密钥或 6位/30秒/SHA1 的 otpauth://totp/ 链接）",
             )
         })?;
-        let kr = login.require_keyring()?;
-        let aad = credential_aad(account_id, "totp");
-        rec.totp_enc = Some(kr.seal(&normalized, &aad).map_err(crypto_api_error)?);
+        rec.totp = Some(normalized);
     }
 
     if let Some(email) = req
@@ -407,15 +380,15 @@ async fn handle_run_login(
 
     let password = if !req.password.is_empty() {
         req.password.clone()
-    } else if let Some(ref enc) = rec.password_enc {
-        let kr = login.require_keyring()?;
-        let aad = credential_aad(account_id, "password");
-        kr.open(enc, &aad).map_err(crypto_api_error)?
+    } else if let Some(ref pw) = rec.password
+        && !pw.is_empty()
+    {
+        pw.clone()
     } else {
         return Err(ApiError::new(
             400,
             "password_missing",
-            "未提供登录密码，且该账号尚未保存加密密码",
+            "未提供登录密码，且该账号尚未保存密码",
         ));
     };
 
@@ -427,23 +400,22 @@ async fn handle_run_login(
                 "2FA 密钥格式无效（需为 Base32 密钥或 6位/30秒/SHA1 的 otpauth://totp/ 链接）",
             )
         })?
-    } else if let Some(ref enc) = rec.totp_enc {
-        let kr = login.require_keyring()?;
-        let aad = credential_aad(account_id, "totp");
-        kr.open(enc, &aad).map_err(crypto_api_error)?
+    } else if let Some(ref saved_totp) = rec.totp
+        && !saved_totp.trim().is_empty()
+    {
+        validate_totp_secret(saved_totp).map_err(|code| {
+            ApiError::new(400, code, "已保存的 2FA 密钥格式无效，请重新输入并保存")
+        })?
     } else {
         String::new()
     };
 
-    if req.save_credentials && (!req.password.is_empty() || !req.totp.trim().is_empty()) {
-        let kr = login.require_keyring()?;
+    if req.save_credentials {
         if !req.password.is_empty() {
-            let aad = credential_aad(account_id, "password");
-            rec.password_enc = Some(kr.seal(&password, &aad).map_err(crypto_api_error)?);
+            rec.password = Some(password.clone());
         }
         if !req.totp.trim().is_empty() {
-            let aad = credential_aad(account_id, "totp");
-            rec.totp_enc = Some(kr.seal(&totp_secret, &aad).map_err(crypto_api_error)?);
+            rec.totp = Some(totp_secret.clone());
         }
     }
 
@@ -540,7 +512,7 @@ async fn handle_oauth_start(
     req: OAuthStartRequest,
 ) -> Result<Value, ApiError> {
     let now = now_ms();
-    let (session_key, email, kind, via_account_id) = if !req.account_id.trim().is_empty() {
+    if !req.account_id.trim().is_empty() {
         let account_id = req.account_id.trim();
         let acct = host::account(host, account_id).await?;
         if !supported(&acct) {
@@ -567,44 +539,74 @@ async fn handle_oauth_start(
                 .to_ascii_lowercase()
         };
         let kind = account_kind(acct.plan_type.as_deref()).to_owned();
-        (account_id.to_owned(), email, kind, account_id.to_owned())
-    } else {
-        let email = req.email.trim().to_ascii_lowercase();
-        if !is_valid_email(&email) {
-            return Err(ApiError::new(400, "invalid_email", "邮箱地址格式无效"));
-        }
-        let kind = normalize_kind(&req.kind)
-            .map_err(|code| ApiError::new(400, code, "账号类型无效"))?
-            .to_owned();
-        let carrier = resolve_carrier(host, &req.via_account_id).await?;
-        (
-            import_session_key(&email, &kind),
-            email,
-            kind,
-            carrier.account_id,
-        )
-    };
+        let (state, verifier, challenge) = new_pkce().map_err(|e| login_error_to_api(&e))?;
+        let auth_url = authorize_url(&login.redirect_url, &state, &challenge);
+        let expires_at_ms = now + OAUTH_SESSION_TTL_MS;
 
-    let (state, verifier, challenge) = new_pkce().map_err(|e| login_error_to_api(&e))?;
-    let auth_url = authorize_url(&login.redirect_url, &state, &challenge);
+        login.set_pending_oauth(
+            account_id.to_owned(),
+            PendingOAuth {
+                flow_id: None,
+                state,
+                verifier,
+                authorize_url: auth_url.clone(),
+                email,
+                kind,
+                expires_at_ms,
+            },
+            now,
+        );
+
+        return Ok(json!({
+            "authorizeUrl": auth_url,
+            "redirectUrl": login.redirect_url,
+            "expiresAtMs": expires_at_ms,
+        }));
+    }
+
+    let email = req.email.trim().to_ascii_lowercase();
+    if !is_valid_email(&email) {
+        return Err(ApiError::new(400, "invalid_email", "邮箱地址格式无效"));
+    }
+    let kind = normalize_kind(&req.kind)
+        .map_err(|code| ApiError::new(400, code, "账号类型无效"))?
+        .to_owned();
+    let carrier = resolve_carrier(host, &req.via_account_id).await?;
+    let admin = Admin::new(host, &login.config)
+        .map_err(|msg| ApiError::new(400, "admin_config_invalid", msg))?;
+    let proxy_id = require_carrier_proxy(&admin, &carrier.account_id).await?;
+    let start = admin
+        .oauth_start(&email, &proxy_id)
+        .await
+        .map_err(|msg| ApiError::new(502, "admin_error", msg))?;
+
+    let state = api::parse_query(
+        start
+            .authorization_url
+            .split_once('?')
+            .map_or("", |(_, q)| q),
+    )
+    .get("state")
+    .cloned()
+    .unwrap_or_default();
     let expires_at_ms = now + OAUTH_SESSION_TTL_MS;
 
     login.set_pending_oauth(
-        session_key,
+        import_session_key(&email, &kind),
         PendingOAuth {
+            flow_id: Some(start.flow_id),
             state,
-            verifier,
-            authorize_url: auth_url.clone(),
+            verifier: String::new(),
+            authorize_url: start.authorization_url.clone(),
             email,
             kind,
-            via_account_id,
             expires_at_ms,
         },
         now,
     );
 
     Ok(json!({
-        "authorizeUrl": auth_url,
+        "authorizeUrl": start.authorization_url,
         "redirectUrl": login.redirect_url,
         "expiresAtMs": expires_at_ms,
     }))
@@ -616,7 +618,6 @@ struct OAuthCompleteRequest {
     account_id: String,
     email: String,
     kind: String,
-    via_account_id: String,
     callback_url: String,
 }
 
@@ -644,8 +645,9 @@ async fn handle_oauth_complete(
         ));
     };
 
-    let (_, code) = parse_callback_url(&req.callback_url, &login.redirect_url, &pending.state)
-        .map_err(|e| login_error_to_api(&e))?;
+    let (callback_url, code) =
+        parse_callback_url(&req.callback_url, &login.redirect_url, &pending.state)
+            .map_err(|e| login_error_to_api(&e))?;
 
     if is_existing {
         let account_id = req.account_id.trim();
@@ -705,71 +707,53 @@ async fn handle_oauth_complete(
         }));
     }
 
-    let via_id = if !req.via_account_id.trim().is_empty() {
-        req.via_account_id.trim()
-    } else {
-        pending.via_account_id.as_str()
+    let Some(ref flow_id) = pending.flow_id else {
+        return Err(ApiError::new(
+            400,
+            "oauth_session_expired",
+            "导入会话缺少 CPR OAuth flowId，请重新生成授权链接",
+        ));
     };
-    let carrier = resolve_carrier(host, via_id).await?;
+    let admin = Admin::new(host, &login.config)
+        .map_err(|msg| ApiError::new(400, "admin_config_invalid", msg))?;
+    let completed = admin
+        .oauth_complete(flow_id, &callback_url)
+        .await
+        .map_err(|msg| ApiError::new(502, "admin_error", msg))?;
+
+    let created_acct = verify_imported_account(host, &completed.account_id, &pending.email).await?;
     let staged_key = staged_email_key(&pending.email, &pending.kind);
-    let mut staged_rec = load_record(host, &staged_key).await?.0;
-    let (identity, profile, _) = ensure_identity(&staged_rec.identity);
-    staged_rec.identity = identity.clone();
+    let (staged_rec, staged_version) = load_record(host, &staged_key).await?;
+    let (identity, _, _) = ensure_identity(&staged_rec.identity);
 
-    let tokens = exchange_authorization_code(
-        host,
-        &carrier,
-        &login.redirect_url,
-        &code,
-        &pending.verifier,
-        &pending.email,
-        &profile,
-    )
-    .await
-    .map_err(|e| login_error_to_api(&e))?;
+    let actual_kind = if let Some(ref plan) = created_acct.plan_type
+        && !plan.trim().is_empty()
+    {
+        account_kind(Some(plan)).to_owned()
+    } else {
+        pending.kind.clone()
+    };
 
-    let saved =
-        save_created_credential(host, &pending.email, &pending.kind, &tokens, &identity).await?;
-
-    let mut new_rec = StoredLoginRecord {
+    let new_rec = StoredLoginRecord {
         email: pending.email.clone(),
-        kind: pending.kind.clone(),
-        password_enc: None,
-        totp_enc: None,
+        kind: actual_kind.clone(),
+        password: staged_rec.password.filter(|s| !s.is_empty()),
+        totp: staged_rec.totp.filter(|s| !s.trim().is_empty()),
         identity,
         last_login_at_ms: Some(now),
         last_error: None,
     };
-    if login.keyring.is_configured() {
-        if let Some(ref enc_pw) = staged_rec.password_enc
-            && let Ok(plain_pw) = login
-                .keyring
-                .open(enc_pw, &credential_aad(&staged_key, "password"))
-        {
-            new_rec.password_enc = login
-                .keyring
-                .seal(&plain_pw, &credential_aad(&saved.account_id, "password"))
-                .ok();
-        }
-        if let Some(ref enc_totp) = staged_rec.totp_enc
-            && let Ok(plain_totp) = login
-                .keyring
-                .open(enc_totp, &credential_aad(&staged_key, "totp"))
-        {
-            new_rec.totp_enc = login
-                .keyring
-                .seal(&plain_totp, &credential_aad(&saved.account_id, "totp"))
-                .ok();
-        }
+    save_record(host, &completed.account_id, &new_rec).await?;
+    if let Some(ver) = staged_version {
+        let _ = host::state_delete(host, STATE_NAMESPACE, &staged_key, ver).await?;
     }
-    save_record(host, &saved.account_id, &new_rec).await?;
     let _ = login.take_pending_oauth(&session_key, now);
 
     Ok(json!({
         "ok": true,
-        "accountId": saved.account_id,
+        "accountId": completed.account_id,
         "email": pending.email,
-        "kind": pending.kind,
+        "kind": actual_kind,
     }))
 }
 
@@ -780,18 +764,13 @@ struct PasteRequest {
     apply: bool,
 }
 
-async fn handle_paste(
-    login: &Login,
-    host: &HostClient,
-    req: PasteRequest,
-) -> Result<Value, ApiError> {
+async fn handle_paste(host: &HostClient, req: PasteRequest) -> Result<Value, ApiError> {
     let cpr_accounts = host::openai_accounts(host).await?;
     let (mut report, rows) = parse_paste_lines(&req.text, &cpr_accounts);
     if !req.apply {
         return serde_json::to_value(report).map_err(|_| ApiError::invalid("序列化预览结果失败"));
     }
 
-    let kr = login.require_keyring()?;
     for row in rows {
         let target_key = if let Some(ref existing_id) = row.item.existing_account_id {
             existing_id.clone()
@@ -803,17 +782,11 @@ async fn handle_paste(
         rec.kind.clone_from(&row.item.kind);
         let (identity, _, _) = ensure_identity(&rec.identity);
         rec.identity = identity;
-        rec.password_enc = Some(
-            kr.seal(&row.password, &credential_aad(&target_key, "password"))
-                .map_err(crypto_api_error)?,
-        );
+        rec.password = Some(row.password);
         if !row.totp_secret.is_empty() {
-            rec.totp_enc = Some(
-                kr.seal(&row.totp_secret, &credential_aad(&target_key, "totp"))
-                    .map_err(crypto_api_error)?,
-            );
+            rec.totp = Some(row.totp_secret);
         } else {
-            rec.totp_enc = None;
+            rec.totp = None;
         }
         save_record(host, &target_key, &rec).await?;
     }
@@ -876,7 +849,7 @@ async fn handle_import(
                 email,
                 password: req.password,
                 totp: req.totp,
-                save_credentials: req.save_credentials || login.keyring.is_configured(),
+                save_credentials: true,
                 workspace_id: req.workspace_id,
                 organization_id: req.organization_id,
             },
@@ -885,14 +858,14 @@ async fn handle_import(
     }
 
     let staged_key = staged_email_key(&email, &kind);
-    let mut staged_rec = load_record(host, &staged_key).await?.0;
+    let (staged_rec, staged_version) = load_record(host, &staged_key).await?;
 
     let password = if !req.password.is_empty() {
         req.password.clone()
-    } else if let Some(ref enc) = staged_rec.password_enc {
-        let kr = login.require_keyring()?;
-        kr.open(enc, &credential_aad(&staged_key, "password"))
-            .map_err(crypto_api_error)?
+    } else if let Some(ref pw) = staged_rec.password
+        && !pw.is_empty()
+    {
+        pw.clone()
     } else {
         return Err(ApiError::new(400, "password_missing", "缺少登录密码"));
     };
@@ -905,18 +878,28 @@ async fn handle_import(
                 "2FA 密钥格式无效（需为 Base32 密钥或 6位/30秒/SHA1 的 otpauth://totp/ 链接）",
             )
         })?
-    } else if let Some(ref enc) = staged_rec.totp_enc {
-        let kr = login.require_keyring()?;
-        kr.open(enc, &credential_aad(&staged_key, "totp"))
-            .map_err(crypto_api_error)?
+    } else if let Some(ref saved_totp) = staged_rec.totp
+        && !saved_totp.trim().is_empty()
+    {
+        validate_totp_secret(saved_totp)
+            .map_err(|code| ApiError::new(400, code, "暂存的 2FA 密钥格式无效，请重新输入"))?
     } else {
         String::new()
     };
 
+    // 1. 读取借道账号在 CPR 绑定的代理：借道账号没绑代理就拒绝导入，不要建直连账号
     let carrier = resolve_carrier(host, &req.via_account_id).await?;
-    let (identity, _, _) = ensure_identity(&staged_rec.identity);
-    staged_rec.identity = identity.clone();
+    let admin = Admin::new(host, &login.config)
+        .map_err(|msg| ApiError::new(400, "admin_config_invalid", msg))?;
+    let outbound_proxy_id = require_carrier_proxy(&admin, &carrier.account_id).await?;
 
+    // 2. 经 CPR 管理 API 调 POST /api/admin/accounts/oauth/start（不带 accountId，带 outboundProxyId，name 写邮箱）
+    let oauth_start = admin
+        .oauth_start(&email, &outbound_proxy_id)
+        .await
+        .map_err(|msg| ApiError::new(502, "admin_error", msg))?;
+
+    let (identity, _, _) = ensure_identity(&staged_rec.identity);
     let input = LoginInput {
         email: email.clone(),
         password: password.clone(),
@@ -928,7 +911,10 @@ async fn handle_import(
         redirect_url: login.redirect_url.clone(),
     };
 
-    let out = match login_and_exchange(host, &carrier, &input).await {
+    // 3. 借道账号的 host.http.account 跑完登录步骤，截下回调地址交给 POST /api/admin/accounts/oauth/complete
+    let out = match login_with_authorize_url(host, &carrier, &input, &oauth_start.authorization_url)
+        .await
+    {
         Ok(out) => out,
         Err(err) => {
             host::log(
@@ -947,50 +933,52 @@ async fn handle_import(
         }
     };
 
-    let saved = save_created_credential(host, &email, &kind, &out.tokens, &out.identity).await?;
+    let completed = admin
+        .oauth_complete(&oauth_start.flow_id, &out.callback_url)
+        .await
+        .map_err(|msg| ApiError::new(502, "admin_error", msg))?;
+
+    // 4. 完成后读新账号，核对邮箱，把明文密码/2FA 存到新账号 ID 下，并删掉 email:<邮箱>:<kind> 暂存记录
+    let created_acct = verify_imported_account(host, &completed.account_id, &email).await?;
     let now = now_ms();
-    let actual_kind = if !out.tokens.identity.plan_type.is_empty() {
-        account_kind(Some(&out.tokens.identity.plan_type)).to_owned()
+    let plan_type = created_acct
+        .plan_type
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let actual_kind = if !plan_type.is_empty() {
+        account_kind(Some(&plan_type)).to_owned()
     } else {
         kind.clone()
     };
 
-    let mut new_rec = StoredLoginRecord {
+    let should_save = req.save_credentials || req.password.is_empty() || staged_version.is_some();
+    let new_rec = StoredLoginRecord {
         email: email.clone(),
         kind: actual_kind.clone(),
-        password_enc: None,
-        totp_enc: None,
+        password: if should_save { Some(password) } else { None },
+        totp: if should_save && !totp_secret.is_empty() {
+            Some(totp_secret)
+        } else {
+            None
+        },
         identity: out.identity,
         last_login_at_ms: Some(now),
         last_error: None,
     };
 
-    if login.keyring.is_configured() {
-        let pw_aad = credential_aad(&saved.account_id, "password");
-        new_rec.password_enc = Some(
-            login
-                .keyring
-                .seal(&password, &pw_aad)
-                .map_err(crypto_api_error)?,
-        );
-        if !totp_secret.is_empty() {
-            let totp_aad = credential_aad(&saved.account_id, "totp");
-            new_rec.totp_enc = Some(
-                login
-                    .keyring
-                    .seal(&totp_secret, &totp_aad)
-                    .map_err(crypto_api_error)?,
-            );
-        }
+    save_record(host, &completed.account_id, &new_rec).await?;
+    if let Some(ver) = staged_version {
+        let _ = host::state_delete(host, STATE_NAMESPACE, &staged_key, ver).await?;
     }
 
-    save_record(host, &saved.account_id, &new_rec).await?;
     host::log(
         host,
         "import_succeeded",
         LogLevel::Info,
         json!({
-            "account_id": saved.account_id,
+            "account_id": completed.account_id,
             "kind": actual_kind,
         }),
     )
@@ -998,13 +986,46 @@ async fn handle_import(
 
     Ok(json!({
         "ok": true,
-        "accountId": saved.account_id,
+        "accountId": completed.account_id,
         "email": email,
         "kind": actual_kind,
-        "planType": out.tokens.identity.plan_type,
-        "hasPassword": new_rec.password_enc.is_some(),
-        "hasTotp": new_rec.totp_enc.is_some(),
+        "planType": plan_type,
+        "hasPassword": new_rec.password.is_some(),
+        "hasTotp": new_rec.totp.is_some(),
     }))
+}
+
+async fn require_carrier_proxy(admin: &Admin<'_>, carrier_id: &str) -> Result<String, ApiError> {
+    let proxy = admin
+        .outbound_proxy_id(carrier_id)
+        .await
+        .map_err(|msg| ApiError::new(502, "admin_error", msg))?;
+    proxy.ok_or_else(|| {
+        ApiError::new(
+            409,
+            "source_proxy_unavailable",
+            "借道账号在 CPR 中未绑定出站代理，拒绝创建直连账号",
+        )
+    })
+}
+
+async fn verify_imported_account(
+    host: &HostClient,
+    account_id: &str,
+    expected_email: &str,
+) -> Result<AuthRuntimeAccount, ApiError> {
+    let acct = host::account(host, account_id).await?;
+    if let Some(ref actual_email) = acct.email
+        && !actual_email.trim().is_empty()
+        && !actual_email.trim().eq_ignore_ascii_case(expected_email)
+    {
+        return Err(ApiError::new(
+            409,
+            "identity_mismatch",
+            "新导入账号在 CPR 中的邮箱与目标邮箱不一致",
+        ));
+    }
+    Ok(acct)
 }
 
 async fn resolve_carrier(host: &HostClient, via_account_id: &str) -> Result<Carrier, ApiError> {
@@ -1135,71 +1156,6 @@ async fn save_replaced_credential(
     ))
 }
 
-async fn save_created_credential(
-    host: &HostClient,
-    email: &str,
-    kind: &str,
-    tokens: &Tokens,
-    identity: &Identity,
-) -> Result<AuthSaveResult, ApiError> {
-    let mut material = Map::new();
-    material.insert("schema_version".into(), json!(1));
-    material.insert("installation_id".into(), json!(identity.device_id));
-    material.insert("access_token".into(), json!(tokens.access_token));
-    material.insert("refresh_token".into(), json!(tokens.refresh_token));
-    material.insert("id_token".into(), json!(tokens.id_token));
-    material.insert("cookies".into(), json!([]));
-    if !tokens.identity.subject.is_empty() || tokens.identity.poid.is_some() {
-        material.insert(
-            "principal".into(),
-            json!({
-                "oauth_subject": tokens.identity.subject,
-                "poid": tokens.identity.poid,
-            }),
-        );
-    }
-
-    let final_email = if !tokens.identity.email.is_empty() {
-        tokens.identity.email.clone()
-    } else {
-        email.to_owned()
-    };
-    let plan_type = if !tokens.identity.plan_type.is_empty() {
-        tokens.identity.plan_type.clone()
-    } else if kind == "team" {
-        "team".to_owned()
-    } else {
-        "plus".to_owned()
-    };
-
-    let facts = CredentialFacts {
-        name: truncate_name(&final_email, "openai-account"),
-        authentication_kind: "oauth".to_owned(),
-        material,
-        email: Some(final_email),
-        upstream_user_id: if tokens.identity.user_id.is_empty() {
-            None
-        } else {
-            Some(tokens.identity.user_id.clone())
-        },
-        upstream_account_id: Some(tokens.identity.account_id.clone()),
-        plan_type: Some(plan_type),
-        has_refresh_token: !tokens.refresh_token.is_empty(),
-        access_token_expires_at_ms: Some(tokens.identity.expires_at_ms),
-        next_refresh_at_ms: None,
-    };
-
-    host::auth_save(
-        host,
-        &AuthSaveRequest::Create {
-            provider_id: "openai".to_owned(),
-            facts,
-        },
-    )
-    .await
-    .map_err(ApiError::from)
-}
-
 fn truncate_name(raw: &str, fallback: &str) -> String {
     let trimmed = raw.trim();
     let s = if trimmed.is_empty() {
@@ -1237,8 +1193,8 @@ fn build_account_status(
         kind,
         enabled: acct.enabled,
         credential_state: acct.credential_state.clone(),
-        has_password: rec.password_enc.is_some(),
-        has_totp: rec.totp_enc.is_some(),
+        has_password: rec.password.as_ref().is_some_and(|s| !s.is_empty()),
+        has_totp: rec.totp.as_ref().is_some_and(|s| !s.trim().is_empty()),
         identity: rec.identity.clone(),
         last_login_at_ms: rec.last_login_at_ms,
         last_error: rec.last_error.clone(),
@@ -1289,10 +1245,6 @@ fn import_session_key(email: &str, kind: &str) -> String {
         email.trim().to_ascii_lowercase(),
         kind.trim().to_ascii_lowercase()
     )
-}
-
-fn crypto_api_error(err: CryptoError) -> ApiError {
-    ApiError::new(400, err.code(), err.message())
 }
 
 fn login_error_to_api(err: &LoginError) -> ApiError {
