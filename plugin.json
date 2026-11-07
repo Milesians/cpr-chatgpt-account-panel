@@ -3,7 +3,7 @@
   "name": "cpr-chatgpt-account-panel",
   "displayName": "ChatGPT 账号面板",
   "publisher": "milesians",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "按账号查看 ChatGPT 官方用量（按使用位置，重点看 Work）、订阅与账单、登录设备",
   "license": "MIT",
   "author": "Milesians",

@@ -489,7 +489,7 @@ onBeforeUnmount(() => { stop = true })
           <div class="min-w-0">
             <button type="button" class="row-title-btn" @click="emit('open', a.id)">
               <div class="flex flex-wrap items-center gap-1.5">
-                <span class="account-name">{{ title(a) }}</span>
+                <span class="account-name" :title="title(a)">{{ title(a) }}</span>
                 <span v-if="a.blocker" class="verdict-pill warn" :title="a.blocker.message">
                   <AlertTriangle :size="11" aria-hidden="true" />
                   {{ a.blocker.code === 'token_expired' ? '令牌过期' : a.blocker.code === 'account_unavailable' ? '已停用' : '凭据异常' }}
@@ -710,7 +710,7 @@ onBeforeUnmount(() => { stop = true })
           >
             <KeyRound :size="12" aria-hidden="true" /> 批量免输重登
           </ZButton>
-          <ZButton size="small" text @click="clearSelection">
+          <ZButton size="small" variant="text" @click="clearSelection">
             取消选择
           </ZButton>
         </div>

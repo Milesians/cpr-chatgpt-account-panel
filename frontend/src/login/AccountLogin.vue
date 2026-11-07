@@ -401,7 +401,7 @@ onMounted(loadStatus)
           v-if="status?.hasPassword || status?.hasTotp"
           size="small"
           type="danger"
-          text
+          variant="text"
           :loading="savingCreds"
           @click="handleClearCredentials"
         >

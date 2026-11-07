@@ -332,6 +332,8 @@ body {
 
 .row-title-btn {
   display: flex;
+  width: 100%;
+  max-width: 100%;
   flex-direction: column;
   gap: 5px;
   min-width: 0;
@@ -349,6 +351,8 @@ body {
 }
 
 .account-name {
+  max-width: 100%;
+  min-width: 0;
   font-weight: 600;
   color: var(--cp-color-text);
   overflow: hidden;
@@ -653,6 +657,14 @@ body {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--cp-color-text);
+}
+
+.rate-tile-value.text-bad {
+  color: var(--tone-bad);
+}
+
+.rate-tile-value.text-warn {
+  color: var(--tone-warn);
 }
 
 .rate-tile-sub {

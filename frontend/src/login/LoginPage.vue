@@ -440,7 +440,7 @@ onMounted(loadOverview)
 
               <div class="cell-item" data-label="2FA">
                 <span class="text-xs" :class="item.hasTotp ? 'text-cp-text font-medium' : 'muted'">
-                  {{ item.hasTotp ? '含 2FA' : '未存 2FA' }}
+                  {{ item.hasTotp ? '含 2FA' : '无 2FA' }}
                 </span>
               </div>
 
