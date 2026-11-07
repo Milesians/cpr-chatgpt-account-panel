@@ -1,0 +1,51 @@
+{
+  "manifestVersion": 2,
+  "name": "cpr-chatgpt-account-panel",
+  "displayName": "ChatGPT 账号面板",
+  "publisher": "milesians",
+  "version": "0.1.0",
+  "description": "按账号查看 ChatGPT 官方用量（按使用位置，重点看 Work）、订阅与账单",
+  "license": "MIT",
+  "author": "Milesians",
+  "engines": {
+    "codex-proxy-rs": ">=3.34.0, <4.0.0"
+  },
+  "main": "bin/plugin",
+  "runtime": "trustedProcess",
+  "contributes": {
+    "management": {
+      "version": 2
+    }
+  },
+  "configurationSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "secretFields": [],
+  "resources": {
+    "web/index.html": "text/html",
+    "web/app.js": "text/javascript",
+    "web/app.css": "text/css"
+  },
+  "state": [
+    {
+      "namespace": "usage",
+      "schemaVersion": 1,
+      "schema": { "type": "object" },
+      "maximumRecords": 2000,
+      "maximumBytes": 4194304,
+      "maximumValueBytes": 16384,
+      "migratesFrom": []
+    },
+    {
+      "namespace": "payments",
+      "schemaVersion": 1,
+      "schema": { "type": "object" },
+      "maximumRecords": 2000,
+      "maximumBytes": 2097152,
+      "maximumValueBytes": 4096,
+      "migratesFrom": []
+    }
+  ]
+}
