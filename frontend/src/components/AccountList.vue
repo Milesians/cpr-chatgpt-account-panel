@@ -149,8 +149,8 @@ function allQueryBtnTitle(what: 'usage' | 'billing'): string {
   if (!queryableAllCount.value)
     return '当前所有账号均无法查询（已停用或凭据不可用）'
   return what === 'usage'
-    ? '逐个查每个可查账号最近 7 天的官方用量'
-    : '逐个查每个可查账号的第一页账单，记下最近一笔'
+    ? '查每个可查账号最近 7 天的官方用量，同时查 6 个'
+    : '查每个可查账号的第一页账单、记下最近一笔，同时查 6 个'
 }
 
 function selectedQueryBtnTitle(what: 'usage' | 'billing'): string | undefined {
@@ -260,7 +260,7 @@ async function runSingleRelogin(a: Account) {
   }
 }
 
-// 「查询全部 / 批量查询 / 批量免输重登」：一个接一个跑，可以中途停
+// 「查询全部 / 批量查询」几个账号同时跑；「批量免输重登」一个接一个跑；都可以中途停
 type Bulk = 'usage' | 'billing' | 'relogin'
 const running = ref<Bulk | null>(null)
 const progress = ref({
@@ -270,9 +270,13 @@ const progress = ref({
   skipped: 0,
   skippedReasons: [] as string[],
   currentName: '',
+  /** 正在进行的账号数 */
+  active: 0,
 })
 const lastBatchNote = ref('')
 let stop = false
+/** 批量查询用量、账单时同时进行的账号数 */
+const BATCH_CONCURRENCY = 6
 
 async function runBatch(what: 'usage' | 'billing', onlySelected = false) {
   const pool = onlySelected && selectedIds.value.size > 0
@@ -285,26 +289,31 @@ async function runBatch(what: 'usage' | 'billing', onlySelected = false) {
   lastBatchNote.value = ''
   running.value = what
   stop = false
-  progress.value = { done: 0, total: targets.length, failed: 0, skipped: 0, skippedReasons: [], currentName: '' }
-  for (const a of targets) {
-    if (stop)
-      break
-    progress.value.currentName = title(a)
-    try {
-      if (what === 'usage') {
-        const r = await api.usage(a.id, 7)
-        emit('patch', a.id, { usage: r.summary })
+  progress.value = { done: 0, total: targets.length, failed: 0, skipped: 0, skippedReasons: [], currentName: '', active: 0 }
+  // 几个账号同时查：每个账号走自己绑定的代理，互不影响；停止后不再发起新的，已发出的等它回来
+  let next = 0
+  async function worker() {
+    while (!stop && next < targets.length) {
+      const a = targets[next++]!
+      progress.value.active++
+      try {
+        if (what === 'usage') {
+          const r = await api.usage(a.id, 7)
+          emit('patch', a.id, { usage: r.summary })
+        }
+        else {
+          const r = await api.billing(a.id)
+          emit('patch', a.id, { payment: r.payment })
+        }
       }
-      else {
-        const r = await api.billing(a.id)
-        emit('patch', a.id, { payment: r.payment })
+      catch {
+        progress.value.failed++
       }
+      progress.value.active--
+      progress.value.done++
     }
-    catch {
-      progress.value.failed++
-    }
-    progress.value.done++
   }
+  await Promise.all(Array.from({ length: Math.min(BATCH_CONCURRENCY, targets.length) }, worker))
   running.value = null
 }
 
@@ -340,6 +349,7 @@ async function runBatchRelogin() {
     skipped: skippedReasons.length,
     skippedReasons,
     currentName: '',
+    active: 0,
   }
 
   let succeeded = 0
@@ -651,6 +661,9 @@ onBeforeUnmount(() => { stop = true })
           </div>
           <span v-if="progress.currentName" class="muted">
             当前：{{ progress.currentName }}
+          </span>
+          <span v-else-if="progress.active" class="muted">
+            同时查询 {{ progress.active }} 个
           </span>
           <span v-if="progress.failed" class="text-bad">
             {{ progress.failed }} 个失败

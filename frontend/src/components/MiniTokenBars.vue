@@ -1,36 +1,74 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { compact, shortDate } from '../format'
+import { computed, ref } from 'vue'
+import { compact, percent, shortDate } from '../format'
 
-/** 列表行里的每日 Token 柱状图：一天一根，悬停看当天数值 */
+/** 列表行里的每日 Token 柱状图：一天一根，悬停或点按看当天详情 */
 const props = defineProps<{ days: { date: string, tokens: number }[] }>()
 
-const W = 150
-const H = 32
+const WEEK = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
 const max = computed(() => Math.max(0, ...props.days.map(d => d.tokens)))
-// 7 天时柱子粗、间隔大，30 天时细、间隔小，都占满整个宽度
-const GAP = computed(() => props.days.length > 14 ? 1.5 : 4)
-const bars = computed(() => {
+const total = computed(() => props.days.reduce((s, d) => s + d.tokens, 0))
+const active = ref<number | null>(null)
+const day = computed(() => (active.value !== null ? props.days[active.value] ?? null : null))
+
+function weekday(date: string): string {
+  const t = Date.parse(`${date}T00:00:00Z`)
+  return Number.isNaN(t) ? '' : WEEK[new Date(t).getUTCDay()]!
+}
+
+function height(tokens: number): string {
+  if (!max.value || tokens <= 0)
+    return '0'
+  return `${Math.max(7, (tokens / max.value) * 100)}%`
+}
+
+/** 弹出卡片靠哪边：两头的柱子贴边对齐，避免超出单元格 */
+const tipSide = computed(() => {
   const n = props.days.length
-  const w = n ? (W - GAP.value * (n - 1)) / n : 0
-  return props.days.map((d, i) => {
-    const h = max.value ? Math.max(d.tokens > 0 ? 2 : 0, (d.tokens / max.value) * (H - 1)) : 0
-    return { ...d, x: i * (w + GAP.value), w, h }
-  })
+  if (active.value === null || n < 3)
+    return 'center'
+  if (active.value < n / 4)
+    return 'start'
+  if (active.value >= (n * 3) / 4)
+    return 'end'
+  return 'center'
+})
+const tipLeft = computed(() => {
+  const n = props.days.length
+  return active.value === null || !n ? '0' : `${((active.value + 0.5) / n) * 100}%`
 })
 </script>
 
 <template>
-  <svg :viewBox="`0 0 ${W} ${H}`" :width="W" :height="H" class="mini-bars" role="img" :aria-label="`每日 Token：${days.map(d => `${shortDate(d.date)} ${compact(d.tokens)}`).join('，')}`">
-    <line x1="0" :x2="W" :y1="H - 0.5" :y2="H - 0.5" class="mini-bars-base" />
-    <g v-for="b in bars" :key="b.date" class="mini-bar">
-      <rect :x="b.x" y="0" :width="b.w + GAP" :height="H" class="mini-bar-hit" />
-      <path
-        v-if="b.h > 0"
-        :d="`M ${b.x} ${H} V ${H - b.h + Math.min(2, b.h)} q 0 -${Math.min(2, b.h)} ${Math.min(2, b.w / 2)} -${Math.min(2, b.h)} H ${b.x + b.w - Math.min(2, b.w / 2)} q ${Math.min(2, b.w / 2)} 0 ${Math.min(2, b.w / 2)} ${Math.min(2, b.h)} V ${H} Z`"
-        class="mini-bar-fill"
-      />
-      <title>{{ shortDate(b.date) }}：{{ compact(b.tokens) }} Token</title>
-    </g>
-  </svg>
+  <div class="mini-bars" :class="{ 'is-dense': days.length > 14 }" @mouseleave="active = null">
+    <button
+      v-for="(d, i) in days"
+      :key="d.date"
+      type="button"
+      class="mini-bar"
+      :class="{ 'is-active': active === i, 'is-dim': active !== null && active !== i }"
+      :aria-label="`${shortDate(d.date)} ${weekday(d.date)}：${compact(d.tokens)} Token`"
+      :aria-expanded="active === i"
+      @mouseenter="active = i"
+      @focus="active = i"
+      @blur="active = null"
+      @click.stop="active = active === i ? null : i"
+    >
+      <i :style="{ height: height(d.tokens) }" />
+    </button>
+    <div
+      v-if="day"
+      class="mini-bars-tip"
+      :data-side="tipSide"
+      :style="{ left: tipLeft }"
+      role="status"
+    >
+      <span class="muted">{{ shortDate(day.date) }} {{ weekday(day.date) }}</span>
+      <strong>{{ day.tokens.toLocaleString('zh-CN') }} Token</strong>
+      <span v-if="day.tokens === 0" class="muted">当天没有用量</span>
+      <span v-else class="muted">
+        占 {{ days.length }} 天的 {{ percent(day.tokens / total, day.tokens / total < 0.1 ? 1 : 0) }}<template v-if="day.tokens === max"> · 这几天最高</template>
+      </span>
+    </div>
+  </div>
 </template>

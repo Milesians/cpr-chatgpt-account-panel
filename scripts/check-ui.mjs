@@ -724,15 +724,29 @@ try {
       chips: [...document.querySelectorAll('.filter-chip')].map(el => el.textContent),
       bars: document.querySelectorAll('.monitor-row .mini-bars').length,
       donuts: document.querySelectorAll('.monitor-row .mini-donut').length,
-      firstBars: document.querySelector('.monitor-row .mini-bars')?.querySelectorAll('.mini-bar-fill').length ?? 0,
+      firstBars: document.querySelector('.monitor-row .mini-bars')?.querySelectorAll('.mini-bar').length ?? 0,
       tones: [...document.querySelectorAll('.monitor-row')].map(el => el.dataset.tone),
     };
   `)
   assert.ok(!listUsage.chips.some(t => t.includes('Work')), '列表不再有 Work 筛选')
   assert.equal(listUsage.bars, 2, '查过用量的两行都有每日 Token 柱状图')
   assert.equal(listUsage.donuts, 2, '查过用量的两行都有使用位置饼图')
-  assert.ok(listUsage.firstBars >= 6, '有 Token 的日子各一根柱子')
+  assert.equal(listUsage.firstBars, 7, '每天一根柱子')
   assert.ok(!listUsage.tones.includes('work'), '行左竖条不再有 Work 紫色')
+
+  // 点柱子弹出当天详情
+  const barTip = await evaluate(`
+    const bars = document.querySelectorAll('.monitor-row .mini-bars')[0].querySelectorAll('.mini-bar');
+    bars[5].click();
+    await new Promise(r => setTimeout(r, 80));
+    const tip = document.querySelector('.mini-bars-tip');
+    return tip ? tip.textContent.replace(/\\s+/g, ' ').trim() : '';
+  `)
+  assert.match(barTip, /11\/5 周四/, '点柱子应显示日期和星期')
+  assert.match(barTip, /4,700,000 Token/, '点柱子应显示当天 Token 原值')
+  assert.match(barTip, /占 7 天的/, '点柱子应显示占这段时间的比例')
+  await capture('14-list-bar-tip', 1440, 900, 'light')
+  await evaluate(`document.querySelector('.mini-bar.is-active')?.click();`)
 
   // ── 2. 详情页（官方用量 + 订阅账单）验收与截图 ──
   await evaluate(`

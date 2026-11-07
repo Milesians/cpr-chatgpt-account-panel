@@ -452,26 +452,88 @@ body {
 }
 
 .mini-bars {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  width: 150px;
+  height: 32px;
+  border-bottom: 1px solid var(--cp-color-border-secondary);
+}
+
+.mini-bars.is-dense {
+  gap: 1.5px;
+}
+
+/* 整列都能点中，柱子本身可以很矮 */
+.mini-bar {
+  display: flex;
+  flex: 1 1 0;
+  align-items: flex-end;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.mini-bar i {
   display: block;
-  overflow: visible;
-}
-
-.mini-bars-base {
-  stroke: var(--cp-color-border-secondary);
-  stroke-width: 1;
-}
-
-.mini-bar-hit {
-  fill: transparent;
-}
-
-.mini-bar-fill {
-  fill: var(--series-1);
+  width: 100%;
+  border-radius: 2px 2px 0 0;
+  background: var(--series-1);
   opacity: 0.8;
+  transition: opacity 0.12s ease;
 }
 
-.mini-bar:hover .mini-bar-fill {
+.mini-bar.is-active i {
   opacity: 1;
+}
+
+.mini-bar.is-dim i {
+  opacity: 0.4;
+}
+
+.mini-bar:focus-visible {
+  outline: 2px solid var(--series-1);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+.mini-bars-tip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 132px;
+  padding: 7px 10px;
+  border: 1px solid var(--cp-color-border);
+  border-radius: var(--cp-radius-sm);
+  background: var(--cp-color-bg-elevated, var(--cp-color-bg-container));
+  box-shadow: var(--cp-shadow-md);
+  font-size: 11px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.mini-bars-tip[data-side='start'] {
+  transform: translateX(-14px);
+}
+
+.mini-bars-tip[data-side='end'] {
+  transform: translateX(calc(-100% + 14px));
+}
+
+.mini-bars-tip strong {
+  color: var(--cp-color-text);
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .usage-mini-pie {
