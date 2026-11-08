@@ -177,10 +177,7 @@ onMounted(load)
       </div>
 
       <div v-show="section === 'login'">
-        <LoginPage
-          :login-accounts="loginAccounts"
-          @accounts-changed="load"
-        />
+        <LoginPage @accounts-changed="load" />
       </div>
     </main>
   </ZConfigProvider>

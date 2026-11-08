@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import type { ApiError } from '../api'
-import type { AccountLoginStatus } from './helpers'
+import type { AccountLoginStatus, LoginChoice } from './helpers'
 import { ZButton, ZTag } from '@codex-proxy/ui'
 import { Check, Copy, KeyRound, Link2, Lock, Trash2 } from '@lucide/vue'
 import { computed, onMounted, ref, watch } from 'vue'
 import { credentialStateLabel, dateTime, formatPlanName } from '../format'
 import { loginApi } from './client'
-import { formatLoginError, needsManualOAuth, resolveLoginMainAction } from './helpers'
+import { formatLoginError, loginChoices, needsManualOAuth, resolveLoginMainAction } from './helpers'
 
 const props = defineProps<{ accountId: string }>()
 const emit = defineEmits<{ updated: [account: AccountLoginStatus] }>()
@@ -32,7 +32,24 @@ const copiedUrl = ref(false)
 
 const errorMsg = ref('')
 const errorCode = ref('')
+const errorChoices = ref<LoginChoice[]>([])
 const successMsg = ref('')
+
+/** 多个工作区或组织时可点选的候选：本次的错误优先，其次上次登录失败时记下的 */
+const choices = computed<LoginChoice[]>(() => {
+  if (errorMsg.value)
+    return errorChoices.value
+  return status.value?.lastError?.choices ?? []
+})
+
+/** 选了工作区或组织后直接重登 */
+async function loginWithChoice(choice: LoginChoice) {
+  if (choice.kind === 'workspace')
+    workspaceId.value = choice.id
+  else
+    organizationId.value = choice.id
+  await handleRunLogin()
+}
 
 const blockedByDisabled = computed(() => status.value !== null && !status.value.enabled)
 const mainAction = computed(() => resolveLoginMainAction({
@@ -93,6 +110,7 @@ async function handleRunLogin() {
   runningLogin.value = true
   errorMsg.value = ''
   errorCode.value = ''
+  errorChoices.value = []
   successMsg.value = ''
   try {
     const r = await loginApi.runLogin({
@@ -114,6 +132,7 @@ async function handleRunLogin() {
     const err = e as ApiError
     errorMsg.value = err.message
     errorCode.value = err.code ?? ''
+    errorChoices.value = loginChoices(err.details)
     if (needsManualOAuth(err.code)) {
       showManualOAuth.value = true
     }
@@ -310,6 +329,20 @@ onMounted(loadStatus)
     <p v-else-if="status?.lastError" class="banner banner-warn">
       上次登录失败（{{ dateTime(status.lastError.atMs) }}）：{{ formatLoginError(status.lastError.code, status.lastError.message) }}
     </p>
+    <div v-if="choices.length" class="flex flex-wrap items-center gap-2 text-xs" role="group" aria-label="选一个重登">
+      <span class="text-cp-text-secondary">选一个{{ choices[0]?.kind === 'organization' ? '组织' : '工作区' }}直接重登：</span>
+      <ZButton
+        v-for="c in choices"
+        :key="c.kind + c.id"
+        size="small"
+        :loading="runningLogin && (workspaceId === c.id || organizationId === c.id)"
+        :disabled="runningLogin || blockedByDisabled"
+        :title="c.id"
+        @click="loginWithChoice(c)"
+      >
+        {{ c.name || c.id }}
+      </ZButton>
+    </div>
     <p v-if="successMsg" class="banner banner-ok" role="status">
       {{ successMsg }}
     </p>

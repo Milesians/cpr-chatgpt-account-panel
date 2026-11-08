@@ -3,8 +3,8 @@
   "name": "cpr-chatgpt-account-panel",
   "displayName": "ChatGPT 账号面板",
   "publisher": "milesians",
-  "version": "0.1.3",
-  "description": "按账号查看 ChatGPT 官方用量（按使用位置，重点看 Work）、订阅与账单、登录设备",
+  "version": "0.1.4",
+  "description": "按账号查看 ChatGPT 官方用量、订阅与账单、登录设备，用密码和 2FA 快速登录与导入账号",
   "license": "MIT",
   "author": "Milesians",
   "engines": {
@@ -22,15 +22,15 @@
     "properties": {
       "cprAdminUrl": {
         "type": "string",
-        "title": "CPR 地址（导入新账号复用代理用）",
-        "description": "插件连 CPR 管理接口的地址，如 http://127.0.0.1:8080；导入新账号时用它调 oauth/start 与 oauth/complete 以绑定借道账号的出站代理",
+        "title": "（已不再使用）CPR 地址",
+        "description": "v0.1.4 起插件经宿主内部调用管理接口，不再需要；可以清空",
         "maxLength": 512,
         "default": ""
       },
       "cprAdminApiKey": {
         "type": "string",
-        "title": "CPR 管理 API Key（敏感字段）",
-        "description": "CPR 设置里生成的管理 API Key；插件只用它读借道账号的代理并完成新账号 OAuth 导入。通过 CPR 独立敏感配置保存",
+        "title": "（已不再使用）CPR 管理 API Key",
+        "description": "v0.1.4 起不再需要；可以清空，并在 CPR 设置里删掉为插件生成的那个 Key",
         "maxLength": 512
       },
       "oauthRedirect": {

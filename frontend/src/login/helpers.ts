@@ -3,11 +3,19 @@ export interface IdentityInfo {
   deviceId: string
 }
 
+/** 登录时可选的工作区或组织；点一下就带着它重试 */
+export interface LoginChoice {
+  kind: 'workspace' | 'organization'
+  id: string
+  name: string
+}
+
 export interface StoredLoginError {
   stage: string
   code: string
   message: string
   atMs: number
+  choices?: LoginChoice[]
 }
 
 export interface PendingOAuthView {
@@ -64,8 +72,11 @@ export interface QueuedImportTask {
 }
 
 const ERROR_LABELS: Record<string, string> = {
-  admin_config_invalid: 'CPR 管理接口未配置',
   admin_error: 'CPR 管理接口调用失败',
+  proxy_missing: '没选代理',
+  proxy_unavailable: '代理不可用',
+  no_carrier: '代理还没有账号在用',
+  mfa_issue_failed: '发起 2FA 验证失败',
   source_proxy_unavailable: '账号绑定代理不可用',
   browser_challenge: '需浏览器验证（Cloudflare）',
   rate_limited: '请求过于频繁（429）',
@@ -77,7 +88,7 @@ const ERROR_LABELS: Record<string, string> = {
   email_otp_required: '需邮箱验证码（Email OTP）',
   unsupported_challenge: '需附加验证',
   workspace_unavailable: '工作区不可用',
-  workspace_ambiguous: '存在多个工作区需指定',
+  workspace_ambiguous: '有多个工作区，请选一个',
   identity_mismatch: '登录账号邮箱不匹配',
   invalid_token_identity: '返回令牌身份无效',
   incomplete_tokens: '返回令牌不完整',
@@ -181,6 +192,7 @@ export function needsManualOAuth(code?: string | null): boolean {
     'email_otp_required',
     'unsupported_challenge',
     'unsupported_mfa',
+    'no_carrier',
   ].includes(code)
 }
 
@@ -219,4 +231,16 @@ export function buildImportQueue(
     })
   }
   return tasks
+}
+
+/** 从错误的 `details.choices` 取出可点选的工作区或组织 */
+export function loginChoices(details: unknown): LoginChoice[] {
+  const list = (details as { choices?: unknown } | undefined)?.choices
+  if (!Array.isArray(list))
+    return []
+  return list.filter((c): c is LoginChoice =>
+    !!c && typeof c === 'object'
+    && (c.kind === 'workspace' || c.kind === 'organization')
+    && typeof c.id === 'string' && c.id !== ''
+    && typeof c.name === 'string')
 }

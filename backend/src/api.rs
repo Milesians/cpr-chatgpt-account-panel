@@ -34,6 +34,8 @@ pub struct ApiError {
     pub status: u16,
     pub code: String,
     pub message: String,
+    /// 给页面的附加信息（如可选的工作区），放在错误对象的 `details` 里
+    pub details: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -43,7 +45,14 @@ impl ApiError {
             status,
             code: code.into(),
             message: message.into(),
+            details: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 
     #[must_use]
@@ -101,10 +110,11 @@ pub fn reply(status: u16, body: &impl Serialize) -> Result<Reply, PluginFault> {
 /// # Errors
 /// 编码失败时返回错误
 pub fn error_reply(e: &ApiError) -> Result<Reply, PluginFault> {
-    reply(
-        e.status,
-        &json!({"error": {"code": e.code, "message": e.message}}),
-    )
+    let mut error = json!({"code": e.code, "message": e.message});
+    if let Some(details) = &e.details {
+        error["details"] = details.clone();
+    }
+    reply(e.status, &json!({ "error": error }))
 }
 
 /// 解码 JSON 请求正文

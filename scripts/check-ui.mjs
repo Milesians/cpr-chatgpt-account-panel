@@ -491,6 +491,21 @@ window.codexProxyPlugin = {
       return __reply(__MOCK__.loginOverview);
     }
     if (fn === 'api/login/paste') return __reply(__MOCK__.pastePreview);
+    if (fn === 'api/login/proxies') return __reply({ proxies: [
+      { id: 'px-off', name: '旧代理', enabled: false, carriers: 1 },
+      { id: 'px-new', name: '新加坡 新线路', enabled: true, carriers: 0 },
+      { id: 'px-tokyo', name: '东京 住宅', enabled: true, carriers: 3 },
+    ] });
+    if (fn === 'api/login/import') {
+      (window.__IMPORTS__ ||= []).push(payload);
+      if (payload.email === 'new-team@acme.io' && !payload.workspaceId) {
+        return __reply({ error: { code: 'workspace_ambiguous', message: '账号有 2 个工作区：个人、Acme', details: { choices: [
+          { kind: 'workspace', id: 'ws-p', name: '个人' },
+          { kind: 'workspace', id: 'ws-acme', name: 'Acme' },
+        ] } } }, 409);
+      }
+      return __reply({ ok: true, accountId: 'acct_new_' + window.__IMPORTS__.length, email: payload.email, kind: payload.kind });
+    }
     if (fn === 'api/login/oauth/start') return __reply(__MOCK__.oauthStart);
     if (fn === 'api/login/run') {
       if (window.__LOGIN_DELAY_MS__ > 0) {
@@ -854,10 +869,43 @@ try {
   assert.equal(loginPageStats.hasImportCountBtn, true, '主按钮应显示「导入 2 个」')
   assert.equal(loginPageStats.hasPreviewBtn, false, '「解析并预览」按钮应已删除')
 
+  const proxyPick = await evaluate(`
+    const sel = document.querySelector('select[aria-label="新账号用哪个代理"]');
+    return {
+      value: sel.value,
+      options: [...sel.options].map(o => ({ text: o.textContent.trim(), disabled: o.disabled })),
+    };
+  `)
+  assert.equal(proxyPick.value, 'px-tokyo', '默认选一个有账号在用、能自动登录的代理')
+  assert.deepEqual(proxyPick.options.map(o => o.disabled), [true, false, false], '停用的代理不能选')
+  assert.ok(proxyPick.options[1].text.includes('只能浏览器手动登录'), '没人用的代理要说明只能浏览器手动登录')
+
   await capture('10-login-import-light', 1440, 1100, 'light')
   await capture('11-login-import-dark', 1440, 1100, 'dark')
   await capture('12-login-import-390px', 390, 1380, 'light')
   await assertNoClippedButtons('390px 导入账号页')
+
+  // 导入：多工作区的行给出候选，点一下带着工作区重试
+  await evaluate(`
+    const start = [...document.querySelectorAll('button')].find(b => b.textContent.includes('导入 2 个'));
+    start.click();
+    await new Promise(r => setTimeout(r, 400));
+  `)
+  const choiceState = await evaluate(`
+    const buttons = [...document.querySelectorAll('.import-preview-row button')].map(b => b.textContent.trim());
+    return { buttons, imports: window.__IMPORTS__ };
+  `)
+  assert.ok(choiceState.imports.every(i => i.proxyId === 'px-tokyo' && !('viaAccountId' in i)), '导入带所选代理，不再带借道账号')
+  assert.ok(choiceState.buttons.includes('个人') && choiceState.buttons.includes('Acme'), '多工作区时给出可点选的候选')
+  await capture('15-login-import-choices', 1440, 1100, 'light')
+  await evaluate(`
+    const acme = [...document.querySelectorAll('.import-preview-row button')].find(b => b.textContent.trim() === 'Acme');
+    acme.click();
+    await new Promise(r => setTimeout(r, 300));
+  `)
+  const retried = await evaluate(`return { last: window.__IMPORTS__.at(-1), text: document.body.textContent }`)
+  assert.equal(retried.last.workspaceId, 'ws-acme', '点候选后带着工作区 ID 重试')
+  assert.equal(retried.last.email, 'new-team@acme.io')
 
   assert.deepEqual(errors, [], `页面运行不应有未捕获异常: ${errors.join('; ')}`)
   console.log('UI check passed. Generated screenshots:')

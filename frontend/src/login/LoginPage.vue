@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import type { ApiError } from '../api'
+import type { ImportProxy } from './client'
 import type {
-  AccountLoginStatus,
+  LoginChoice,
   PasteReport,
   QueuedImportTask,
 } from './helpers'
@@ -18,13 +19,11 @@ import { loginApi } from './client'
 import {
   buildImportQueue,
   formatLoginError,
+  loginChoices,
   needsManualOAuth,
   resolveImportAction,
 } from './helpers'
 
-const props = defineProps<{
-  loginAccounts?: AccountLoginStatus[]
-}>()
 const emit = defineEmits<{ accountsChanged: [] }>()
 
 interface ImportExecutionState {
@@ -32,15 +31,18 @@ interface ImportExecutionState {
   accountId?: string
   code?: string
   message?: string
+  /** 多个工作区或组织时可点选的候选 */
+  choices?: LoginChoice[]
 }
 
-const loadingOverview = ref(false)
-const localAccounts = ref<AccountLoginStatus[]>([])
-const overviewError = ref('')
+// 新账号绑定的 CPR 代理；登录请求经一个绑着它的启用账号发出
+const proxies = ref<ImportProxy[]>([])
+const proxyId = ref('')
+const loadingProxies = ref(false)
+const proxiesError = ref('')
 
 // 快速导入状态
 const pasteText = ref('')
-const viaAccountId = ref('')
 const includeExistingUpdates = ref(false)
 const previewing = ref(false)
 const previewReport = ref<PasteReport | null>(null)
@@ -63,8 +65,9 @@ const manualBusy = ref(false)
 const manualCopied = ref(false)
 const manualError = ref('')
 
-const accounts = computed(() => props.loginAccounts?.length ? props.loginAccounts : localAccounts.value)
-const enabledAccounts = computed(() => accounts.value.filter(a => a.enabled))
+const selectedProxy = computed(() => proxies.value.find(p => p.id === proxyId.value))
+/** 选的代理没有账号在用：只能浏览器手动登录 */
+const proxyBrowserOnly = computed(() => !!selectedProxy.value && selectedProxy.value.carriers === 0)
 
 const importQueue = computed(() => {
   if (!previewReport.value)
@@ -84,12 +87,6 @@ const hasImportProgress = computed(() => importing.value || Object.keys(rowState
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 let previewSeq = 0
-
-watch(enabledAccounts, (list) => {
-  if (!viaAccountId.value && list.length > 0) {
-    viaAccountId.value = list[0]!.accountId
-  }
-}, { immediate: true })
 
 watch(pasteText, (next) => {
   if (debounceTimer)
@@ -114,23 +111,31 @@ onBeforeUnmount(() => {
     clearTimeout(debounceTimer)
 })
 
-async function loadOverview() {
-  loadingOverview.value = true
-  overviewError.value = ''
+function proxyLabel(p: ImportProxy): string {
+  const name = p.name || p.id
+  if (!p.enabled)
+    return `${name}（已停用）`
+  if (p.carriers === 0)
+    return `${name}（没有账号在用，只能浏览器手动登录）`
+  return `${name}（${p.carriers} 个账号在用）`
+}
+
+async function loadProxies() {
+  loadingProxies.value = true
+  proxiesError.value = ''
   try {
-    const r = await loginApi.overview()
-    localAccounts.value = r.accounts
-    if (!viaAccountId.value) {
-      const firstEnabled = r.accounts.find(a => a.enabled)
-      if (firstEnabled)
-        viaAccountId.value = firstEnabled.accountId
+    const r = await loginApi.proxies()
+    proxies.value = r.proxies
+    if (!proxies.value.some(p => p.id === proxyId.value && p.enabled)) {
+      const best = r.proxies.find(p => p.enabled && p.carriers > 0) ?? r.proxies.find(p => p.enabled)
+      proxyId.value = best?.id ?? ''
     }
   }
   catch (e) {
-    overviewError.value = (e as ApiError).message
+    proxiesError.value = (e as ApiError).message
   }
   finally {
-    loadingOverview.value = false
+    loadingProxies.value = false
   }
 }
 
@@ -165,8 +170,8 @@ async function handleStartImport() {
     importError.value = importAction.value.title ?? '没有可导入的行'
     return
   }
-  if (!viaAccountId.value && enabledAccounts.value.length === 0) {
-    importError.value = 'CPR 中需要至少有一个启用状态的 OpenAI 账号来提供代理出站连接'
+  if (!proxyId.value) {
+    importError.value = '先选一个出站代理，新账号会绑在它上面'
     return
   }
 
@@ -198,18 +203,20 @@ async function handleStartImport() {
   importing.value = false
   const stoppedText = stopRequested.value ? '（已手动停止）' : ''
   importNotice.value = `导入执行结束${stoppedText}：成功 ${succeeded} 个，失败 ${failed} 个`
-  await loadOverview()
+  await loadProxies()
   emit('accountsChanged')
 }
 
-async function executeImportTask(task: QueuedImportTask) {
+async function executeImportTask(task: QueuedImportTask, choice?: LoginChoice) {
   try {
     const res = await loginApi.importAccount({
       email: task.email,
       password: task.password,
       ...(task.totp ? { totp: task.totp } : {}),
       kind: task.kind,
-      ...(viaAccountId.value ? { viaAccountId: viaAccountId.value } : {}),
+      proxyId: proxyId.value,
+      ...(choice?.kind === 'workspace' ? { workspaceId: choice.id } : {}),
+      ...(choice?.kind === 'organization' ? { organizationId: choice.id } : {}),
       replaceExisting: task.action === 'update',
       saveCredentials: true,
     })
@@ -225,8 +232,24 @@ async function executeImportTask(task: QueuedImportTask) {
       status: 'error',
       code: err.code,
       message: err.message,
+      choices: loginChoices(err.details),
     }
     throw err
+  }
+}
+
+/** 选了工作区或组织后重试这一行 */
+async function retryWithChoice(line: number, choice: LoginChoice) {
+  const task = importQueue.value.find(t => t.line === line)
+  if (!task || importing.value)
+    return
+  rowStates.value[line] = { status: 'running' }
+  try {
+    await executeImportTask(task, choice)
+    emit('accountsChanged')
+  }
+  catch {
+    // 行状态里已经记下错误
   }
 }
 
@@ -246,11 +269,7 @@ async function toggleManualForImport(line: number, email: string, kind: string) 
   manualCopied.value = false
   manualBusy.value = true
   try {
-    const r = await loginApi.oauthStart({
-      email,
-      kind,
-      ...(viaAccountId.value ? { viaAccountId: viaAccountId.value } : {}),
-    })
+    const r = await loginApi.oauthStart({ email, kind, proxyId: proxyId.value })
     manualAuthUrl.value = r.authorizeUrl
   }
   catch (e) {
@@ -271,7 +290,6 @@ async function submitManualCallback() {
     const r = await loginApi.oauthComplete({
       email: target.email,
       kind: target.kind,
-      ...(viaAccountId.value ? { viaAccountId: viaAccountId.value } : {}),
       callbackUrl: manualCallbackUrl.value.trim(),
     })
     rowStates.value[target.line] = {
@@ -282,7 +300,7 @@ async function submitManualCallback() {
     manualTarget.value = null
     manualAuthUrl.value = ''
     manualCallbackUrl.value = ''
-    await loadOverview()
+    await loadProxies()
     emit('accountsChanged')
   }
   catch (e) {
@@ -305,13 +323,13 @@ async function copyManualUrl() {
   }
 }
 
-onMounted(loadOverview)
+onMounted(loadProxies)
 </script>
 
 <template>
   <div class="detail-page">
-    <p v-if="overviewError" class="banner banner-error" role="alert">
-      {{ overviewError }}
+    <p v-if="proxiesError" class="banner banner-error" role="alert">
+      读不到 CPR 的代理：{{ proxiesError }}
     </p>
 
     <section class="detail-card" aria-labelledby="quick-import-title">
@@ -337,11 +355,11 @@ onMounted(loadOverview)
       <div class="flex flex-wrap items-center justify-between gap-3 text-xs">
         <div class="flex flex-wrap items-center gap-4">
           <label class="inline-flex items-center gap-2 text-cp-text-secondary">
-            <span>借哪个账号的代理登录：</span>
-            <select v-model="viaAccountId" class="cp-select w-64" aria-label="借哪个账号的代理登录">
-              <option v-if="!enabledAccounts.length" value="">无启用中的 CPR 账号</option>
-              <option v-for="a in enabledAccounts" :key="a.accountId" :value="a.accountId">
-                {{ a.email || a.name }} ({{ a.accountId }})
+            <span class="whitespace-nowrap">新账号用哪个代理：</span>
+            <select v-model="proxyId" class="cp-select w-72" aria-label="新账号用哪个代理" :disabled="loadingProxies">
+              <option v-if="!proxies.length" value="">{{ loadingProxies ? '正在读取代理…' : 'CPR 里没有代理' }}</option>
+              <option v-for="p in proxies" :key="p.id" :value="p.id" :disabled="!p.enabled">
+                {{ proxyLabel(p) }}
               </option>
             </select>
           </label>
@@ -373,6 +391,10 @@ onMounted(loadOverview)
           </ZButton>
         </div>
       </div>
+
+      <p v-if="proxyBrowserOnly" class="muted note">
+        这个代理还没有账号在用，插件没法经它自动登录。导入失败的行可以点“浏览器手动登录”，新账号照样绑在这个代理上；也可以先在 CPR 给一个账号绑上它。
+      </p>
 
       <p v-if="importError" class="banner banner-error" role="alert">
         {{ importError }}
@@ -477,6 +499,16 @@ onMounted(loadOverview)
                         : rowStates[item.line]?.message
                     }}
                   </span>
+                  <ZButton
+                    v-for="c in rowStates[item.line]?.status === 'error' ? rowStates[item.line]?.choices ?? [] : []"
+                    :key="c.kind + c.id"
+                    size="small"
+                    :disabled="importing"
+                    :title="`用${c.kind === 'workspace' ? '工作区' : '组织'} ${c.id} 重试这一行`"
+                    @click="retryWithChoice(item.line, c)"
+                  >
+                    {{ c.name || c.id }}
+                  </ZButton>
                   <ZButton
                     v-if="rowStates[item.line]?.status === 'error' && needsManualOAuth(rowStates[item.line]?.code)"
                     size="small"

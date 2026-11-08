@@ -80,9 +80,10 @@ pub struct FakeHost {
     pub seen_http: Vec<SeenRequest>,
     pub calls: Vec<String>,
     pub last_oauth_state: String,
-    /// 假的 CPR 管理接口（`http://cpr.test`）
-    pub cpr_admin_key: String,
+    /// 假的 CPR 管理接口（经 `host.http.dispatch` 调宿主路由）
     pub cpr_account_proxies: HashMap<String, Option<String>>,
+    /// 代理池：(ID, 名称, 是否启用)
+    pub cpr_proxies: Vec<(String, String, bool)>,
     pub cpr_admin_calls: Vec<String>,
     pub cpr_oauth_starts: Vec<Value>,
     pub cpr_oauth_completes: Vec<Value>,
@@ -107,13 +108,15 @@ pub fn account(id: &str) -> Value {
 impl FakeHost {
     pub fn new(accounts: &[&str]) -> Self {
         let mut cpr_account_proxies = HashMap::new();
+        let mut cpr_proxies = Vec::new();
         for &id in accounts {
             cpr_account_proxies.insert(id.to_owned(), Some(format!("proxy-{id}")));
+            cpr_proxies.push((format!("proxy-{id}"), format!("代理 {id}"), true));
         }
         Self {
             accounts: accounts.iter().map(|id| account(id)).collect(),
-            cpr_admin_key: "test-admin-key".to_owned(),
             cpr_account_proxies,
+            cpr_proxies,
             ..Self::default()
         }
     }
@@ -136,31 +139,36 @@ impl FakeHost {
 
     fn cpr_admin(&mut self, params: &Value, payload: &[u8]) -> (u16, Value) {
         let method = params["method"].as_str().unwrap().to_owned();
-        let url = params["url"].as_str().unwrap();
-        let path = url
-            .trim_start_matches("http://cpr.test")
-            .split('?')
-            .next()
-            .unwrap()
-            .to_owned();
+        let url = params["uri"].as_str().unwrap();
+        assert!(
+            url.starts_with("/api/admin/"),
+            "admin dispatch must use a relative host path: {url}"
+        );
+        let path = url.split('?').next().unwrap().to_owned();
         self.cpr_admin_calls.push(format!("{method} {path}"));
-        let key = params["headers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|h| h[0].as_str().unwrap().eq_ignore_ascii_case("x-api-key"))
-            .map(|h| {
-                let bytes: Vec<u8> = serde_json::from_value(h[1].clone()).unwrap();
-                String::from_utf8(bytes).unwrap()
-            });
-        if key.as_deref() != Some(self.cpr_admin_key.as_str()) || self.cpr_admin_key.is_empty() {
-            return (
-                401,
-                json!({"code": 401, "message": "invalid admin api key", "data": null}),
+        for h in params["headers"].as_array().unwrap() {
+            let name = h["name"].as_str().unwrap();
+            assert!(
+                !name.eq_ignore_ascii_case("x-api-key")
+                    && !name.eq_ignore_ascii_case("authorization"),
+                "dispatch must not carry credentials: {name}"
             );
         }
         let ok = |data: Value| (200, json!({"code": 200, "message": "ok", "data": data}));
         match (method.as_str(), path.as_str()) {
+            ("GET", "/api/admin/proxies") => {
+                let items: Vec<Value> = self
+                    .cpr_proxies
+                    .iter()
+                    .map(|(id, name, enabled)| {
+                        json!({
+                            "id": id, "name": name, "enabled": enabled,
+                            "endpoint": "http://10.0.0.1:8080", "hasAuthentication": true,
+                        })
+                    })
+                    .collect();
+                ok(json!({"items": items, "page": {"totalPages": 1}}))
+            }
             ("GET", "/api/admin/accounts") => {
                 assert!(url.contains("provider=openai"));
                 let items: Vec<Value> = self
@@ -420,19 +428,39 @@ impl FakeHost {
                 });
                 Ok((json!({"Ok":profile}), Vec::new()))
             }
-            "host.http.do_stream"
-                if params["url"]
-                    .as_str()
-                    .is_some_and(|u| u.starts_with("http://cpr.test/")) =>
-            {
-                let (status, body) = self.cpr_admin(params, payload);
-                let id = format!("cpr-stream-{}", self.cpr_admin_calls.len());
+            "host.http.dispatch" => {
+                let body = match params["body"]["kind"].as_str().unwrap() {
+                    "bytes" => payload.to_vec(),
+                    "empty" => Vec::new(),
+                    other => panic!("unexpected dispatch body kind {other}"),
+                };
+                let (status, reply) = self.cpr_admin(params, &body);
+                let id = format!("cpr-body-{}", self.cpr_admin_calls.len());
                 self.streams
-                    .insert(id.clone(), serde_json::to_vec(&body).unwrap());
+                    .insert(id.clone(), serde_json::to_vec(&reply).unwrap());
                 Ok((
-                    json!({"status": status, "http_version": "HTTP/1.1", "headers": [], "stream": id, "trailers": []}),
+                    json!({
+                        "status": status, "version": "HTTP/1.1", "headers": [],
+                        "body": {"kind": "handle", "handle": id},
+                        "response": null, "session": false,
+                    }),
                     Vec::new(),
                 ))
+            }
+            "host.http.body_read" => {
+                let id = params["handle"].as_str().unwrap();
+                let buf = self.streams.get_mut(id).expect("unknown body handle");
+                if buf.is_empty() {
+                    self.streams.remove(id);
+                    return Ok((json!({"eof": true, "trailers": null}), Vec::new()));
+                }
+                let n = buf.len().min(40);
+                let chunk: Vec<u8> = buf.drain(..n).collect();
+                Ok((json!({"eof": false, "trailers": null}), chunk))
+            }
+            "host.http.body_close" => {
+                self.streams.remove(params["handle"].as_str().unwrap());
+                Ok((json!({}), Vec::new()))
             }
             "host.http.account" => {
                 let mut reply = self

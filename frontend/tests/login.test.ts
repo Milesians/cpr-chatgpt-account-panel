@@ -5,6 +5,7 @@ import {
   errorCodeLabel,
   formatLoginError,
   hasKnownErrorCode,
+  loginChoices,
   needsManualOAuth,
   resolveImportAction,
   resolveLoginMainAction,
@@ -13,7 +14,8 @@ import {
 test('maps login error codes and detects manual OAuth fallback conditions', () => {
   assert.equal(errorCodeLabel('browser_challenge'), '需浏览器验证（Cloudflare）')
   assert.equal(errorCodeLabel('source_proxy_unavailable'), '账号绑定代理不可用')
-  assert.equal(errorCodeLabel('admin_config_invalid'), 'CPR 管理接口未配置')
+  assert.equal(errorCodeLabel('no_carrier'), '代理还没有账号在用')
+  assert.equal(errorCodeLabel('mfa_issue_failed'), '发起 2FA 验证失败')
   assert.equal(errorCodeLabel('email_missing'), '缺少邮箱')
   assert.equal(errorCodeLabel('password_missing'), '缺少密码')
   assert.equal(errorCodeLabel('login_rejected'), '认证请求被拒绝')
@@ -40,6 +42,7 @@ test('maps login error codes and detects manual OAuth fallback conditions', () =
   assert.equal(needsManualOAuth('browser_challenge'), true)
   assert.equal(needsManualOAuth('email_otp_required'), true)
   assert.equal(needsManualOAuth('password_rejected'), false)
+  assert.equal(needsManualOAuth('no_carrier'), true)
 })
 
 test('button labels and disabled reasons follow state changes', () => {
@@ -154,4 +157,19 @@ test('builds one-by-one import queue from raw text and preview report', () => {
   assert.equal(withUpdates.length, 2)
   assert.equal(withUpdates[1]?.existingAccountId, 'acct_a')
   assert.equal(withUpdates[1]?.totp, '')
+})
+
+test('reads workspace choices from error details and drops odd entries', () => {
+  assert.deepEqual(loginChoices(undefined), [])
+  assert.deepEqual(loginChoices({ choices: 'x' }), [])
+  assert.deepEqual(loginChoices({ choices: [
+    { kind: 'workspace', id: 'ws-a', name: '个人' },
+    { kind: 'workspace', id: '', name: 'x' },
+    { kind: 'project', id: 'p', name: 'x' },
+    null,
+    { kind: 'organization', id: 'org-1', name: '' },
+  ] }), [
+    { kind: 'workspace', id: 'ws-a', name: '个人' },
+    { kind: 'organization', id: 'org-1', name: '' },
+  ])
 })

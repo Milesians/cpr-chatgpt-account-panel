@@ -91,6 +91,17 @@ pub struct LoginError {
     pub stage: &'static str,
     pub code: &'static str,
     pub message: String,
+    /// 多个工作区或组织时可选的候选，页面点一下就带着它重试
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<Choice>,
+}
+
+/// 登录时可选的一个工作区（`workspace`）或组织（`organization`）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Choice {
+    pub kind: String,
+    pub id: String,
+    pub name: String,
 }
 
 impl LoginError {
@@ -100,7 +111,35 @@ impl LoginError {
             stage,
             code,
             message: message.into(),
+            choices: Vec::new(),
         }
+    }
+
+    #[must_use]
+    fn with_choices(mut self, kind: &'static str, candidates: &[WorkspaceCandidate]) -> Self {
+        self.choices = candidates
+            .iter()
+            .map(|c| Choice {
+                kind: kind.to_owned(),
+                id: c.id.clone(),
+                name: c.name.clone(),
+            })
+            .collect();
+        self
+    }
+}
+
+/// 30 秒的 TOTP 窗口只剩这么多时，等到下一个窗口再生成验证码
+const TOTP_MIN_REMAINING_MS: i64 = 4_000;
+
+/// 离当前 TOTP 窗口结束不到 [`TOTP_MIN_REMAINING_MS`] 时，返回要等多久（多等 300 毫秒越过边界）
+#[must_use]
+pub fn totp_wait_ms(now_ms: i64) -> u64 {
+    let remaining = 30_000 - now_ms.rem_euclid(30_000);
+    if remaining <= TOTP_MIN_REMAINING_MS {
+        u64::try_from(remaining + 300).unwrap_or(0)
+    } else {
+        0
     }
 }
 
@@ -619,7 +658,24 @@ impl Flow<'_> {
                     "force_fresh_challenge": false,
                 }),
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                // 这一步还没提交验证码，被拒不代表 2FA 密钥不对
+                if matches!(e.code, "login_rejected" | "upstream_rejected") {
+                    LoginError::new(
+                        "totp",
+                        "mfa_issue_failed",
+                        format!("OpenAI 没能发起 2FA 验证：{}", e.message),
+                    )
+                } else {
+                    e
+                }
+            })?;
+        let wait = totp_wait_ms(now_ms());
+        if wait > 0 {
+            // 验证码临近失效，加上代理延迟可能到达时已过期
+            tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+        }
         let code = totp_code(self.totp_secret, now_ms()).map_err(|err_code| {
             let msg = if err_code == "totp_secret_missing" {
                 "该账号开启了 2FA 验证，但尚未提供 2FA 密钥"
@@ -639,6 +695,20 @@ impl Flow<'_> {
             }),
         )
         .await
+        .map_err(|e| {
+            if matches!(e.code, "login_rejected" | "upstream_rejected") {
+                LoginError::new(
+                    "totp",
+                    "totp_rejected",
+                    format!(
+                        "2FA 动态验证码被拒绝，请检查 2FA 密钥是否正确（{}）",
+                        e.message
+                    ),
+                )
+            } else {
+                e
+            }
+        })
     }
 
     async fn select_workspace(&mut self, p: &Page) -> Result<Page, LoginError> {
@@ -657,8 +727,9 @@ impl Flow<'_> {
                 return Err(LoginError::new(
                     "authorize",
                     "workspace_unavailable",
-                    "指定的 Workspace ID 不在账号可用工作区列表中",
-                ));
+                    "指定的工作区不在这个账号可用的工作区里，请重选",
+                )
+                .with_choices("workspace", &candidates));
             }
         } else if !direct_ws.is_empty() {
             direct_ws
@@ -683,9 +754,9 @@ impl Flow<'_> {
                         .iter()
                         .map(|c| {
                             if c.name.is_empty() {
-                                c.id.clone()
+                                c.id.as_str()
                             } else {
-                                format!("{} ({})", c.name, c.id)
+                                c.name.as_str()
                             }
                         })
                         .collect::<Vec<_>>()
@@ -693,8 +764,9 @@ impl Flow<'_> {
                     return Err(LoginError::new(
                         "authorize",
                         "workspace_ambiguous",
-                        format!("账号存在多个可用工作区，请指定 Workspace ID：{summary}"),
-                    ));
+                        format!("账号有 {} 个工作区：{summary}", candidates.len()),
+                    )
+                    .with_choices("workspace", &candidates));
                 }
             }
         };
@@ -729,8 +801,9 @@ impl Flow<'_> {
                     LoginError::new(
                         "authorize",
                         "workspace_unavailable",
-                        "指定的 Organization ID 不在可选列表中",
+                        "指定的组织不在可选列表中，请重选",
                     )
+                    .with_choices("organization", &candidates)
                 })?
         } else {
             match candidates.len() {
@@ -746,8 +819,9 @@ impl Flow<'_> {
                     return Err(LoginError::new(
                         "authorize",
                         "workspace_ambiguous",
-                        "账号存在多个 Organization，请指定 Organization ID",
-                    ));
+                        "账号有多个组织，请选一个",
+                    )
+                    .with_choices("organization", &candidates));
                 }
             }
         };
@@ -1498,6 +1572,40 @@ fn decode_jwt_claims(token: &str) -> Result<Map<String, Value>, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waits_for_a_fresh_totp_window_near_the_edge() {
+        let base = 1_800_000_010_000_i64 - 1_800_000_010_000_i64.rem_euclid(30_000);
+        assert_eq!(totp_wait_ms(base), 0);
+        assert_eq!(totp_wait_ms(base + 25_999), 0);
+        assert_eq!(totp_wait_ms(base + 26_000), 4_300);
+        assert_eq!(totp_wait_ms(base + 29_999), 301);
+    }
+
+    #[test]
+    fn ambiguous_workspace_error_lists_choices() {
+        let candidates = vec![
+            WorkspaceCandidate {
+                id: "ws-a".into(),
+                name: "个人".into(),
+                project_id: String::new(),
+            },
+            WorkspaceCandidate {
+                id: "ws-b".into(),
+                name: "Team".into(),
+                project_id: String::new(),
+            },
+        ];
+        let e = LoginError::new("authorize", "workspace_ambiguous", "x")
+            .with_choices("workspace", &candidates);
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(
+            v["choices"][1],
+            json!({"kind": "workspace", "id": "ws-b", "name": "Team"})
+        );
+        let plain = serde_json::to_value(LoginError::new("a", "b", "c")).unwrap();
+        assert!(plain.get("choices").is_none());
+    }
 
     fn make_jwt(payload: &Value) -> String {
         let header = base64_url_encode(br#"{"alg":"none","typ":"JWT"}"#);

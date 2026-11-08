@@ -362,8 +362,7 @@ async fn cloudflare_challenge_triggers_browser_challenge_and_manual_oauth_comple
 }
 
 #[tokio::test]
-async fn import_uses_cpr_admin_oauth_start_and_complete_with_carrier_proxy_and_deletes_staged_email_record()
- {
+async fn import_with_chosen_proxy_borrows_a_bound_account_and_deletes_staged_email_record() {
     let mut host = FakeHost::new(&["acct_a"]);
     host.forbidden_secrets = vec![
         TEST_PASSWORD.to_owned(),
@@ -424,7 +423,8 @@ async fn import_uses_cpr_admin_oauth_start_and_complete_with_carrier_proxy_and_d
     assert_eq!(staged["totp"], TEST_TOTP);
 
     // 3. 逐个导入新账号到 CPR：
-    //    - 先经管理接口 GET /api/admin/accounts 查借道账号 acct_a 的 outboundProxyId ("proxy-acct_a")
+    //    - 选了代理 proxy-acct_a：经管理接口 GET /api/admin/proxies 核对它启用，
+    //      GET /api/admin/accounts 找到绑着它的启用账号 acct_a 借道
     //    - 再经管理接口 POST /api/admin/accounts/oauth/start（带 outboundProxyId，不带 accountId，name 为邮箱）
     //    - 借道 acct_a 的 host.http.account 跑完登录步骤截获回调 URL（插件自己不调 /oauth/token）
     //    - 交给管理接口 POST /api/admin/accounts/oauth/complete 由 CPR 用该代理换码建号
@@ -446,7 +446,7 @@ async fn import_uses_cpr_admin_oauth_start_and_complete_with_carrier_proxy_and_d
             Some(json!({
                 "email": "team_new@example.com",
                 "kind": "team",
-                "viaAccountId": "acct_a",
+                "proxyId": "proxy-acct_a",
             })),
             &mut host,
         )
@@ -460,10 +460,11 @@ async fn import_uses_cpr_admin_oauth_start_and_complete_with_carrier_proxy_and_d
     assert_eq!(imported["hasPassword"], true);
     assert_eq!(imported["hasTotp"], true);
 
-    // 证明 1：导入只调了 GET /api/admin/accounts、POST /api/admin/accounts/oauth/start 和 POST /api/admin/accounts/oauth/complete
+    // 证明 1：管理接口只经宿主内部调用（假宿主断言了相对路径、不带 Key），且只调了这几条
     assert_eq!(
         host.cpr_admin_calls,
         vec![
+            "GET /api/admin/proxies",
             "GET /api/admin/accounts",
             "POST /api/admin/accounts/oauth/start",
             "POST /api/admin/accounts/oauth/complete",
@@ -479,6 +480,9 @@ async fn import_uses_cpr_admin_oauth_start_and_complete_with_carrier_proxy_and_d
         })
     );
     assert!(host.cpr_oauth_starts[0].get("accountId").is_none());
+    // 登录请求全部经借道账号 acct_a（绑着所选代理）发出
+    assert!(!host.seen_http.is_empty());
+    assert!(host.seen_http.iter().all(|r| r.account_id == "acct_a"));
     assert_eq!(host.cpr_oauth_completes.len(), 1);
     assert_eq!(host.cpr_oauth_completes[0]["provider"], "openai");
     assert_eq!(host.cpr_oauth_completes[0]["flowId"], "flow_1");
@@ -523,7 +527,7 @@ async fn import_uses_cpr_admin_oauth_start_and_complete_with_carrier_proxy_and_d
                 "password": TEST_PASSWORD,
                 "totp": TEST_TOTP,
                 "kind": "team",
-                "viaAccountId": "acct_a",
+                "proxyId": "proxy-acct_a",
             })),
             &mut host,
         )
@@ -532,32 +536,116 @@ async fn import_uses_cpr_admin_oauth_start_and_complete_with_carrier_proxy_and_d
     assert_eq!(dup["error"]["code"], "already_in_source");
 }
 
-#[tokio::test]
-async fn import_rejects_when_carrier_account_has_no_bound_proxy() {
-    let mut host = FakeHost::new(&["acct_a"]);
-    // 借道账号未绑定代理（outboundProxyId 为 null）
-    host.cpr_account_proxies.insert("acct_a".to_owned(), None);
+async fn import(peer: &mut Peer, host: &mut FakeHost, proxy_id: &str) -> (u64, Value) {
+    peer.api(
+        "POST",
+        "api/login/import",
+        "",
+        Some(json!({
+            "email": "fresh@example.com",
+            "password": TEST_PASSWORD,
+            "kind": "personal",
+            "proxyId": proxy_id,
+        })),
+        host,
+    )
+    .await
+}
 
-    let mut peer = Peer::start(test_config()).await;
-    let (code, body) = peer
-        .api(
-            "POST",
-            "api/login/import",
-            "",
-            Some(json!({
-                "email": "direct_forbidden@example.com",
-                "password": TEST_PASSWORD,
-                "kind": "personal",
-                "viaAccountId": "acct_a",
-            })),
-            &mut host,
-        )
-        .await;
-    assert_eq!(code, 409, "{body}");
-    assert_eq!(body["error"]["code"], "source_proxy_unavailable");
-    assert_eq!(host.cpr_admin_calls, vec!["GET /api/admin/accounts"]);
+fn assert_nothing_sent(host: &FakeHost) {
     assert!(host.cpr_oauth_starts.is_empty());
     assert!(host.cpr_oauth_completes.is_empty());
     assert!(host.seen_http.is_empty());
     assert!(!host.calls.iter().any(|c| c == "host.auth.save"));
+}
+
+#[tokio::test]
+async fn import_needs_a_proxy_that_an_enabled_account_uses() {
+    let mut host = FakeHost::new(&["acct_a", "acct_b"]);
+    // 新代理还没有账号在用；acct_b 绑的代理停用了；acct_a 自己停用了
+    host.cpr_proxies
+        .push(("proxy-new".into(), "新代理".into(), true));
+    host.cpr_proxies[1].2 = false;
+    host.accounts[0]["enabled"] = json!(false);
+    let mut peer = Peer::start(test_config()).await;
+
+    let (code, body) = import(&mut peer, &mut host, "").await;
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(body["error"]["code"], "proxy_missing");
+
+    let (code, body) = import(&mut peer, &mut host, "proxy-new").await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(body["error"]["code"], "no_carrier");
+
+    // 停用的账号不能借道
+    let (code, body) = import(&mut peer, &mut host, "proxy-acct_a").await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(body["error"]["code"], "no_carrier");
+
+    let (code, body) = import(&mut peer, &mut host, "proxy-acct_b").await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(body["error"]["code"], "proxy_unavailable");
+
+    let (code, body) = import(&mut peer, &mut host, "proxy-gone").await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(body["error"]["code"], "proxy_unavailable");
+
+    assert_nothing_sent(&host);
+}
+
+#[tokio::test]
+async fn browser_login_can_use_a_proxy_nobody_uses_yet() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    host.cpr_proxies
+        .push(("proxy-new".into(), "新代理".into(), true));
+    let mut peer = Peer::start(test_config()).await;
+    let (code, body) = peer
+        .api(
+            "POST",
+            "api/login/oauth/start",
+            "",
+            Some(json!({"email": "fresh@example.com", "kind": "personal", "proxyId": "proxy-new"})),
+            &mut host,
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body["authorizeUrl"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://auth.openai.com/")
+    );
+    assert_eq!(host.cpr_oauth_starts[0]["outboundProxyId"], "proxy-new");
+    assert!(
+        host.seen_http.is_empty(),
+        "browser login sends nothing itself"
+    );
+}
+
+#[tokio::test]
+async fn proxy_list_counts_carriers_without_addresses() {
+    let mut host = FakeHost::new(&["acct_a", "acct_b"]);
+    host.cpr_account_proxies
+        .insert("acct_b".to_owned(), Some("proxy-acct_a".to_owned()));
+    host.cpr_proxies
+        .push(("proxy-new".into(), "新代理".into(), true));
+    let mut peer = Peer::start(test_config()).await;
+    let (code, body) = peer
+        .api("GET", "api/login/proxies", "", None, &mut host)
+        .await;
+    assert_eq!(code, 200, "{body}");
+    let list = body["proxies"].as_array().unwrap();
+    let carriers = |id: &str| {
+        list.iter()
+            .find(|p| p["id"] == id)
+            .map(|p| p["carriers"].as_u64().unwrap())
+    };
+    assert_eq!(carriers("proxy-acct_a"), Some(2));
+    assert_eq!(carriers("proxy-acct_b"), Some(0));
+    assert_eq!(carriers("proxy-new"), Some(0));
+    let text = body.to_string();
+    assert!(
+        !text.contains("10.0.0.1") && !text.contains("endpoint"),
+        "{text}"
+    );
 }

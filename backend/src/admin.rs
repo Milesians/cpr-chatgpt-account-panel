@@ -1,21 +1,25 @@
-//! CPR 管理员接口：只用来读借道账号绑定的代理，以及调 `oauth/start` 和 `oauth/complete` 导入新账号
+//! CPR 管理接口：读代理和账号绑定，调 `oauth/start` 和 `oauth/complete` 导入新账号
 //!
-//! 插件 SDK 的 `host.auth.save` 不能给新建账号绑定出站代理；新导入账号必须借道已有账号绑定的代理，
-//! 并通过 CPR 管理 API 的 `oauth/start` + `oauth/complete` 让 CPR 自己用那个代理换码建号。
-//! 用部署级管理 API Key（`x-api-key`），只发给配置的 CPR 地址，宿主客户端不跟随重定向，3xx 也当失败。
-//! 错误信息不带 Key 和地址。
+//! 插件 SDK 的 `host.auth.save` 不能给新建账号绑定出站代理，新账号要经 CPR 管理接口的
+//! `oauth/start`（带 `outboundProxyId`）+ `oauth/complete` 让 CPR 自己用那个代理换码建号。
+//!
+//! 管理接口经 `host.http.dispatch` 发给宿主自己的路由：只传相对路径，宿主给子请求注入插件身份，
+//! 不需要管理 API Key，也不出本机网络。
 
-use gateway_plugin_sdk::{call::host::HttpRequest, client::HostClient};
+use gateway_plugin_sdk::{
+    call::middleware::{MiddlewareHeader, http::Version},
+    client::{HostClient, HttpBody, HttpFrame, HttpRequest},
+};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-
-use crate::config::Config;
 
 const PAGE_SIZE: u32 = 200;
 const MAX_PAGES: u32 = 100;
 const MAX_BODY: usize = 8 * 1024 * 1024;
+const TIMEOUT_MS: u64 = 20_000;
 
 const ACCOUNTS: &str = "/api/admin/accounts";
+const PROXIES: &str = "/api/admin/proxies";
 const OAUTH_START: &str = "/api/admin/accounts/oauth/start";
 const OAUTH_COMPLETE: &str = "/api/admin/accounts/oauth/complete";
 
@@ -30,6 +34,28 @@ pub struct AccountProxy {
     pub plan_type: Option<String>,
     #[serde(default)]
     pub outbound_proxy_id: Option<String>,
+}
+
+impl AccountProxy {
+    /// 绑定的代理 ID；没绑时是 `None`
+    #[must_use]
+    pub fn proxy_id(&self) -> Option<&str> {
+        self.outbound_proxy_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// CPR 代理池里的一条代理（不含地址和认证）
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Proxy {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// `POST /api/admin/accounts/oauth/start` 的响应数据
@@ -77,52 +103,14 @@ fn one_line(s: &str, max_chars: usize) -> String {
     collapsed.chars().take(max_chars).collect()
 }
 
-/// 配好了地址和 Key 时返回规范化的地址（去掉末尾的 `/`）
-///
-/// # Errors
-/// 没配或配得不对时返回给页面看的原因
-pub fn base_url(config: &Config) -> Result<String, &'static str> {
-    let url = config.cpr_admin_url.trim().trim_end_matches('/');
-    let key = config.cpr_admin_api_key.trim();
-    if url.is_empty() || key.is_empty() {
-        return Err(
-            "在插件设置里填写 CPR 地址，并在敏感配置里填写 CPR 管理 API Key 后才能导入新账号",
-        );
-    }
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"));
-    if rest.is_none_or(|r| {
-        r.is_empty() || r.contains(['?', '#', '@']) || r.chars().any(char::is_whitespace)
-    }) || url.len() > 512
-    {
-        return Err("CPR 地址格式不对，应为 http(s)://主机[:端口]");
-    }
-    if key.len() > 512 || key.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err("CPR 管理 API Key 格式不对");
-    }
-    Ok(url.to_owned())
-}
-
 pub struct Admin<'a> {
     host: &'a HostClient,
-    base: String,
-    key: String,
 }
 
 impl<'a> Admin<'a> {
-    /// # Errors
-    /// 没配好时返回原因
-    pub fn new(host: &'a HostClient, config: &Config) -> Result<Self, String> {
-        Ok(Self {
-            host,
-            base: base_url(config)?,
-            key: config.cpr_admin_api_key.trim().to_owned(),
-        })
-    }
-
-    fn redact(&self, s: &str) -> String {
-        one_line(&s.replace(&self.key, "***").replace(&self.base, "CPR"), 200)
+    #[must_use]
+    pub const fn new(host: &'a HostClient) -> Self {
+        Self { host }
     }
 
     async fn call<T: DeserializeOwned>(
@@ -132,48 +120,58 @@ impl<'a> Admin<'a> {
         query: &str,
         body: Option<Value>,
     ) -> Result<T, String> {
-        let mut headers = vec![
-            ("x-api-key".to_owned(), self.key.as_bytes().to_vec()),
-            ("Accept".to_owned(), b"application/json".to_vec()),
-        ];
-        let payload = match body {
+        let mut headers = vec![MiddlewareHeader {
+            name: "accept".to_owned(),
+            value: b"application/json".to_vec(),
+        }];
+        let body = match body {
             Some(body) => {
-                headers.push(("Content-Type".to_owned(), b"application/json".to_vec()));
-                serde_json::to_vec(&body).map_err(|_| "请求编码失败".to_owned())?
+                headers.push(MiddlewareHeader {
+                    name: "content-type".to_owned(),
+                    value: b"application/json".to_vec(),
+                });
+                HttpBody::from_bytes(
+                    serde_json::to_vec(&body).map_err(|_| "请求编码失败".to_owned())?,
+                )
             }
-            None => Vec::new(),
+            None => HttpBody::empty(),
         };
-        let url = if query.is_empty() {
-            format!("{}{path}", self.base)
+        let uri = if query.is_empty() {
+            path.to_owned()
         } else {
-            format!("{}{path}?{query}", self.base)
+            format!("{path}?{query}")
         };
-        let response = self
+        let mut response = self
             .host
-            .http(
-                HttpRequest {
-                    method: method.to_owned(),
-                    url,
-                    headers,
-                },
-                payload,
-            )
+            .dispatch_http(HttpRequest {
+                settings: Value::Null,
+                method: method.to_owned(),
+                uri,
+                version: Version::Http11,
+                headers,
+                timeout_ms: Some(TIMEOUT_MS),
+                body,
+            })
             .await
-            .map_err(|_| "连不上 CPR 管理接口，请检查插件设置里的 CPR 地址".to_owned())?;
+            .map_err(|_| "调不通 CPR 管理接口，请确认 CPR 版本支持插件调用管理接口".to_owned())?;
         let status = response.status;
-        let bytes = response
-            .body
-            .collect(MAX_BODY)
-            .await
-            .map_err(|_| "读取 CPR 管理接口的响应失败".to_owned())?;
-        match status {
-            401 | 403 => return Err("CPR 管理 API Key 无效或没有权限".into()),
-            300..=399 => {
-                return Err(format!(
-                    "CPR 管理接口返回重定向（HTTP {status}），请填写 CPR 的实际地址"
-                ));
+        let mut bytes = Vec::new();
+        loop {
+            match response.body.read().await {
+                Ok(Some(HttpFrame::Data(chunk))) => {
+                    if bytes.len() + chunk.len() > MAX_BODY {
+                        let _ = response.body.close().await;
+                        return Err("CPR 管理接口的响应太大".into());
+                    }
+                    bytes.extend(chunk);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => return Err("读取 CPR 管理接口的响应失败".into()),
             }
-            _ => {}
+        }
+        if matches!(status, 401 | 403) {
+            return Err("CPR 拒绝了插件调用管理接口（没有权限）".into());
         }
         let envelope: Envelope = serde_json::from_slice(&bytes)
             .map_err(|_| format!("CPR 管理接口返回了无效响应（HTTP {status}）"))?;
@@ -181,7 +179,7 @@ impl<'a> Admin<'a> {
         if !(200..300).contains(&status) || envelope.code.as_u64() != Some(200) {
             return Err(format!(
                 "CPR 管理接口拒绝了请求（HTTP {status}）：{}",
-                self.redact(&envelope.message)
+                one_line(&envelope.message, 200)
             ));
         }
         serde_json::from_value(envelope.data)
@@ -210,20 +208,12 @@ impl<'a> Admin<'a> {
         self.pages(ACCOUNTS, "provider=openai&").await
     }
 
-    /// 读取指定账号绑定的出站代理 ID（未绑代理时返回 `None`）
+    /// 代理池里的全部代理
     ///
     /// # Errors
-    /// 管理接口失败或找不到账号时返回原因
-    pub async fn outbound_proxy_id(&self, account_id: &str) -> Result<Option<String>, String> {
-        let list = self.accounts().await?;
-        let found = list
-            .into_iter()
-            .find(|a| a.id == account_id)
-            .ok_or_else(|| "在 CPR 管理接口中找不到指定的借道账号".to_owned())?;
-        Ok(found
-            .outbound_proxy_id
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty()))
+    /// 管理接口失败时返回原因
+    pub async fn proxies(&self) -> Result<Vec<Proxy>, String> {
+        self.pages(PROXIES, "").await
     }
 
     /// 发起新建 OpenAI OAuth 账号流程（不带 `accountId`，带 `outboundProxyId`，`name` 为邮箱）
@@ -268,5 +258,35 @@ impl<'a> Admin<'a> {
             })),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_id_ignores_blank() {
+        let a: AccountProxy =
+            serde_json::from_value(json!({"id": "a", "outboundProxyId": "  "})).unwrap();
+        assert_eq!(a.proxy_id(), None);
+        let b: AccountProxy =
+            serde_json::from_value(json!({"id": "b", "outboundProxyId": " p1 "})).unwrap();
+        assert_eq!(b.proxy_id(), Some("p1"));
+        let c: AccountProxy = serde_json::from_value(json!({"id": "c"})).unwrap();
+        assert_eq!(c.proxy_id(), None);
+    }
+
+    #[test]
+    fn proxy_view_reads_only_safe_fields() {
+        let p: Proxy = serde_json::from_value(json!({
+            "id": "px", "name": "东京", "enabled": true,
+            "endpoint": "http://1.2.3.4:8080", "hasAuthentication": true, "accountCount": 3,
+        }))
+        .unwrap();
+        assert_eq!(
+            (p.id.as_str(), p.name.as_str(), p.enabled),
+            ("px", "东京", true)
+        );
     }
 }

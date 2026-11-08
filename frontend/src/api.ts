@@ -171,7 +171,7 @@ export interface Devices {
 export type SignOutTarget = { device: string } | { others: true } | { all: true }
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number, readonly code = '') {
+  constructor(message: string, readonly status: number, readonly code = '', readonly details?: unknown) {
     super(message)
   }
 }
@@ -199,7 +199,7 @@ export async function call<T>(method: 'GET' | 'POST', path: string, query?: Reco
   }
   if (reply.status < 200 || reply.status >= 300) {
     const e = value?.error
-    throw new ApiError(typeof e?.message === 'string' ? e.message : `请求失败（HTTP ${reply.status}）`, reply.status, typeof e?.code === 'string' ? e.code : '')
+    throw new ApiError(typeof e?.message === 'string' ? e.message : `请求失败（HTTP ${reply.status}）`, reply.status, typeof e?.code === 'string' ? e.code : '', e?.details)
   }
   return value as T
 }

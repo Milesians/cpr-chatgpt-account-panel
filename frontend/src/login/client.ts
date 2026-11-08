@@ -35,6 +35,14 @@ export interface OAuthCompleteResponse {
   kind?: string
 }
 
+/** 导入时可选的 CPR 代理；carriers 是绑着它、能借道发登录请求的启用账号数 */
+export interface ImportProxy {
+  id: string
+  name: string
+  enabled: boolean
+  carriers: number
+}
+
 export interface ImportAccountResponse {
   ok: boolean
   accountId: string
@@ -49,6 +57,9 @@ export interface ImportAccountResponse {
 export const loginApi = {
   overview: () =>
     call<LoginStatusOverview>('GET', 'api/login/status'),
+
+  proxies: () =>
+    call<{ proxies: ImportProxy[] }>('GET', 'api/login/proxies'),
 
   accountStatus: (id: string) =>
     call<SingleAccountLoginStatus>('GET', 'api/login/status', { id }),
@@ -78,7 +89,7 @@ export const loginApi = {
     accountId?: string
     email?: string
     kind?: string
-    viaAccountId?: string
+    proxyId?: string
   }) =>
     call<OAuthStartResponse>('POST', 'api/login/oauth/start', undefined, data),
 
@@ -86,7 +97,6 @@ export const loginApi = {
     accountId?: string
     email?: string
     kind?: string
-    viaAccountId?: string
     callbackUrl: string
   }) =>
     call<OAuthCompleteResponse>('POST', 'api/login/oauth/complete', undefined, data),
@@ -99,7 +109,7 @@ export const loginApi = {
     password?: string
     totp?: string
     kind: string
-    viaAccountId?: string
+    proxyId?: string
     workspaceId?: string
     organizationId?: string
     replaceExisting?: boolean

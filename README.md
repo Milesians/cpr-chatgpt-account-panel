@@ -58,12 +58,15 @@
 
 - **凭据存储**：账号的密码与 2FA 密钥（Base32 或 `otpauth://totp/` 链接）以**明文**存在 CPR 数据库 `plugin_state_records` 表的 `login` 命名空间里（键为 CPR 账号 ID；粘贴待导入时暂存在 `email:<邮箱>:<kind>` 下）。密码与 2FA 绝不写入宿主日志 `host.log` 或错误信息，前端页面也绝不回显明文（只返回 `hasPassword` / `hasTotp` 显示“已保存密码 / 已保存 2FA”或“未存密码 / 未存 2FA”）。库里若有旧版加密字段（`passwordEnc` / `totpEnc`），反序列化时自然当作未保存密码（`None`）。
 - **已有账号重登**：经该账号在 CPR 绑定的出站代理（`host.http.account`）跑完 OpenAI OAuth PKCE 登录状态机（含 Sentinel PoW、TOTP 验证、Workspace 选择）并换取新令牌，经 `host.auth.save`（`Replace`）写回 CPR。
-- **导入账号（复用借道账号代理）**：
-  1. 粘贴文本后自动防抖预览（统计总行数、待新建、已在 CPR、跳过），点“导入 N 个”逐条执行。
-  2. 先经 CPR 管理接口 `GET /api/admin/accounts` 读取所选借道账号（carrier）绑定的 `outboundProxyId`；若借道账号未绑定出站代理则直接拒绝导入（不创建直连账号）。
-  3. 调 CPR 管理接口 `POST /api/admin/accounts/oauth/start`（不带 `accountId`，带 `outboundProxyId`，`name` 为邮箱），获取 CPR 生成的授权链接与 `flowId`。
-  4. 借道账号经 `host.http.account` 跑完登录步骤，截下回调地址 `callbackUrl` 后交给 `POST /api/admin/accounts/oauth/complete`，由 CPR 自己通过该代理换码并一步建好已绑定代理的新账号（套餐由 CPR 自己从令牌解析，不调 `host.auth.save Create`）。
+- **导入账号（选代理导入）**：
+  1. 粘贴文本后自动防抖预览（统计总行数、待新建、已在 CPR、跳过），选新账号用哪个 CPR 代理，点“导入 N 个”逐条执行。
+  2. 代理列表经 CPR 管理接口 `GET /api/admin/proxies` 和 `GET /api/admin/accounts` 读出，标出每个代理有几个启用账号在用；页面只拿到代理的 ID、名称和是否启用，不拿地址和认证。
+  3. 插件 SDK 不能按代理 ID 发请求（已提 [zyycn/codex-proxy-rs#642](https://github.com/zyycn/codex-proxy-rs/issues/642)），所以导入时在后台挑一个绑着所选代理的启用账号“借道”：经它的 `host.http.account` 发登录请求，宿主只用它的代理和 TLS，不带它的凭据。所选代理没有账号在用时拒绝自动导入（`no_carrier`），可以改用浏览器手动登录；不建直连账号。
+  4. 调 CPR 管理接口 `POST /api/admin/accounts/oauth/start`（不带 `accountId`，带所选代理的 `outboundProxyId`，`name` 为邮箱），跑完登录步骤截下回调地址，交给 `POST /api/admin/accounts/oauth/complete`，由 CPR 自己经该代理换码并建好已绑定代理的新账号（不调 `host.auth.save Create`）。
   5. 建号完成后核对新账号邮箱，将明文密码与 2FA 保存到新账号 ID 下，并用 `host.state.delete`（带 `expectedVersion`）删掉 `email:<邮箱>:<kind>` 暂存记录。
+- **CPR 管理接口**：经 `host.http.dispatch` 调宿主自己的路由（只传 `/api/admin/...` 相对路径），宿主给子请求注入插件身份，不需要管理 API Key，也不出本机网络。v0.1.3 及以前的 `cprAdminUrl`、`cprAdminApiKey` 设置已不再使用，清单里仍声明它们是为了旧安装能升级；可以清空，并删掉当时为插件生成的管理 Key。
+- **多个工作区**：账号有多个工作区或组织时，错误里带上候选（`details.choices`），详情页和导入行直接点选重试，不用手抄 ID。
+- **2FA**：当前 30 秒窗口只剩 4 秒以内时，等到下一个窗口再生成验证码，避免经代理到达时已过期；“发起 2FA 验证失败”（`mfa_issue_failed`）和“验证码被拒”（`totp_rejected`）分开报。
 
 ## 模块分工
 
@@ -71,7 +74,7 @@
 - **登录**（用登录凭据换令牌并写回 CPR、导入新账号）：`backend/src/{admin.rs,login/}`、`frontend/src/login/`，单独维护。和面板的接口：
   - 后端：`login::routes()` 返回本模块的管理路由（路径都以 `api/login/` 开头，`management` 合进注册），`api/login/` 开头的请求交给 `login::handle`；`login::Login` 是进程内状态，用 `Config` 建一次。错误用 `api::ApiError`，路由用 `api::route`
   - 前端：`login/LoginPage.vue` 是顶部“导入账号”页，`login/AccountLogin.vue` 放在账号详情页（props `accountId`）。请求用 `api.ts` 的 `call`
-  - 设置项加在 `config::Config` 和 `plugin.json` 的 `configurationSchema`（普通设置 `cprAdminUrl`、`oauthRedirect`，敏感设置 `cprAdminApiKey` 进 `secretFields`）；私有状态的命名空间加在 `plugin.json` 的 `state`
+  - 设置项加在 `config::Config` 和 `plugin.json` 的 `configurationSchema`（现在只有 `oauthRedirect`）；私有状态的命名空间加在 `plugin.json` 的 `state`
   - 共用的：`chatgpt::supported` / `chatgpt::is_team`（个人号和 Team 按 CPR 给的套餐区分）、`host.rs` 的宿主回调封装
 
 ## 开发
@@ -91,8 +94,12 @@ cargo test --manifest-path backend/Cargo.toml
 
 ```bash
 cargo install --locked --git https://github.com/zyycn/codex-proxy-rs.git --rev 47d30474af7c3e1fab433f2d4a70430fae548ff2 codex-proxy-plugin-cli --root .tools
+python3 -m venv .tools/zig && .tools/zig/bin/pip install ziglang==0.15.2 cargo-zigbuild==0.23.4
+export PATH="$PWD/.tools/zig/bin:$PATH"   # cargo-zigbuild 经这个环境的 python 找到 Zig
 bash scripts/package            # 默认本机平台；也可传 aarch64-unknown-linux-gnu 等
 ```
+
+Linux 安装包用 `cargo zigbuild --target <平台>.2.28` 构建，二进制最高只依赖 `GLIBC_2.28`：CPR 官方镜像是 Debian 12（glibc 2.36），在新系统上直接 `cargo build` 会链接更高的 GLIBC 符号，插件进程在握手前就退出。没装 cargo-zigbuild 时脚本退回 `cargo build` 并警告；发版流程设了 `REQUIRE_GLIBC_FLOOR=1`，缺工具或符号超过 2.28 就失败。
 
 在 CPR 的“插件管理”点安装：上传 `dist/` 里的 `.tar.gz`，或来源选 GitHub。发布新版本：改 `plugin.json` 的 `version` 和 `release/notes.md`，推送 `v<版本>` 标签，GitHub Actions 检查通过后构建 Linux x86_64 / aarch64 两个安装包并发布。插件以 CPR 的系统身份运行（能读账号凭据），CPR 不提供沙箱。
 
