@@ -433,7 +433,7 @@ async fn import_with_chosen_proxy_borrows_a_bound_account_and_deletes_staged_ema
         ok(json!({"token": "t1", "proofofwork": {"required": false}})),
         ok(json!({"page": {"type": "password"}})),
         ok(json!({"token": "t2", "proofofwork": {"required": false}})),
-        redirect("http://localhost:1455/auth/callback?code=import_code_1&state=__OAUTH_STATE__"),
+        redirect("http://127.0.0.1:1455/auth/callback?code=import_code_1&state=__OAUTH_STATE__"),
     ]);
 
     let (code, imported) = peer
@@ -607,13 +607,37 @@ async fn browser_login_can_use_a_proxy_nobody_uses_yet() {
         )
         .await;
     assert_eq!(code, 200, "{body}");
+    // CPR 给的是桌面登录入口；回调地址要用它内层的 redirect_uri，而不是插件配置的 localhost
     assert!(
         body["authorizeUrl"]
             .as_str()
             .unwrap()
-            .starts_with("https://auth.openai.com/")
+            .starts_with("https://chatgpt.com/codex/desktop-auth?authorize_url=")
     );
+    assert_eq!(body["redirectUrl"], "http://127.0.0.1:1455/auth/callback");
     assert_eq!(host.cpr_oauth_starts[0]["outboundProxyId"], "proxy-new");
+    assert!(
+        host.seen_http.is_empty(),
+        "browser login sends nothing itself"
+    );
+
+    // 浏览器里登录完，把 127.0.0.1 的回调链接贴回来；state 取自内层链接
+    let state = host.last_oauth_state.clone();
+    let (code, done) = peer
+        .api(
+            "POST",
+            "api/login/oauth/complete",
+            "",
+            Some(json!({
+                "email": "fresh@example.com",
+                "kind": "personal",
+                "callbackUrl": format!("http://127.0.0.1:1455/auth/callback?code=browser_code&state={state}"),
+            })),
+            &mut host,
+        )
+        .await;
+    assert_eq!(code, 200, "{done}");
+    assert_eq!(host.cpr_oauth_completes.len(), 1);
     assert!(
         host.seen_http.is_empty(),
         "browser login sends nothing itself"

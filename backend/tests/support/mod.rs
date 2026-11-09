@@ -204,8 +204,13 @@ impl FakeHost {
                 let flow_id = format!("flow_{idx}");
                 let state = format!("cpr_oauth_state_{idx}");
                 self.last_oauth_state.clone_from(&state);
+                // 和 CPR 3.43 一样：外层是桌面登录入口，redirect_uri（127.0.0.1）和 state 在内层 authorize_url 里
+                let inner = format!(
+                    "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&code_challenge=ch_{idx}&code_challenge_method=S256&state={state}&scope=openid+profile+email+offline_access&codex_cli_simplified_flow=true"
+                );
                 let auth_url = format!(
-                    "https://auth.openai.com/oauth/authorize?client_id=app_EMoamEEZ73f0CkXaXp7hrann&code_challenge=ch_{idx}&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&response_type=code&scope=openid+profile+email+offline_access&state={state}"
+                    "https://chatgpt.com/codex/desktop-auth?authorize_url={}&codex_streamlined_login=true&no_universal_links=1",
+                    url_encode(&inner)
                 );
                 self.cpr_pending_flows
                     .insert(flow_id.clone(), (name, proxy_id, state));
@@ -716,4 +721,15 @@ impl Drop for Peer {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }

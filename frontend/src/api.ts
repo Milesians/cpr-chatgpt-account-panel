@@ -171,8 +171,14 @@ export interface Devices {
 export type SignOutTarget = { device: string } | { others: true } | { all: true }
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number, readonly code = '', readonly details?: unknown) {
+  readonly status: number
+  readonly code: string
+  readonly details?: unknown
+  constructor(message: string, status: number, code = '', details?: unknown) {
     super(message)
+    this.status = status
+    this.code = code
+    this.details = details
   }
 }
 
@@ -190,18 +196,51 @@ export async function call<T>(method: 'GET' | 'POST', path: string, query?: Reco
     ...(query ? { query: new URLSearchParams(query).toString() } : {}),
     ...(data === undefined ? {} : { contentType: 'application/json', body: JSON.stringify(data) }),
   })
+  const text = new TextDecoder().decode(reply.body)
   let value: any
   try {
-    value = JSON.parse(new TextDecoder().decode(reply.body))
+    value = JSON.parse(text)
   }
   catch {
+    if (reply.status < 200 || reply.status >= 300)
+      throw new ApiError(describeFailure(reply.status, '', snippet(text)), reply.status)
     throw new ApiError(`插件返回了无效响应（HTTP ${reply.status}）`, reply.status)
   }
-  if (reply.status < 200 || reply.status >= 300) {
-    const e = value?.error
-    throw new ApiError(typeof e?.message === 'string' ? e.message : `请求失败（HTTP ${reply.status}）`, reply.status, typeof e?.code === 'string' ? e.code : '', e?.details)
-  }
+  if (reply.status < 200 || reply.status >= 300)
+    throw errorFromBody(reply.status, value, text)
   return value as T
+}
+
+function snippet(text: string): string {
+  return text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)
+}
+
+/**
+ * 插件自己的错误是 `{error:{code,message,details}}`；CPR 宿主的错误信封是顶层
+ * `{code:50201,message}`，也见过 `{error:"…"}`。都认出来，别把真实原因吞成一句「HTTP 502」
+ */
+export function errorFromBody(status: number, value: any, text = ''): ApiError {
+  const e = value?.error
+  if (e && typeof e === 'object') {
+    const message = typeof e.message === 'string' ? e.message.trim() : ''
+    const code = typeof e.code === 'string' ? e.code : ''
+    return new ApiError(message || describeFailure(status, code, ''), status, code, e.details)
+  }
+  if (typeof e === 'string' && e.trim())
+    return new ApiError(e.trim(), status)
+  const message = typeof value?.message === 'string' ? value.message.trim() : ''
+  const hostCode = typeof value?.code === 'number' ? ` · ${value.code}` : ''
+  if (message)
+    return new ApiError(`CPR：${message}（HTTP ${status}${hostCode}）`, status)
+  return new ApiError(describeFailure(status, '', snippet(text)), status)
+}
+
+function describeFailure(status: number, code: string, body: string): string {
+  const hint = status === 502 || status === 503 || status === 504
+    ? 'CPR 没拿到插件的正常响应（插件调用超时、崩溃或被重启），请看 CPR 日志里这一时刻的插件记录'
+    : '请求失败'
+  const tail = [code, body].filter(Boolean).join('：')
+  return `${hint}（HTTP ${status}）${tail ? `：${tail}` : ''}`
 }
 
 export const api = {

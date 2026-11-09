@@ -31,9 +31,9 @@ use crate::config::Config;
 use crate::host;
 
 use self::oauth::{
-    Carrier, Choice, LoginError, LoginInput, Tokens, authorize_url, exchange_authorization_code,
-    login_and_exchange, login_with_authorize_url, new_pkce, normalize_redirect_url,
-    parse_callback_url,
+    Carrier, Choice, LoginError, LoginInput, Tokens, authorize_params, authorize_url,
+    exchange_authorization_code, login_and_exchange, login_with_authorize_url, new_pkce,
+    normalize_redirect_url, parse_callback_url,
 };
 use self::paste::{account_kind, is_valid_email, normalize_kind, parse_paste_lines};
 use self::sentinel::{Identity, ensure_identity, is_uuid_v4};
@@ -57,6 +57,8 @@ struct PendingOAuth {
     state: String,
     verifier: String,
     authorize_url: String,
+    /// 回调地址：插件自己生成的链接用配置值，CPR 生成的链接用它里面的 `redirect_uri`
+    redirect_url: String,
     email: String,
     kind: String,
     expires_at_ms: i64,
@@ -554,6 +556,7 @@ async fn handle_oauth_start(
                 state,
                 verifier,
                 authorize_url: auth_url.clone(),
+                redirect_url: login.redirect_url.clone(),
                 email,
                 kind,
                 expires_at_ms,
@@ -583,15 +586,12 @@ async fn handle_oauth_start(
         .await
         .map_err(|msg| ApiError::new(502, "admin_error", msg))?;
 
-    let state = api::parse_query(
-        start
-            .authorization_url
-            .split_once('?')
-            .map_or("", |(_, q)| q),
-    )
-    .get("state")
-    .cloned()
-    .unwrap_or_default();
+    // CPR 的链接是桌面登录入口，state 和 redirect_uri 在内层 authorize_url 里
+    let params = authorize_params(&start.authorization_url);
+    let state = params.state;
+    let redirect_url = params
+        .redirect_uri
+        .unwrap_or_else(|| login.redirect_url.clone());
     let expires_at_ms = now + OAUTH_SESSION_TTL_MS;
 
     login.set_pending_oauth(
@@ -601,6 +601,7 @@ async fn handle_oauth_start(
             state,
             verifier: String::new(),
             authorize_url: start.authorization_url.clone(),
+            redirect_url: redirect_url.clone(),
             email,
             kind,
             expires_at_ms,
@@ -610,7 +611,7 @@ async fn handle_oauth_start(
 
     Ok(json!({
         "authorizeUrl": start.authorization_url,
-        "redirectUrl": login.redirect_url,
+        "redirectUrl": redirect_url,
         "expiresAtMs": expires_at_ms,
     }))
 }
@@ -649,7 +650,7 @@ async fn handle_oauth_complete(
     };
 
     let (callback_url, code) =
-        parse_callback_url(&req.callback_url, &login.redirect_url, &pending.state)
+        parse_callback_url(&req.callback_url, &pending.redirect_url, &pending.state)
             .map_err(|e| login_error_to_api(&e))?;
 
     if is_existing {

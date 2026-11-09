@@ -197,6 +197,43 @@ pub fn normalize_redirect_url(raw: &str) -> String {
     }
 }
 
+/// 从授权链接里读出的回调地址和 `state`
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthorizeParams {
+    pub redirect_uri: Option<String>,
+    pub state: String,
+}
+
+/// 读授权链接的 `redirect_uri` 和 `state`
+///
+/// CPR 的 `oauth/start` 给的是桌面登录入口
+/// `https://chatgpt.com/codex/desktop-auth?authorize_url=<真正的 authorize 链接>`，
+/// 两个参数都在内层链接里；外层没有时就拆开 `authorize_url` 再找
+#[must_use]
+pub fn authorize_params(auth_url: &str) -> AuthorizeParams {
+    let mut url = auth_url.trim().to_owned();
+    // 最多拆两层，防止恶意嵌套
+    for _ in 0..3 {
+        let query = parse_query(url.split_once('?').map_or("", |(_, q)| q));
+        let redirect_uri = query
+            .get("redirect_uri")
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let state = query.get("state").map_or("", String::as_str).trim();
+        if redirect_uri.is_some() || !state.is_empty() {
+            return AuthorizeParams {
+                redirect_uri,
+                state: state.to_owned(),
+            };
+        }
+        match query.get("authorize_url").map(|s| s.trim()) {
+            Some(inner) if !inner.is_empty() => url = inner.to_owned(),
+            _ => break,
+        }
+    }
+    AuthorizeParams::default()
+}
+
 /// 使用外部提供的 OAuth `authorize` 地址（如 CPR `oauth/start` 返回的 `authorizationUrl`）
 /// 执行邮箱 + 密码 + 2FA 登录状态机，截下回调地址后返回（不换取令牌）
 ///
@@ -219,21 +256,11 @@ pub async fn login_with_authorize_url(
             "缺少登录密码",
         ));
     }
-    let query_str = auth_url.split_once('?').map_or("", |(_, q)| q);
-    let query = parse_query(query_str);
-    let state = query
-        .get("state")
-        .map_or("", String::as_str)
-        .trim()
-        .to_owned();
-    let redirect = query
-        .get("redirect_uri")
-        .map(String::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map_or_else(
-            || normalize_redirect_url(&input.redirect_url),
-            |s| s.trim().to_owned(),
-        );
+    let params = authorize_params(auth_url);
+    let state = params.state;
+    let redirect = params
+        .redirect_uri
+        .unwrap_or_else(|| normalize_redirect_url(&input.redirect_url));
     if !is_valid_callback_base(&redirect) {
         return Err(LoginError::new(
             "connect",
@@ -1658,5 +1685,30 @@ mod tests {
         );
         let parsed = decode_session_cookie(&encoded).unwrap();
         assert_eq!(string_field(&parsed, "workspace_id"), "ws_abc");
+    }
+
+    #[test]
+    fn authorize_params_unwraps_the_cpr_desktop_auth_link() {
+        let inner = "https://auth.openai.com/oauth/authorize?response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&state=s1";
+        let outer = format!(
+            "https://chatgpt.com/codex/desktop-auth?authorize_url={}&codex_streamlined_login=true",
+            inner
+                .replace('%', "%25")
+                .replace(':', "%3A")
+                .replace('/', "%2F")
+                .replace('?', "%3F")
+                .replace('&', "%26")
+                .replace('=', "%3D")
+        );
+        let want = AuthorizeParams {
+            redirect_uri: Some("http://127.0.0.1:1455/auth/callback".into()),
+            state: "s1".into(),
+        };
+        assert_eq!(authorize_params(&outer), want);
+        assert_eq!(authorize_params(inner), want);
+        assert_eq!(
+            authorize_params("https://chatgpt.com/x"),
+            AuthorizeParams::default()
+        );
     }
 }
