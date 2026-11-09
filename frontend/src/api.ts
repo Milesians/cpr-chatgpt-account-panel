@@ -16,6 +16,8 @@ export interface PluginHost {
     contentType?: string
     body?: string
   }) => Promise<ManagementReply>
+  /** CPR 新版才有：只收 https，必须由点击触发，宿主弹窗确认后在新标签打开（弹窗里也能复制） */
+  openExternal?: (url: string) => Promise<void>
 }
 
 export interface Problem {
@@ -180,6 +182,19 @@ export class ApiError extends Error {
     this.code = code
     this.details = details
   }
+}
+
+/** 宿主能不能替插件打开外部链接 */
+export function canOpenExternal(): boolean {
+  return typeof window.codexProxyPlugin?.openExternal === 'function'
+}
+
+/** 请宿主弹窗确认后打开外部链接；必须在点击回调里同步调用，宿主要校验用户激活 */
+export function openExternal(url: string): Promise<void> {
+  const open = window.codexProxyPlugin?.openExternal
+  if (typeof open !== 'function')
+    return Promise.reject(new Error('当前 CPR 版本不支持从插件打开链接'))
+  return open(url)
 }
 
 function host(): PluginHost {

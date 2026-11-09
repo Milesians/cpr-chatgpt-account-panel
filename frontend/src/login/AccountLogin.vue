@@ -2,8 +2,10 @@
 import type { ApiError } from '../api'
 import type { AccountLoginStatus, LoginChoice } from './helpers'
 import { ZButton, ZTag } from '@codex-proxy/ui'
-import { Check, Copy, KeyRound, Link2, Lock, Trash2 } from '@lucide/vue'
+import { Check, Copy, ExternalLink, KeyRound, Link2, Lock, Trash2 } from '@lucide/vue'
 import { computed, onMounted, ref, watch } from 'vue'
+import { canOpenExternal, openExternal } from '../api'
+import { copyText, selectField } from '../clipboard'
 import { credentialStateLabel, dateTime, formatPlanName } from '../format'
 import { loginApi } from './client'
 import { formatLoginError, loginChoices, needsManualOAuth, resolveLoginMainAction } from './helpers'
@@ -29,6 +31,9 @@ const showManualOAuth = ref(false)
 const authorizeUrl = ref('')
 const callbackUrl = ref('')
 const copiedUrl = ref(false)
+const copyFailed = ref(false)
+const authUrlInput = ref<HTMLInputElement | null>(null)
+const hostOpens = canOpenExternal()
 
 const errorMsg = ref('')
 const errorCode = ref('')
@@ -208,6 +213,7 @@ async function handleStartOAuth() {
   errorCode.value = ''
   successMsg.value = ''
   copiedUrl.value = false
+  copyFailed.value = false
   try {
     const r = await loginApi.oauthStart({ accountId: props.accountId })
     authorizeUrl.value = r.authorizeUrl
@@ -258,13 +264,18 @@ async function handleCompleteOAuth() {
 async function copyAuthorizeUrl() {
   if (!authorizeUrl.value)
     return
-  try {
-    await navigator.clipboard.writeText(authorizeUrl.value)
-    copiedUrl.value = true
-  }
-  catch {
-    copiedUrl.value = false
-  }
+  copiedUrl.value = await copyText(authorizeUrl.value)
+  copyFailed.value = !copiedUrl.value
+  if (copyFailed.value)
+    selectField(authUrlInput.value)
+}
+
+function openAuthorizeUrl() {
+  if (!authorizeUrl.value)
+    return
+  openExternal(authorizeUrl.value).catch((e: Error) => {
+    errorMsg.value = e.message
+  })
 }
 
 function selectInput(e: Event) {
@@ -461,18 +472,26 @@ onMounted(loadStatus)
       </p>
       <div v-if="authorizeUrl" class="inline-copy-row">
         <input
+          ref="authUrlInput"
           readonly
           :value="authorizeUrl"
           class="cp-input font-mono text-xs"
           aria-label="OAuth 授权链接"
           @focus="selectInput"
         >
+        <ZButton v-if="hostOpens" type="primary" size="small" @click="openAuthorizeUrl">
+          <ExternalLink :size="13" aria-hidden="true" />
+          打开授权链接
+        </ZButton>
         <ZButton size="small" @click="copyAuthorizeUrl">
           <Check v-if="copiedUrl" :size="13" aria-hidden="true" />
           <Copy v-else :size="13" aria-hidden="true" />
           {{ copiedUrl ? '已复制' : '复制授权链接' }}
         </ZButton>
       </div>
+      <p v-if="copyFailed" class="muted text-xs" role="status">
+        浏览器不允许插件页面写剪贴板，链接已选中，按 Ctrl+C（Mac 上 ⌘C）复制
+      </p>
       <div class="inline-copy-row">
         <input
           v-model="callbackUrl"

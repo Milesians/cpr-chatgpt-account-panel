@@ -10,11 +10,14 @@ import { ZButton, ZTag } from '@codex-proxy/ui'
 import {
   Check,
   Copy,
+  ExternalLink,
   Link2,
   Play,
   Square,
 } from '@lucide/vue'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { canOpenExternal, openExternal } from '../api'
+import { copyText, selectField } from '../clipboard'
 import { loginApi } from './client'
 import {
   buildImportQueue,
@@ -63,6 +66,10 @@ const manualAuthUrl = ref('')
 const manualCallbackUrl = ref('')
 const manualBusy = ref(false)
 const manualCopied = ref(false)
+const manualCopyFailed = ref(false)
+const manualRedirectUrl = ref('')
+const manualUrlInput = ref<HTMLInputElement | null>(null)
+const hostOpens = canOpenExternal()
 const manualError = ref('')
 
 const selectedProxy = computed(() => proxies.value.find(p => p.id === proxyId.value))
@@ -267,10 +274,13 @@ async function toggleManualForImport(line: number, email: string, kind: string) 
   manualCallbackUrl.value = ''
   manualError.value = ''
   manualCopied.value = false
+  manualCopyFailed.value = false
+  manualRedirectUrl.value = ''
   manualBusy.value = true
   try {
     const r = await loginApi.oauthStart({ email, kind, proxyId: proxyId.value })
     manualAuthUrl.value = r.authorizeUrl
+    manualRedirectUrl.value = r.redirectUrl
   }
   catch (e) {
     manualError.value = (e as ApiError).message
@@ -314,13 +324,18 @@ async function submitManualCallback() {
 async function copyManualUrl() {
   if (!manualAuthUrl.value)
     return
-  try {
-    await navigator.clipboard.writeText(manualAuthUrl.value)
-    manualCopied.value = true
-  }
-  catch {
-    manualCopied.value = false
-  }
+  manualCopied.value = await copyText(manualAuthUrl.value)
+  manualCopyFailed.value = !manualCopied.value
+  if (manualCopyFailed.value)
+    selectField(manualUrlInput.value)
+}
+
+function openManualUrl() {
+  if (!manualAuthUrl.value)
+    return
+  openExternal(manualAuthUrl.value).catch((e: Error) => {
+    manualError.value = e.message
+  })
 }
 
 onMounted(loadProxies)
@@ -537,30 +552,39 @@ onMounted(loadProxies)
                 </ZButton>
               </div>
               <p class="muted note">
-                请复制下方授权链接在浏览器中打开并完成验证，然后将跳转后的 <code>http://localhost:1455/auth/callback?code=...&amp;state=...</code> 完整地址粘贴到下方提交。
+                在浏览器中打开下方授权链接并完成验证，然后将跳转后的 <code>{{ manualRedirectUrl || 'http://127.0.0.1:1455/auth/callback' }}?code=...&amp;state=...</code> 完整地址粘贴到下方提交（浏览器会显示“无法访问此网站”，这是正常的，复制地址栏即可）。
               </p>
               <p v-if="manualError" class="banner banner-error" role="alert">
                 {{ manualError }}
               </p>
               <div v-if="manualAuthUrl" class="inline-copy-row">
                 <input
+                  ref="manualUrlInput"
                   readonly
                   :value="manualAuthUrl"
                   class="cp-input font-mono text-xs"
                   aria-label="OAuth 授权链接"
+                  @focus="($event.target as HTMLInputElement).select()"
                 >
+                <ZButton v-if="hostOpens" type="primary" size="small" @click="openManualUrl">
+                  <ExternalLink :size="13" aria-hidden="true" />
+                  打开授权链接
+                </ZButton>
                 <ZButton size="small" @click="copyManualUrl">
                   <Check v-if="manualCopied" :size="13" aria-hidden="true" />
                   <Copy v-else :size="13" aria-hidden="true" />
                   {{ manualCopied ? '已复制' : '复制授权链接' }}
                 </ZButton>
               </div>
+              <p v-if="manualCopyFailed" class="muted text-xs" role="status">
+                浏览器不允许插件页面写剪贴板，链接已选中，按 Ctrl+C（Mac 上 ⌘C）复制
+              </p>
               <div class="inline-copy-row">
                 <input
                   v-model="manualCallbackUrl"
                   type="text"
                   class="cp-input font-mono text-xs"
-                  placeholder="粘贴 http://localhost:1455/auth/callback?code=...&state=..."
+                  :placeholder="`粘贴 ${manualRedirectUrl || 'http://127.0.0.1:1455/auth/callback'}?code=...&state=...`"
                   aria-label="OAuth 回调链接"
                 >
                 <ZButton

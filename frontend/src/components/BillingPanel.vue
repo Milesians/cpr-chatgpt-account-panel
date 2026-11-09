@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import type { LastPayment, Subscription, Transaction } from '../api'
 import { ZButton, ZEmpty, ZTag } from '@codex-proxy/ui'
-import { Check, Copy, CreditCard, RefreshCw } from '@lucide/vue'
+import { Check, Copy, CreditCard, ExternalLink, RefreshCw } from '@lucide/vue'
 import { computed, ref } from 'vue'
-import { api } from '../api'
+import { api, canOpenExternal, openExternal } from '../api'
+import { copyText } from '../clipboard'
 import {
   ago,
   billingStatusLabel,
@@ -27,6 +28,8 @@ const cursor = ref('')
 const billLoading = ref(false)
 const billError = ref('')
 const copied = ref('')
+const copyFailed = ref('')
+const hostOpens = canOpenExternal()
 let copyTimer: ReturnType<typeof setTimeout> | null = null
 
 const hasData = computed(() => subscription.value !== null || rows.value !== null)
@@ -75,21 +78,23 @@ async function loadAll() {
   ])
 }
 
-/** 插件页面在隔离 iframe 里，不能开新标签：给出链接让人复制 */
+/** 新版 CPR 能经宿主弹窗打开外链；老版本只能复制 */
+function openInvoice(url: string) {
+  openExternal(url).catch(() => {})
+}
+
 async function copy(url: string, id: string) {
-  try {
-    await navigator.clipboard.writeText(url)
-    copied.value = id
-    if (copyTimer)
-      clearTimeout(copyTimer)
-    copyTimer = setTimeout(() => {
-      if (copied.value === id)
-        copied.value = ''
-    }, 2000)
-  }
-  catch {
-    copied.value = ''
-  }
+  const ok = await copyText(url)
+  copied.value = ok ? id : ''
+  copyFailed.value = ok ? '' : url
+  if (!ok)
+    return
+  if (copyTimer)
+    clearTimeout(copyTimer)
+  copyTimer = setTimeout(() => {
+    if (copied.value === id)
+      copied.value = ''
+  }, 2000)
 }
 </script>
 
@@ -200,6 +205,15 @@ async function copy(url: string, id: string) {
 
           <div class="invoice-box">
             <ZButton
+              v-if="t.document_url && hostOpens"
+              size="small"
+              :title="t.document_url"
+              @click="openInvoice(t.document_url)"
+            >
+              <ExternalLink :size="13" aria-hidden="true" />
+              打开发票
+            </ZButton>
+            <ZButton
               v-if="t.document_url"
               size="small"
               :title="t.document_url"
@@ -214,8 +228,12 @@ async function copy(url: string, id: string) {
         </div>
       </div>
 
+      <p v-if="copyFailed" class="muted text-xs" role="status">
+        浏览器不允许插件页面写剪贴板，请手动复制：
+        <input readonly :value="copyFailed" class="cp-input font-mono text-xs" aria-label="发票链接" @focus="($event.target as HTMLInputElement).select()">
+      </p>
       <p class="muted note">
-        插件页面在沙箱中运行，不能直接打开新标签页：复制发票链接后，到浏览器里打开 Stripe 页面下载发票或收据。
+        {{ hostOpens ? '「打开发票」会先弹出 CPR 的确认框，确认后在新标签页打开 Stripe 页面下载发票或收据。' : '插件页面在沙箱中运行，不能直接打开新标签页：复制发票链接后，到浏览器里打开 Stripe 页面下载发票或收据。' }}
       </p>
 
       <div v-if="cursor">
