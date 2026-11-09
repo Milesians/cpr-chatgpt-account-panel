@@ -64,7 +64,7 @@
   3. 插件 SDK 不能按代理 ID 发请求（已提 [zyycn/codex-proxy-rs#642](https://github.com/zyycn/codex-proxy-rs/issues/642)），所以导入时在后台挑一个绑着所选代理的启用账号“借道”：经它的 `host.http.account` 发登录请求，宿主只用它的代理和 TLS，不带它的凭据。所选代理没有账号在用时拒绝自动导入（`no_carrier`），可以改用浏览器手动登录；不建直连账号。
   4. 调 CPR 管理接口 `POST /api/admin/accounts/oauth/start`（不带 `accountId`，带所选代理的 `outboundProxyId`，`name` 为邮箱），跑完登录步骤截下回调地址，交给 `POST /api/admin/accounts/oauth/complete`，由 CPR 自己经该代理换码并建好已绑定代理的新账号（不调 `host.auth.save Create`）。
   5. 建号完成后核对新账号邮箱，将明文密码与 2FA 保存到新账号 ID 下，并用 `host.state.delete`（带 `expectedVersion`）删掉 `email:<邮箱>:<kind>` 暂存记录。
-- **CPR 管理接口**：经 `host.http.dispatch` 调宿主自己的路由（只传 `/api/admin/...` 相对路径），宿主给子请求注入插件身份，不需要管理 API Key，也不出本机网络。v0.1.3 及以前的 `cprAdminUrl`、`cprAdminApiKey` 设置已不再使用，清单里仍声明它们是为了旧安装能升级；可以清空，并删掉当时为插件生成的管理 Key。
+- **CPR 管理接口**：经 `host.http.dispatch` 调宿主自己的路由（只传 `/api/admin/...` 相对路径），宿主给子请求注入插件身份，不需要管理 API Key，也不出本机网络。v0.1.5 起清单里不再有 v0.1.3 及以前的 `cprAdminUrl`、`cprAdminApiKey`，从旧版本升级时按发布说明删掉它们。
 - **多个工作区**：账号有多个工作区或组织时，错误里带上候选（`details.choices`），详情页和导入行直接点选重试，不用手抄 ID。
 - **2FA**：当前 30 秒窗口只剩 4 秒以内时，等到下一个窗口再生成验证码，避免经代理到达时已过期；“发起 2FA 验证失败”（`mfa_issue_failed`）和“验证码被拒”（`totp_rejected`）分开报。
 

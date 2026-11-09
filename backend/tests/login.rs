@@ -12,8 +12,6 @@ const NEW_REFRESH_TOKEN: &str = "new-secret-refresh-token-value";
 
 fn test_config() -> Value {
     json!({
-        "cprAdminUrl": "http://cpr.test",
-        "cprAdminApiKey": "test-admin-key",
         "oauthRedirect": "http://localhost:1455/auth/callback"
     })
 }

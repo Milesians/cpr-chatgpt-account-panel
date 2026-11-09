@@ -3,7 +3,7 @@
   "name": "cpr-chatgpt-account-panel",
   "displayName": "ChatGPT 账号面板",
   "publisher": "milesians",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "按账号查看 ChatGPT 官方用量、订阅与账单、登录设备，用密码和 2FA 快速登录与导入账号",
   "license": "MIT",
   "author": "Milesians",
@@ -20,19 +20,6 @@
   "configurationSchema": {
     "type": "object",
     "properties": {
-      "cprAdminUrl": {
-        "type": "string",
-        "title": "（已不再使用）CPR 地址",
-        "description": "v0.1.4 起插件经宿主内部调用管理接口，不再需要；可以清空",
-        "maxLength": 512,
-        "default": ""
-      },
-      "cprAdminApiKey": {
-        "type": "string",
-        "title": "（已不再使用）CPR 管理 API Key",
-        "description": "v0.1.4 起不再需要；可以清空，并在 CPR 设置里删掉为插件生成的那个 Key",
-        "maxLength": 512
-      },
       "oauthRedirect": {
         "type": "string",
         "description": "OAuth 回调地址（默认 http://localhost:1455/auth/callback）"
@@ -40,9 +27,6 @@
     },
     "additionalProperties": false
   },
-  "secretFields": [
-    "cprAdminApiKey"
-  ],
   "resources": {
     "web/index.html": "text/html",
     "web/app.js": "text/javascript",
