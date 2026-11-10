@@ -23,7 +23,7 @@ use gateway_plugin_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::admin::{self, Admin};
+use crate::admin::Admin;
 use crate::api::{self, ApiError};
 use crate::chatgpt::supported;
 use crate::clock::now_ms;
@@ -31,7 +31,7 @@ use crate::config::Config;
 use crate::host;
 
 use self::oauth::{
-    Carrier, Choice, LoginError, LoginInput, Tokens, authorize_params, authorize_url,
+    Choice, Egress, LoginError, LoginInput, Tokens, authorize_params, authorize_url,
     exchange_authorization_code, login_and_exchange, login_with_authorize_url, new_pkce,
     normalize_redirect_url, parse_callback_url,
 };
@@ -431,10 +431,7 @@ async fn handle_run_login(
     let (identity, _, _) = ensure_identity(&rec.identity);
     rec.identity = identity.clone();
 
-    let carrier = Carrier {
-        account_id: acct.account_id.clone(),
-        credential_revision: acct.credential_revision,
-    };
+    let egress = relogin_egress(host, &acct).await;
     let input = LoginInput {
         email: email.clone(),
         password,
@@ -446,7 +443,7 @@ async fn handle_run_login(
         redirect_url: login.redirect_url.clone(),
     };
 
-    match login_and_exchange(host, &carrier, &input).await {
+    match login_and_exchange(host, &egress, &input).await {
         Err(err) => {
             let now = now_ms();
             rec.last_error = Some(StoredLoginError {
@@ -579,8 +576,8 @@ async fn handle_oauth_start(
         .map_err(|code| ApiError::new(400, code, "账号类型无效"))?
         .to_owned();
     let admin = Admin::new(host);
-    // 浏览器手动登录不经插件发请求，只要代理可用，不需要借道账号
-    let (proxy_id, _) = import_proxy(host, &admin, &req.proxy_id, false).await?;
+    // 浏览器手动登录不经插件发请求，换码由 CPR 自己经这个代理完成
+    let proxy_id = import_proxy(host, &req.proxy_id).await?;
     let start = admin
         .oauth_start(&email, &proxy_id)
         .await
@@ -673,10 +670,7 @@ async fn handle_oauth_complete(
         let mut rec = load_record(host, account_id).await?.0;
         let (identity, profile, _) = ensure_identity(&rec.identity);
         rec.identity = identity;
-        let carrier = Carrier {
-            account_id: acct.account_id.clone(),
-            credential_revision: acct.credential_revision,
-        };
+        let egress = relogin_egress(host, &acct).await;
         let expected_email = if !pending.email.is_empty() {
             pending.email.as_str()
         } else {
@@ -684,7 +678,7 @@ async fn handle_oauth_complete(
         };
         let tokens = exchange_authorization_code(
             host,
-            &carrier,
+            &egress,
             &login.redirect_url,
             &code,
             &pending.verifier,
@@ -889,11 +883,11 @@ async fn handle_import(
         String::new()
     };
 
-    // 1. 选的代理要在 CPR 里启用，并找一个绑着它的启用账号借道发登录请求；不建直连账号
+    // 1. 选的代理要在 CPR 里启用；登录请求经 host.http.proxy 直接从它出去，不借任何账号，也不建直连账号
     let admin = Admin::new(host);
-    let (outbound_proxy_id, carrier) = import_proxy(host, &admin, &req.proxy_id, true).await?;
-    let Some(carrier) = carrier else {
-        return Err(ApiError::invalid("没有找到借道账号"));
+    let outbound_proxy_id = import_proxy(host, &req.proxy_id).await?;
+    let egress = Egress::Proxy {
+        proxy_id: outbound_proxy_id.clone(),
     };
 
     // 2. 经 CPR 管理 API 调 POST /api/admin/accounts/oauth/start（不带 accountId，带 outboundProxyId，name 写邮箱）
@@ -914,8 +908,8 @@ async fn handle_import(
         redirect_url: login.redirect_url.clone(),
     };
 
-    // 3. 经借道账号的 host.http.account 跑完登录步骤，截下回调地址交给 POST /api/admin/accounts/oauth/complete
-    let out = match login_with_authorize_url(host, &carrier, &input, &oauth_start.authorization_url)
+    // 3. 经所选代理跑完登录步骤，截下回调地址交给 POST /api/admin/accounts/oauth/complete
+    let out = match login_with_authorize_url(host, &egress, &input, &oauth_start.authorization_url)
         .await
     {
         Ok(out) => out,
@@ -1017,60 +1011,18 @@ async fn verify_imported_account(
     Ok(acct)
 }
 
-/// 代理池里的代理，以及每个代理能不能借道（有绑着它的启用 OAuth 账号）
-struct ProxyChoices {
-    proxies: Vec<admin::Proxy>,
-    /// 代理 ID → 绑着它、能借道的账号（按 CPR 账号列表的顺序）
-    carriers: HashMap<String, Vec<Carrier>>,
-}
-
-async fn proxy_choices(host: &HostClient, admin: &Admin<'_>) -> Result<ProxyChoices, ApiError> {
-    let admin_error = |msg: String| ApiError::new(502, "admin_error", msg);
-    let proxies = admin.proxies().await.map_err(admin_error)?;
-    let bindings = admin.accounts().await.map_err(admin_error)?;
-    let runtime: HashMap<String, AuthRuntimeAccount> = host::openai_accounts(host)
+/// `GET api/login/proxies`：导入时可选的代理（`host.proxies.list`，不含地址和认证）
+async fn handle_proxies(host: &HostClient) -> Result<Value, ApiError> {
+    let list: Vec<Value> = host::proxies(host)
         .await?
         .into_iter()
-        .filter(|a| supported(a) && a.enabled)
-        .map(|a| (a.account_id.clone(), a))
-        .collect();
-    let mut carriers: HashMap<String, Vec<Carrier>> = HashMap::new();
-    for b in &bindings {
-        if let (Some(proxy), Some(acct)) = (b.proxy_id(), runtime.get(&b.id)) {
-            carriers.entry(proxy.to_owned()).or_default().push(Carrier {
-                account_id: acct.account_id.clone(),
-                credential_revision: acct.credential_revision,
-            });
-        }
-    }
-    Ok(ProxyChoices { proxies, carriers })
-}
-
-/// `GET api/login/proxies`：导入时可选的代理（不含地址和认证）
-async fn handle_proxies(host: &HostClient) -> Result<Value, ApiError> {
-    let choices = proxy_choices(host, &Admin::new(host)).await?;
-    let list: Vec<Value> = choices
-        .proxies
-        .iter()
-        .map(|p| {
-            json!({
-                "id": p.id,
-                "name": p.name,
-                "enabled": p.enabled,
-                "carriers": choices.carriers.get(&p.id).map_or(0, Vec::len),
-            })
-        })
+        .map(|p| json!({ "id": p.id, "name": p.name, "enabled": p.enabled }))
         .collect();
     Ok(json!({ "proxies": list }))
 }
 
-/// 核对导入选的代理；`need_carrier` 时再挑一个绑着它的启用账号借道发登录请求
-async fn import_proxy(
-    host: &HostClient,
-    admin: &Admin<'_>,
-    proxy_id: &str,
-    need_carrier: bool,
-) -> Result<(String, Option<Carrier>), ApiError> {
+/// 核对导入选的代理：要在 CPR 里存在且启用（发请求时宿主还会再核对一次）
+async fn import_proxy(host: &HostClient, proxy_id: &str) -> Result<String, ApiError> {
     let proxy_id = proxy_id.trim();
     if proxy_id.is_empty() {
         return Err(ApiError::new(
@@ -1079,8 +1031,8 @@ async fn import_proxy(
             "先选一个出站代理，新账号会绑在它上面",
         ));
     }
-    let mut choices = proxy_choices(host, admin).await?;
-    let Some(proxy) = choices.proxies.iter().find(|p| p.id == proxy_id) else {
+    let proxies = host::proxies(host).await?;
+    let Some(proxy) = proxies.iter().find(|p| p.id == proxy_id) else {
         return Err(ApiError::new(
             409,
             "proxy_unavailable",
@@ -1094,21 +1046,39 @@ async fn import_proxy(
             "这个代理在 CPR 里已停用，请换一个",
         ));
     }
-    if !need_carrier {
-        return Ok((proxy_id.to_owned(), None));
+    Ok(proxy_id.to_owned())
+}
+
+/// 已有账号重登的出口
+///
+/// 绑着启用的已保存代理时按代理 ID 发（`host.http.proxy`），CPR 中途刷新令牌不会打断登录；
+/// 否则经账号自己的 `host.http.account`，和 CPR 用这个账号时的出口一样（没绑或代理停用时直连，
+/// 内联代理地址照用）。读不到绑定时也退回后者，出口不变，只是又受凭据版本约束
+async fn relogin_egress(host: &HostClient, acct: &AuthRuntimeAccount) -> Egress {
+    let by_account = || Egress::Account {
+        account_id: acct.account_id.clone(),
+        credential_revision: acct.credential_revision,
+    };
+    let proxy_id = match Admin::new(host).account_proxy_id(&acct.account_id).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return by_account(),
+        Err(reason) => {
+            host::log(
+                host,
+                "relogin_binding_unread",
+                LogLevel::Warn,
+                json!({ "account_id": acct.account_id, "reason": reason }),
+            )
+            .await;
+            return by_account();
+        }
+    };
+    match host::proxies(host).await {
+        Ok(list) if list.iter().any(|p| p.id == proxy_id && p.enabled) => {
+            Egress::Proxy { proxy_id }
+        }
+        _ => by_account(),
     }
-    let carrier = choices
-        .carriers
-        .remove(proxy_id)
-        .and_then(|list| list.into_iter().next());
-    if carrier.is_none() {
-        return Err(ApiError::new(
-            409,
-            "no_carrier",
-            "这个代理还没有启用的账号在用，插件没法经它发登录请求。可以用浏览器手动登录，或先在 CPR 给一个账号绑上它",
-        ));
-    }
-    Ok((proxy_id.to_owned(), carrier))
 }
 
 async fn save_replaced_credential(
@@ -1312,6 +1282,7 @@ fn login_error_to_api(err: &LoginError) -> ApiError {
         | "unsupported_mfa"
         | "identity_mismatch"
         | "account_unavailable"
+        | "proxy_unavailable"
         | "credential_changed" => 409,
         "rate_limited" => 429,
         "network_timeout" => 504,

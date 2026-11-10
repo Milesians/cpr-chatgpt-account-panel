@@ -1,4 +1,4 @@
-//! 宿主回调的编码：账号、凭据、私有状态、额度观测、客户端身份和日志
+//! 宿主回调的编码：账号、凭据、代理目录、私有状态、额度观测、客户端身份和日志
 
 use gateway_plugin_sdk::{
     ErrorCode, PluginFault,
@@ -6,9 +6,9 @@ use gateway_plugin_sdk::{
         data::{QuotaFacts, QuotaFactsQuery},
         host::{
             AuthCredential, AuthGetRequest, AuthListRequest, AuthListResult, AuthRuntimeAccount,
-            AuthSaveRequest, AuthSaveResult, LogLevel, LogRequest, StateDeleteRequest,
-            StateDeleteResult, StateGetRequest, StateGetResult, StatePutRequest, StatePutResult,
-            StateRecord,
+            AuthSaveRequest, AuthSaveResult, LogLevel, LogRequest, ProxyListRequest,
+            ProxyListResult, ProxySummary, StateDeleteRequest, StateDeleteResult, StateGetRequest,
+            StateGetResult, StatePutRequest, StatePutResult, StateRecord,
         },
     },
     client::{HostClient, SessionError},
@@ -97,6 +97,34 @@ pub async fn account(
         },
     )
     .await
+}
+
+/// CPR 代理目录里的全部代理（`host.proxies.list`，含停用的；只有 ID、名称、是否启用）
+///
+/// # Errors
+/// 宿主回调失败或代理太多时返回错误
+pub async fn proxies(host: &HostClient) -> Result<Vec<ProxySummary>, PluginFault> {
+    const PAGE_SIZE: u16 = 200;
+    const MAX_PAGES: u32 = 50;
+    let mut out = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let result: ProxyListResult = host
+            .list_proxies(ProxyListRequest {
+                page,
+                page_size: PAGE_SIZE,
+                search: String::new(),
+            })
+            .await?;
+        let n = result.items.len();
+        out.extend(result.items);
+        if n < usize::from(PAGE_SIZE) || out.len() as u64 >= result.total {
+            return Ok(out);
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Capacity,
+        "CPR 里的代理太多，读不完",
+    ))
 }
 
 /// 一个账号当前的凭据。只在发请求前读，不保存

@@ -43,10 +43,13 @@ pub fn status(status: u16, body: Value) -> HttpReply {
     }
 }
 
-/// 一次 `host.http.account` 收到的请求
+/// 一次 `host.http.account` 或 `host.http.proxy` 收到的请求
 #[allow(dead_code)]
 pub struct SeenRequest {
+    /// `host.http.account` 的账号；`host.http.proxy` 时为空
     pub account_id: String,
+    /// `host.http.proxy` 的代理 ID；`host.http.account` 时为 `None`
+    pub proxy_id: Option<String>,
     pub revision: u64,
     pub method: String,
     pub url: String,
@@ -88,6 +91,8 @@ pub struct FakeHost {
     pub cpr_oauth_starts: Vec<Value>,
     pub cpr_oauth_completes: Vec<Value>,
     pub cpr_next_plan_type: Option<String>,
+    /// 下一次 `host.http.proxy` 之前把这个代理停用（模拟核对之后、发请求之前被管理员停用）
+    pub disable_proxy_before_http: Option<String>,
     cpr_pending_flows: HashMap<String, (String, String, String)>,
     streams: HashMap<String, Vec<u8>>,
     next_version: u64,
@@ -156,38 +161,26 @@ impl FakeHost {
         }
         let ok = |data: Value| (200, json!({"code": 200, "message": "ok", "data": data}));
         match (method.as_str(), path.as_str()) {
-            ("GET", "/api/admin/proxies") => {
-                let items: Vec<Value> = self
-                    .cpr_proxies
-                    .iter()
-                    .map(|(id, name, enabled)| {
-                        json!({
-                            "id": id, "name": name, "enabled": enabled,
-                            "endpoint": "http://10.0.0.1:8080", "hasAuthentication": true,
-                        })
-                    })
-                    .collect();
-                ok(json!({"items": items, "page": {"totalPages": 1}}))
-            }
-            ("GET", "/api/admin/accounts") => {
-                assert!(url.contains("provider=openai"));
-                let items: Vec<Value> = self
-                    .accounts
-                    .iter()
-                    .map(|a| {
-                        let id = a["account_id"].as_str().unwrap();
-                        let proxy = self.cpr_account_proxies.get(id).cloned().unwrap_or(None);
-                        json!({
-                            "id": id,
-                            "name": a["name"],
-                            "email": a["email"],
-                            "planType": a["plan_type"],
-                            "provider": "openai",
-                            "outboundProxyId": proxy,
-                        })
-                    })
-                    .collect();
-                ok(json!({"items": items, "page": {"totalPages": 1}}))
+            ("GET", "/api/admin/accounts/detail") => {
+                let (_, q) = url.split_once('?').expect("detail needs accountId");
+                let id = cpr_chatgpt_account_panel::api::parse_query(q)
+                    .remove("accountId")
+                    .expect("detail needs accountId");
+                if !self.accounts.iter().any(|a| a["account_id"] == id.as_str()) {
+                    return (
+                        404,
+                        json!({"code": 404, "message": "账号不存在", "data": null}),
+                    );
+                }
+                let proxy = self.cpr_account_proxies.get(&id).cloned().unwrap_or(None);
+                ok(json!({
+                    "account": {
+                        "id": id, "provider": "openai",
+                        "outboundProxyId": proxy,
+                        "outboundProxyEndpoint": proxy.as_ref().map(|_| "http://10.0.0.1:8080"),
+                    },
+                    "credentialConfiguration": null,
+                }))
             }
             ("POST", "/api/admin/accounts/oauth/start") => {
                 let body: Value = serde_json::from_slice(payload).unwrap();
@@ -276,6 +269,61 @@ impl FakeHost {
             .find(|a| a["account_id"] == id.as_str())
             .cloned()
             .ok_or_else(|| PluginFault::new(ErrorCode::Rejected, "not found"))
+    }
+
+    fn serve_http(
+        &mut self,
+        params: &Value,
+        payload: &[u8],
+        account_id: String,
+        revision: u64,
+        proxy_id: Option<String>,
+    ) -> Reply {
+        let mut reply = self
+            .http
+            .pop_front()
+            .expect("unscripted account HTTP request");
+        let url = params["request"]["url"].as_str().unwrap().to_owned();
+        if let Some((_, q)) = url.split_once('?') {
+            let parsed = cpr_chatgpt_account_panel::api::parse_query(q);
+            if let Some(st) = parsed.get("state") {
+                self.last_oauth_state.clone_from(st);
+            }
+        }
+        if !self.last_oauth_state.is_empty() {
+            for (_, v) in &mut reply.headers {
+                if let Ok(s) = std::str::from_utf8(v)
+                    && s.contains("__OAUTH_STATE__")
+                {
+                    *v = s
+                        .replace("__OAUTH_STATE__", &self.last_oauth_state)
+                        .into_bytes();
+                }
+            }
+            if let Ok(s) = std::str::from_utf8(&reply.body)
+                && s.contains("__OAUTH_STATE__")
+            {
+                reply.body = s
+                    .replace("__OAUTH_STATE__", &self.last_oauth_state)
+                    .into_bytes();
+            }
+        }
+        self.seen_http.push(SeenRequest {
+            account_id,
+            proxy_id,
+            revision,
+            method: params["request"]["method"].as_str().unwrap().to_owned(),
+            url,
+            headers: serde_json::from_value(params["request"]["headers"].clone()).unwrap(),
+            body_len: payload.len(),
+            body: payload.to_vec(),
+        });
+        let id = format!("stream-{}", self.seen_http.len());
+        self.streams.insert(id.clone(), reply.body);
+        Ok((
+            json!({"status": reply.status, "http_version": "HTTP/2.0", "headers": reply.headers, "stream": id, "trailers": []}),
+            Vec::new(),
+        ))
     }
 
     pub fn handle(&mut self, method: &str, params: &Value, payload: &[u8]) -> Reply {
@@ -467,51 +515,44 @@ impl FakeHost {
                 self.streams.remove(params["handle"].as_str().unwrap());
                 Ok((json!({}), Vec::new()))
             }
-            "host.http.account" => {
-                let mut reply = self
-                    .http
-                    .pop_front()
-                    .expect("unscripted account HTTP request");
-                let url = params["request"]["url"].as_str().unwrap().to_owned();
-                if let Some((_, q)) = url.split_once('?') {
-                    let parsed = cpr_chatgpt_account_panel::api::parse_query(q);
-                    if let Some(st) = parsed.get("state") {
-                        self.last_oauth_state.clone_from(st);
-                    }
-                }
-                if !self.last_oauth_state.is_empty() {
-                    for (_, v) in &mut reply.headers {
-                        if let Ok(s) = std::str::from_utf8(v)
-                            && s.contains("__OAUTH_STATE__")
-                        {
-                            *v = s
-                                .replace("__OAUTH_STATE__", &self.last_oauth_state)
-                                .into_bytes();
-                        }
-                    }
-                    if let Ok(s) = std::str::from_utf8(&reply.body)
-                        && s.contains("__OAUTH_STATE__")
-                    {
-                        reply.body = s
-                            .replace("__OAUTH_STATE__", &self.last_oauth_state)
-                            .into_bytes();
-                    }
-                }
-                self.seen_http.push(SeenRequest {
-                    account_id: params["account_id"].as_str().unwrap().to_owned(),
-                    revision: params["credential_revision"].as_u64().unwrap(),
-                    method: params["request"]["method"].as_str().unwrap().to_owned(),
-                    url,
-                    headers: serde_json::from_value(params["request"]["headers"].clone()).unwrap(),
-                    body_len: payload.len(),
-                    body: payload.to_vec(),
+            "host.proxies.list" => {
+                assert_eq!(params, &json!({}));
+                let req: Value = serde_json::from_slice(payload).unwrap();
+                assert!(req["page"].as_u64().unwrap() >= 1);
+                let size = req["page_size"].as_u64().unwrap();
+                assert!((1..=200).contains(&size));
+                let items: Vec<Value> = self
+                    .cpr_proxies
+                    .iter()
+                    .map(|(id, name, enabled)| json!({"id": id, "name": name, "enabled": enabled}))
+                    .collect();
+                let body = json!({
+                    "items": items, "total": self.cpr_proxies.len(),
+                    "page": req["page"], "page_size": size,
                 });
-                let id = format!("stream-{}", self.seen_http.len());
-                self.streams.insert(id.clone(), reply.body);
-                Ok((
-                    json!({"status": reply.status, "http_version": "HTTP/2.0", "headers": reply.headers, "stream": id, "trailers": []}),
-                    Vec::new(),
-                ))
+                Ok((json!({}), serde_json::to_vec(&body).unwrap()))
+            }
+            "host.http.proxy" => {
+                let proxy_id = params["proxy_id"].as_str().unwrap().to_owned();
+                if let Some(id) = self.disable_proxy_before_http.take()
+                    && let Some(p) = self.cpr_proxies.iter_mut().find(|p| p.0 == id)
+                {
+                    p.2 = false;
+                }
+                // 和宿主一样：不存在是 Rejected，停用是 InvalidInput，都不发出请求
+                match self.cpr_proxies.iter().find(|(id, _, _)| *id == proxy_id) {
+                    None => return Err(PluginFault::new(ErrorCode::Rejected, "代理不存在")),
+                    Some((_, _, false)) => {
+                        return Err(PluginFault::new(ErrorCode::InvalidInput, "代理已禁用"));
+                    }
+                    Some(_) => {}
+                }
+                self.serve_http(params, payload, String::new(), 0, Some(proxy_id))
+            }
+            "host.http.account" => {
+                let account_id = params["account_id"].as_str().unwrap().to_owned();
+                let revision = params["credential_revision"].as_u64().unwrap();
+                self.serve_http(params, payload, account_id, revision, None)
             }
             "host.http.stream_read" => {
                 let id = params["stream"].as_str().unwrap();

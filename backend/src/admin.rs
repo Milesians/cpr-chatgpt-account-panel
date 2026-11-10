@@ -1,4 +1,4 @@
-//! CPR 管理接口：读代理和账号绑定，调 `oauth/start` 和 `oauth/complete` 导入新账号
+//! CPR 管理接口：读账号绑定的代理，调 `oauth/start` 和 `oauth/complete` 导入新账号
 //!
 //! 插件 SDK 的 `host.auth.save` 不能给新建账号绑定出站代理，新账号要经 CPR 管理接口的
 //! `oauth/start`（带 `outboundProxyId`）+ `oauth/complete` 让 CPR 自己用那个代理换码建号。
@@ -13,49 +13,34 @@ use gateway_plugin_sdk::{
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-const PAGE_SIZE: u32 = 200;
-const MAX_PAGES: u32 = 100;
+use crate::chatgpt::encode;
+
 const MAX_BODY: usize = 8 * 1024 * 1024;
 const TIMEOUT_MS: u64 = 20_000;
 
-const ACCOUNTS: &str = "/api/admin/accounts";
-const PROXIES: &str = "/api/admin/proxies";
+const ACCOUNT_DETAIL: &str = "/api/admin/accounts/detail";
 const OAUTH_START: &str = "/api/admin/accounts/oauth/start";
 const OAUTH_COMPLETE: &str = "/api/admin/accounts/oauth/complete";
 
-/// CPR 里的一个账号及其绑定的出站代理
+/// 账号绑定的已保存代理（`outboundProxyId`）；代理停用时仍保留 ID，没绑或用的是内联代理地址时为空
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AccountProxy {
-    pub id: String,
+struct AccountBinding {
     #[serde(default)]
-    pub email: Option<String>,
-    #[serde(default)]
-    pub plan_type: Option<String>,
-    #[serde(default)]
-    pub outbound_proxy_id: Option<String>,
+    outbound_proxy_id: Option<String>,
 }
 
-impl AccountProxy {
-    /// 绑定的代理 ID；没绑时是 `None`
-    #[must_use]
-    pub fn proxy_id(&self) -> Option<&str> {
+impl AccountBinding {
+    fn proxy_id(self) -> Option<String> {
         self.outbound_proxy_id
-            .as_deref()
-            .map(str::trim)
+            .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
     }
 }
 
-/// CPR 代理池里的一条代理（不含地址和认证）
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Proxy {
-    pub id: String,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub enabled: bool,
+#[derive(Deserialize)]
+struct AccountDetail {
+    account: AccountBinding,
 }
 
 /// `POST /api/admin/accounts/oauth/start` 的响应数据
@@ -71,21 +56,6 @@ pub struct OAuthStartData {
 #[serde(rename_all = "camelCase")]
 pub struct OAuthCompleteData {
     pub account_id: String,
-}
-
-#[derive(Deserialize)]
-struct Page<T> {
-    #[serde(default = "Vec::new")]
-    items: Vec<T>,
-    #[serde(default)]
-    page: PageMeta,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct PageMeta {
-    #[serde(default)]
-    total_pages: u32,
 }
 
 #[derive(Deserialize)]
@@ -186,34 +156,14 @@ impl<'a> Admin<'a> {
             .map_err(|_| "CPR 管理接口的响应格式和预期不同，可能是 CPR 版本不兼容".to_owned())
     }
 
-    async fn pages<T: DeserializeOwned>(&self, path: &str, filter: &str) -> Result<Vec<T>, String> {
-        let mut out = Vec::new();
-        for page in 1..=MAX_PAGES {
-            let query = format!("{filter}page={page}&pageSize={PAGE_SIZE}");
-            let p: Page<T> = self.call("GET", path, &query, None).await?;
-            let n = p.items.len();
-            out.extend(p.items);
-            if n < PAGE_SIZE as usize || page >= p.page.total_pages {
-                return Ok(out);
-            }
-        }
-        Err("CPR 里的记录太多，读不完".into())
-    }
-
-    /// 全部 OpenAI 账号及其绑定的出站代理
+    /// 账号绑定的已保存代理 ID（`GET /api/admin/accounts/detail`，只读本地记录）
     ///
     /// # Errors
     /// 管理接口失败时返回原因
-    pub async fn accounts(&self) -> Result<Vec<AccountProxy>, String> {
-        self.pages(ACCOUNTS, "provider=openai&").await
-    }
-
-    /// 代理池里的全部代理
-    ///
-    /// # Errors
-    /// 管理接口失败时返回原因
-    pub async fn proxies(&self) -> Result<Vec<Proxy>, String> {
-        self.pages(PROXIES, "").await
+    pub async fn account_proxy_id(&self, account_id: &str) -> Result<Option<String>, String> {
+        let query = format!("accountId={}", encode(account_id));
+        let detail: AccountDetail = self.call("GET", ACCOUNT_DETAIL, &query, None).await?;
+        Ok(detail.account.proxy_id())
     }
 
     /// 发起新建 OpenAI OAuth 账号流程（不带 `accountId`，带 `outboundProxyId`，`name` 为邮箱）
@@ -265,28 +215,24 @@ impl<'a> Admin<'a> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn proxy_id_ignores_blank() {
-        let a: AccountProxy =
-            serde_json::from_value(json!({"id": "a", "outboundProxyId": "  "})).unwrap();
-        assert_eq!(a.proxy_id(), None);
-        let b: AccountProxy =
-            serde_json::from_value(json!({"id": "b", "outboundProxyId": " p1 "})).unwrap();
-        assert_eq!(b.proxy_id(), Some("p1"));
-        let c: AccountProxy = serde_json::from_value(json!({"id": "c"})).unwrap();
-        assert_eq!(c.proxy_id(), None);
+    fn bound(v: Value) -> Option<String> {
+        serde_json::from_value::<AccountDetail>(v)
+            .unwrap()
+            .account
+            .proxy_id()
     }
 
     #[test]
-    fn proxy_view_reads_only_safe_fields() {
-        let p: Proxy = serde_json::from_value(json!({
-            "id": "px", "name": "东京", "enabled": true,
-            "endpoint": "http://1.2.3.4:8080", "hasAuthentication": true, "accountCount": 3,
-        }))
-        .unwrap();
+    fn detail_reads_bound_proxy_id() {
         assert_eq!(
-            (p.id.as_str(), p.name.as_str(), p.enabled),
-            ("px", "东京", true)
+            bound(json!({"account": {"id": "a", "outboundProxyId": " p1 "}})),
+            Some("p1".into())
+        );
+        assert_eq!(bound(json!({"account": {"outboundProxyId": "  "}})), None);
+        assert_eq!(bound(json!({"account": {"outboundProxyId": null}})), None);
+        assert_eq!(
+            bound(json!({"account": {"outboundProxyEndpoint": "http://1.2.3.4:8080"}})),
+            None
         );
     }
 }

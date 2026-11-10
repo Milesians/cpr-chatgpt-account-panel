@@ -1,13 +1,13 @@
 //! OpenAI OAuth PKCE 登录状态机、手动 OAuth 授权链接与令牌交换
 //!
-//! 严格经由 `host.http.account`（受管账号绑定代理）发送全部认证与 Sentinel 请求，
-//! 绝不调用 `host.http.do`。
+//! 全部认证与 Sentinel 请求经 [`Egress`] 选定的出口发出：`host.http.proxy`（按代理 ID）
+//! 或 `host.http.account`（账号在 CPR 里的实际出口），绝不调用 `host.http.do`。
 
 use std::collections::BTreeMap;
 
 use gateway_plugin_sdk::{
     ErrorCode, PluginFault,
-    call::host::{AccountHttpRequest, HttpRequest},
+    call::host::{AccountHttpRequest, HttpRequest, ProxyHttpRequest},
     client::HostClient,
 };
 use serde::{Deserialize, Serialize};
@@ -31,11 +31,17 @@ pub const DEFAULT_REDIRECT: &str = "http://localhost:1455/auth/callback";
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_STEPS: usize = 24;
 
-/// 承载出站请求的 CPR 启用账号（提供代理与连接上下文）
+/// 登录请求的出口
 #[derive(Debug, Clone)]
-pub struct Carrier {
-    pub account_id: String,
-    pub credential_revision: u64,
+pub enum Egress {
+    /// `host.http.proxy`：按代理 ID 现读配置，不依赖任何账号；代理不存在、停用或连不上都失败，不回退直连
+    Proxy { proxy_id: String },
+    /// `host.http.account`：账号在 CPR 里的实际出口（绑定的代理；没绑或代理停用时直连），
+    /// 要求账号启用、凭据版本没变
+    Account {
+        account_id: String,
+        credential_revision: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -241,7 +247,7 @@ pub fn authorize_params(auth_url: &str) -> AuthorizeParams {
 /// 任一步骤失败时返回结构化 [`LoginError`]
 pub async fn login_with_authorize_url(
     host: &HostClient,
-    carrier: &Carrier,
+    egress: &Egress,
     input: &LoginInput,
     auth_url: &str,
 ) -> Result<LoginCallbackOutput, LoginError> {
@@ -272,7 +278,7 @@ pub async fn login_with_authorize_url(
 
     let mut flow = Flow {
         host,
-        carrier,
+        egress,
         email: &email,
         password: &input.password,
         totp_secret: input.totp_secret.trim(),
@@ -302,7 +308,7 @@ pub async fn login_with_authorize_url(
 /// 任一步骤失败时返回结构化 [`LoginError`]，绝不包含明文密码、2FA 密钥或令牌
 pub async fn login_and_exchange(
     host: &HostClient,
-    carrier: &Carrier,
+    egress: &Egress,
     input: &LoginInput,
 ) -> Result<LoginOutput, LoginError> {
     let email = input.email.trim().to_ascii_lowercase();
@@ -330,7 +336,7 @@ pub async fn login_and_exchange(
 
     let mut flow = Flow {
         host,
-        carrier,
+        egress,
         email: &email,
         password: &input.password,
         totp_secret: input.totp_secret.trim(),
@@ -348,7 +354,7 @@ pub async fn login_and_exchange(
     let (callback_url, code) = flow.run_from_url(&auth_url).await?;
     let tokens = exchange_authorization_code(
         host,
-        carrier,
+        egress,
         &redirect,
         &code,
         &verifier,
@@ -371,7 +377,7 @@ pub async fn login_and_exchange(
 /// 网络、挑战、上游拒绝或令牌身份不匹配时返回 [`LoginError`]
 pub async fn exchange_authorization_code(
     host: &HostClient,
-    carrier: &Carrier,
+    egress: &Egress,
     redirect_url: &str,
     code: &str,
     verifier: &str,
@@ -395,9 +401,9 @@ pub async fn exchange_authorization_code(
     ];
     headers.extend(profile.headers());
 
-    let resp = raw_account_http(
+    let resp = raw_http(
         host,
-        carrier,
+        egress,
         "exchange",
         "POST",
         &format!("{DEFAULT_ORIGIN}/oauth/token"),
@@ -510,7 +516,7 @@ pub fn parse_callback_url(
 
 struct Flow<'a> {
     host: &'a HostClient,
-    carrier: &'a Carrier,
+    egress: &'a Egress,
     email: &'a str,
     password: &'a str,
     totp_secret: &'a str,
@@ -948,9 +954,9 @@ impl Flow<'_> {
             headers.push(("Cookie".into(), cookie_line.into_bytes()));
         }
 
-        let resp = raw_account_http(
+        let resp = raw_http(
             self.host,
-            self.carrier,
+            self.egress,
             self.stage,
             method,
             target,
@@ -1049,9 +1055,9 @@ impl Flow<'_> {
             ("oai-device-id".into(), self.device_id.as_bytes().to_vec()),
         ];
         headers.extend(self.profile.headers());
-        let resp = raw_account_http(
+        let resp = raw_http(
             self.host,
-            self.carrier,
+            self.egress,
             self.stage,
             "POST",
             DEFAULT_SENTINEL_URL,
@@ -1099,30 +1105,47 @@ struct RawHttpReply {
     body: Vec<u8>,
 }
 
-async fn raw_account_http(
+async fn raw_http(
     host: &HostClient,
-    carrier: &Carrier,
+    egress: &Egress,
     stage: &'static str,
     method: &str,
     url: &str,
     headers: Vec<(String, Vec<u8>)>,
     body: Vec<u8>,
 ) -> Result<RawHttpReply, LoginError> {
-    let response = host
-        .account_http(
-            AccountHttpRequest {
-                account_id: carrier.account_id.clone(),
-                credential_revision: carrier.credential_revision,
-                request: HttpRequest {
-                    method: method.to_owned(),
-                    url: url.to_owned(),
-                    headers,
+    let request = HttpRequest {
+        method: method.to_owned(),
+        url: url.to_owned(),
+        headers,
+    };
+    let response = match egress {
+        Egress::Proxy { proxy_id } => {
+            host.proxy_http(
+                ProxyHttpRequest {
+                    proxy_id: proxy_id.clone(),
+                    request,
                 },
-            },
-            body,
-        )
-        .await
-        .map_err(|e| map_host_fault(stage, &e))?;
+                body,
+            )
+            .await
+        }
+        Egress::Account {
+            account_id,
+            credential_revision,
+        } => {
+            host.account_http(
+                AccountHttpRequest {
+                    account_id: account_id.clone(),
+                    credential_revision: *credential_revision,
+                    request,
+                },
+                body,
+            )
+            .await
+        }
+    }
+    .map_err(|e| map_host_fault(egress, stage, &e))?;
     let status = response.status;
     let resp_headers = response.headers;
     let body_bytes = response
@@ -1133,7 +1156,7 @@ async fn raw_account_http(
             if e.code == ErrorCode::Capacity {
                 LoginError::new(stage, "invalid_response", "上游返回的响应体积超过限制")
             } else {
-                map_host_fault(stage, &e)
+                map_host_fault(egress, stage, &e)
             }
         })?;
     Ok(RawHttpReply {
@@ -1143,28 +1166,49 @@ async fn raw_account_http(
     })
 }
 
-fn map_host_fault(stage: &'static str, fault: &PluginFault) -> LoginError {
-    match fault.code {
-        ErrorCode::Timeout => LoginError::new(stage, "network_timeout", "连接 OpenAI 认证服务超时"),
-        ErrorCode::Upstream => LoginError::new(
-            stage,
-            "source_proxy_unavailable",
-            "无法经账号绑定的代理连接 OpenAI（代理不可用，不会回退直连）",
-        ),
-        ErrorCode::PermissionDenied => LoginError::new(
-            stage,
-            "source_proxy_unavailable",
-            "代理承载账号在 CPR 中已停用或不可用",
-        ),
-        ErrorCode::Conflict => LoginError::new(
-            stage,
-            "credential_changed",
-            "承载账号的凭据版本刚发生变更，请重试",
-        ),
-        ErrorCode::Rejected => {
-            LoginError::new(stage, "account_unavailable", "CPR 中找不到承载账号")
-        }
-        _ => LoginError::new(stage, "network", "宿主网络请求未完成，请稍后重试"),
+fn map_host_fault(egress: &Egress, stage: &'static str, fault: &PluginFault) -> LoginError {
+    if fault.code == ErrorCode::Timeout {
+        return LoginError::new(stage, "network_timeout", "连接 OpenAI 认证服务超时");
+    }
+    match egress {
+        // 宿主按 ID 解析代理：停用或 ID 不合法是 InvalidInput，不存在是 Rejected，连不上是 Upstream
+        Egress::Proxy { .. } => match fault.code {
+            ErrorCode::InvalidInput => LoginError::new(
+                stage,
+                "proxy_unavailable",
+                "这个代理在 CPR 里已停用，请换一个",
+            ),
+            ErrorCode::Rejected => LoginError::new(
+                stage,
+                "proxy_unavailable",
+                "CPR 里没有这个代理，可能刚被删除，请刷新后重选",
+            ),
+            ErrorCode::Upstream => LoginError::new(
+                stage,
+                "source_proxy_unavailable",
+                "经所选代理连不上 OpenAI（不会回退直连），请先在 CPR 测试这个代理",
+            ),
+            _ => LoginError::new(stage, "network", "宿主网络请求未完成，请稍后重试"),
+        },
+        Egress::Account { .. } => match fault.code {
+            ErrorCode::Upstream => LoginError::new(
+                stage,
+                "source_proxy_unavailable",
+                "无法经账号绑定的代理连接 OpenAI（代理不可用，不会回退直连）",
+            ),
+            ErrorCode::PermissionDenied => {
+                LoginError::new(stage, "account_unavailable", "账号在 CPR 里已停用或不可用")
+            }
+            ErrorCode::Conflict => LoginError::new(
+                stage,
+                "credential_changed",
+                "账号凭据刚被 CPR 更新过，请重试",
+            ),
+            ErrorCode::Rejected => {
+                LoginError::new(stage, "account_unavailable", "CPR 里找不到这个账号")
+            }
+            _ => LoginError::new(stage, "network", "宿主网络请求未完成，请稍后重试"),
+        },
     }
 }
 

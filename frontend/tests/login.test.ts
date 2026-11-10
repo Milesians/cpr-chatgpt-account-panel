@@ -13,8 +13,8 @@ import {
 
 test('maps login error codes and detects manual OAuth fallback conditions', () => {
   assert.equal(errorCodeLabel('browser_challenge'), '需浏览器验证（Cloudflare）')
-  assert.equal(errorCodeLabel('source_proxy_unavailable'), '账号绑定代理不可用')
-  assert.equal(errorCodeLabel('no_carrier'), '代理还没有账号在用')
+  assert.equal(errorCodeLabel('source_proxy_unavailable'), '经代理连不上 OpenAI')
+  assert.equal(errorCodeLabel('proxy_unavailable'), '代理不可用')
   assert.equal(errorCodeLabel('mfa_issue_failed'), '发起 2FA 验证失败')
   assert.equal(errorCodeLabel('email_missing'), '缺少邮箱')
   assert.equal(errorCodeLabel('password_missing'), '缺少密码')
@@ -42,7 +42,7 @@ test('maps login error codes and detects manual OAuth fallback conditions', () =
   assert.equal(needsManualOAuth('browser_challenge'), true)
   assert.equal(needsManualOAuth('email_otp_required'), true)
   assert.equal(needsManualOAuth('password_rejected'), false)
-  assert.equal(needsManualOAuth('no_carrier'), true)
+  assert.equal(needsManualOAuth('proxy_unavailable'), false)
 })
 
 test('button labels and disabled reasons follow state changes', () => {

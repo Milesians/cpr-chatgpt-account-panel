@@ -332,7 +332,7 @@ onMounted(loadStatus)
     </div>
 
     <p v-if="blockedByDisabled" class="banner banner-warn">
-      账号在 CPR 里已停用，停用的账号不能经它的绑定代理发起登录请求。
+      账号在 CPR 里已停用，启用后才能重新登录。
     </p>
     <p v-if="errorMsg" class="banner banner-error" role="alert">
       {{ formatLoginError(errorCode, errorMsg) }}

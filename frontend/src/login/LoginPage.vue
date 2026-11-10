@@ -38,7 +38,7 @@ interface ImportExecutionState {
   choices?: LoginChoice[]
 }
 
-// 新账号绑定的 CPR 代理；登录请求经一个绑着它的启用账号发出
+// 新账号绑定的 CPR 代理；登录请求经 host.http.proxy 直接从它发出
 const proxies = ref<ImportProxy[]>([])
 const proxyId = ref('')
 const loadingProxies = ref(false)
@@ -71,10 +71,6 @@ const manualRedirectUrl = ref('')
 const manualUrlInput = ref<HTMLInputElement | null>(null)
 const hostOpens = canOpenExternal()
 const manualError = ref('')
-
-const selectedProxy = computed(() => proxies.value.find(p => p.id === proxyId.value))
-/** 选的代理没有账号在用：只能浏览器手动登录 */
-const proxyBrowserOnly = computed(() => !!selectedProxy.value && selectedProxy.value.carriers === 0)
 
 const importQueue = computed(() => {
   if (!previewReport.value)
@@ -122,9 +118,7 @@ function proxyLabel(p: ImportProxy): string {
   const name = p.name || p.id
   if (!p.enabled)
     return `${name}（已停用）`
-  if (p.carriers === 0)
-    return `${name}（没有账号在用，只能浏览器手动登录）`
-  return `${name}（${p.carriers} 个账号在用）`
+  return name
 }
 
 async function loadProxies() {
@@ -134,7 +128,7 @@ async function loadProxies() {
     const r = await loginApi.proxies()
     proxies.value = r.proxies
     if (!proxies.value.some(p => p.id === proxyId.value && p.enabled)) {
-      const best = r.proxies.find(p => p.enabled && p.carriers > 0) ?? r.proxies.find(p => p.enabled)
+      const best = r.proxies.find(p => p.enabled)
       proxyId.value = best?.id ?? ''
     }
   }
@@ -406,10 +400,6 @@ onMounted(loadProxies)
           </ZButton>
         </div>
       </div>
-
-      <p v-if="proxyBrowserOnly" class="muted note">
-        这个代理还没有账号在用，插件没法经它自动登录。导入失败的行可以点“浏览器手动登录”，新账号照样绑在这个代理上；也可以先在 CPR 给一个账号绑上它。
-      </p>
 
       <p v-if="importError" class="banner banner-error" role="alert">
         {{ importError }}

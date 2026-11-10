@@ -31,7 +31,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "cpr-chatgpt-account-panel"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "futures",
  "gateway-plugin-sdk",
@@ -151,7 +151,7 @@ dependencies = [
 [[package]]
 name = "gateway-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/zyycn/codex-proxy-rs.git?rev=47d30474af7c3e1fab433f2d4a70430fae548ff2#47d30474af7c3e1fab433f2d4a70430fae548ff2"
+source = "git+https://github.com/zyycn/codex-proxy-rs.git?rev=c622f085748f812936a7371fcc85d1621fa72ca8#c622f085748f812936a7371fcc85d1621fa72ca8"
 dependencies = [
  "base64",
  "semver",

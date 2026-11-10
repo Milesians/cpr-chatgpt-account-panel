@@ -492,9 +492,9 @@ window.codexProxyPlugin = {
     }
     if (fn === 'api/login/paste') return __reply(__MOCK__.pastePreview);
     if (fn === 'api/login/proxies') return __reply({ proxies: [
-      { id: 'px-off', name: '旧代理', enabled: false, carriers: 1 },
-      { id: 'px-new', name: '新加坡 新线路', enabled: true, carriers: 0 },
-      { id: 'px-tokyo', name: '东京 住宅', enabled: true, carriers: 3 },
+      { id: 'px-off', name: '旧代理', enabled: false },
+      { id: 'px-new', name: '新加坡 新线路', enabled: true },
+      { id: 'px-tokyo', name: '东京 住宅', enabled: true },
     ] });
     if (fn === 'api/login/import') {
       (window.__IMPORTS__ ||= []).push(payload);

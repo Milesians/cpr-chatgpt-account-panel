@@ -35,12 +35,11 @@ export interface OAuthCompleteResponse {
   kind?: string
 }
 
-/** 导入时可选的 CPR 代理；carriers 是绑着它、能借道发登录请求的启用账号数 */
+/** 导入时可选的 CPR 代理（宿主 host.proxies.list，不含地址和认证） */
 export interface ImportProxy {
   id: string
   name: string
   enabled: boolean
-  carriers: number
 }
 
 export interface ImportAccountResponse {

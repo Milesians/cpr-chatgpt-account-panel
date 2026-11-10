@@ -1,6 +1,6 @@
 [package]
 name = "cpr-chatgpt-account-panel"
-version = "0.1.7"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 futures = { version = "0.3.31", default-features = false, features = ["std", "async-await"] }
-gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "47d30474af7c3e1fab433f2d4a70430fae548ff2", features = ["io"] }
+gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "c622f085748f812936a7371fcc85d1621fa72ca8", features = ["io"] }
 getrandom = "0.3.3"
 hex = "0.4.3"
 serde = { version = "1.0.228", features = ["derive"] }

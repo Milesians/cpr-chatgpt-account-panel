@@ -75,9 +75,8 @@ const ERROR_LABELS: Record<string, string> = {
   admin_error: 'CPR 管理接口调用失败',
   proxy_missing: '没选代理',
   proxy_unavailable: '代理不可用',
-  no_carrier: '代理还没有账号在用',
   mfa_issue_failed: '发起 2FA 验证失败',
-  source_proxy_unavailable: '账号绑定代理不可用',
+  source_proxy_unavailable: '经代理连不上 OpenAI',
   browser_challenge: '需浏览器验证（Cloudflare）',
   rate_limited: '请求过于频繁（429）',
   password_rejected: '密码被拒绝',
@@ -192,7 +191,6 @@ export function needsManualOAuth(code?: string | null): boolean {
     'email_otp_required',
     'unsupported_challenge',
     'unsupported_mfa',
-    'no_carrier',
   ].includes(code)
 }
 

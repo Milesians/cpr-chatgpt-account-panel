@@ -3,12 +3,12 @@
   "name": "cpr-chatgpt-account-panel",
   "displayName": "ChatGPT 账号面板",
   "publisher": "milesians",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "按账号查看 ChatGPT 官方用量、订阅与账单、登录设备，用密码和 2FA 快速登录与导入账号",
   "license": "MIT",
   "author": "Milesians",
   "engines": {
-    "codex-proxy-rs": ">=3.34.0, <4.0.0"
+    "codex-proxy-rs": ">=3.44.0, <4.0.0"
   },
   "main": "bin/plugin",
   "runtime": "trustedProcess",
