@@ -22,6 +22,7 @@ import {
   hasWork,
   paymentIssue,
   percent,
+  subscriptionStatusLabel,
   title,
 } from '../format'
 import AccountLogin from '../login/AccountLogin.vue'
@@ -79,6 +80,14 @@ const paymentSummary = computed(() => {
       sub: '点击「查询订阅与账单」获取记录',
     }
   }
+  if (!p.created_at_ms) {
+    const subKey = (p.subscription_status ?? p.status).trim().toLowerCase()
+    const subLabel = subscriptionStatusLabel[subKey] ?? p.status
+    return {
+      value: `订阅${subLabel}`,
+      sub: `无账单明细 · ${ago(p.checked_at_ms)}查`,
+    }
+  }
   const label = billingStatusLabel[p.status.toLowerCase()] ?? p.status
   return {
     value: label,
@@ -91,17 +100,18 @@ const graceSummary = computed(() => {
   if (graceMs) {
     const left = daysLeft(graceMs)
     return {
-      value: `剩 ${left} 天`,
+      value: left > 0 ? `剩 ${left} 天` : '宽限期已过',
       sub: `宽限期至 ${day(graceMs)}`,
       tone: 'bad' as const,
     }
   }
   if (hasPaymentAnomaly(props.account)) {
     const issue = paymentIssue(props.account.payment?.status)
+    const overdue = issue === 'failed' || props.account.payment?.subscription_status === 'past_due'
     return {
-      value: issue === 'failed' ? '扣款失败' : '待续费',
-      sub: issue === 'failed' ? '最近一笔账单扣款失败或逾期' : '账单处于待支付状态',
-      tone: (issue === 'failed' ? 'bad' : 'warn') as 'bad' | 'warn',
+      value: overdue ? '扣款失败' : '待续费',
+      sub: overdue ? '最近一笔账单扣款失败或订阅付款逾期' : '账单处于待支付状态',
+      tone: (overdue ? 'bad' : 'warn') as 'bad' | 'warn',
     }
   }
   return {
@@ -192,7 +202,7 @@ const tokenSummary = computed(() => {
         <div
           class="rate-tile-value"
           :class="{
-            'text-bad': paymentIssue(account.payment?.status) === 'failed',
+            'text-bad': paymentIssue(account.payment?.status) === 'failed' || (!account.payment?.created_at_ms && account.payment?.subscription_status === 'past_due'),
             'text-warn': paymentIssue(account.payment?.status) === 'due',
           }"
         >

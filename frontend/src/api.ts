@@ -56,12 +56,14 @@ export interface UsageSummary {
 }
 
 export interface LastPayment {
-  created_at_ms: number
-  amount: number
-  currency: string
+  created_at_ms?: number
+  amount?: number
+  currency?: string
   status: string
-  plan: string
+  plan?: string
   checked_at_ms: number
+  subscription_status?: Subscription['status']
+  delinquent_since_ms?: number
   grace_ends_at_ms?: number
 }
 
@@ -144,6 +146,8 @@ export interface History {
   next_cursor?: string
   checked_at_ms: number
   subscription?: Subscription
+  problem?: string
+  subscription_problem?: string
 }
 
 export interface Device {
@@ -261,7 +265,7 @@ function describeFailure(status: number, code: string, body: string): string {
 export const api = {
   accounts: () => call<{ accounts: Account[], checked_at_ms: number }>('GET', 'api/accounts'),
   usage: (id: string, days: number) => call<{ usage: CodexUsage, summary: UsageSummary }>('GET', 'api/usage', { id, days: String(days) }),
-  subscription: (id: string) => call<{ subscription: Subscription }>('GET', 'api/subscription', { id }),
+  subscription: (id: string) => call<{ subscription: Subscription, payment?: LastPayment }>('GET', 'api/subscription', { id }),
   devices: (id: string) => call<{ devices: Devices }>('GET', 'api/devices', { id }),
   signOut: (id: string, target: SignOutTarget) => call<{ signed_out: number, cpr_voided?: boolean }>('POST', 'api/devices/sign-out', undefined, { id, ...target }),
   billing: (id: string, cursor = '') => call<{ history: History, payment: LastPayment | null }>('GET', 'api/billing', cursor ? { id, cursor } : { id }),

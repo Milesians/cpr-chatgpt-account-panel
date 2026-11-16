@@ -7,6 +7,9 @@ import {
   daysLeft,
   formatPlanName,
   formatPlanWithKind,
+  graceText,
+  graceTooltip,
+  hasGracePeriod,
   hasHighWeeklyQuota,
   hasPaymentAnomaly,
   isTeamPlan,
@@ -16,13 +19,14 @@ import {
   money,
   needsCredentialRelogin,
   paymentIssue,
+  paymentTag,
   paymentText,
   rowAccentTone,
   shortDate,
   windowName,
 } from '../src/format.ts'
 
-test('payment issues and text', () => {
+test('payment issues, subscription-only records, and grace period text', () => {
   assert.equal(paymentIssue('Past_Due'), 'failed')
   assert.equal(paymentIssue('open'), 'due')
   assert.equal(paymentIssue('paid'), null)
@@ -38,6 +42,20 @@ test('payment issues and text', () => {
     currency: 'USD',
     plan: 'plus',
   }), /1 小时前查/)
+
+  const subOnly = {
+    status: 'past_due',
+    subscription_status: 'past_due' as const,
+    checked_at_ms: Date.now() - 120_000,
+    delinquent_since_ms: Date.UTC(2026, 10, 3),
+    grace_ends_at_ms: Date.UTC(2026, 10, 10),
+  }
+  assert.match(paymentText(subOnly), /^订阅付款逾期 · 2 分钟前查$/)
+  assert.equal(paymentTag(subOnly), 'danger')
+  assert.equal(hasGracePeriod(subOnly), true)
+  assert.match(graceText(Date.UTC(2026, 10, 10), Date.UTC(2026, 10, 6)), /宽限期至 2026\/11\/10 · 剩 4 天/)
+  assert.match(graceText(Date.UTC(2026, 10, 6), Date.UTC(2026, 10, 6, 1)), /宽限期至 2026\/11\/06 · 已到期/)
+  assert.match(graceTooltip(subOnly), /付款逾期宽限期截止 .*（逾期始于 2026\/11\/03）/)
 })
 
 test('plan formatting and kind labels', () => {
@@ -101,9 +119,10 @@ test('dates', () => {
   assert.equal(daysLeft(Date.now() - 1000), 0)
 })
 
-test('a nearly full week sorts first, then unchecked; work usage is not special', () => {
+test('grace period or nearly full week sorts first, then unchecked; work usage is not special', () => {
   const base = { checked_at_ms: 1, days: 7, surfaces: [], windows: [] as [number, number][], problems: [] }
-  const acct = (usage: any) => ({ usage }) as any
+  const acct = (usage: any, payment: any = null) => ({ usage, payment }) as any
+  assert.equal(attention(acct(base, { status: 'paid', checked_at_ms: 1, grace_ends_at_ms: 1_900_000_000_000 })), 0)
   assert.equal(attention(acct({ ...base, windows: [[10080, 95]] })), 0)
   assert.equal(attention(acct(null)), 1)
   assert.equal(attention(acct({ ...base, error: { code: 'x', message: 'y' } })), 1)
@@ -141,8 +160,21 @@ test('account filter classification and row accent tones', () => {
     payment: null,
   } as any
 
+  const paidButGraceAcct = {
+    id: 'a_grace',
+    usage: baseUsage,
+    payment: { status: 'paid', created_at_ms: 1, checked_at_ms: 1, subscription_status: 'past_due', grace_ends_at_ms: 1_900_000_000_000 },
+  } as any
+
   assert.equal(matchesAccountFilter(workAcct, 'payment'), false)
+  assert.equal(matchesAccountFilter(workAcct, 'grace'), false)
   assert.equal(rowAccentTone(workAcct), 'none')
+
+  assert.equal(hasGracePeriod(paidButGraceAcct), true)
+  assert.equal(hasPaymentAnomaly(paidButGraceAcct), true)
+  assert.equal(matchesAccountFilter(paidButGraceAcct, 'grace'), true)
+  assert.equal(matchesAccountFilter(paidButGraceAcct, 'payment'), true)
+  assert.equal(rowAccentTone(paidButGraceAcct), 'bad')
 
   assert.equal(hasPaymentAnomaly(failedAcct), true)
   assert.equal(matchesAccountFilter(failedAcct, 'payment'), true)

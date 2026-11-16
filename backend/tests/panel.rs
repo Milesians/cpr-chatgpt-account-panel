@@ -275,16 +275,45 @@ async fn first_billing_page_records_the_newest_payment_and_grace_period() {
 }
 
 #[tokio::test]
-async fn a_paid_bill_does_not_look_up_the_subscription() {
-    let mut host = FakeHost::new(&["acct_a"]);
-    host.http.push_back(ok(history("paid", "")));
+async fn first_billing_page_checks_subscription_even_when_bill_is_paid_or_forbidden() {
+    let mut host = FakeHost::new(&["acct_a", "acct_member"]);
+    host.http.extend([
+        ok(history("paid", "")),
+        ok(json!({"account_id": "chatgpt-acct_a", "plan_type": "plus", "is_active": true, "is_delinquent": true,
+            "active_until": "2026-11-01T00:00:00Z", "became_delinquent_timestamp": 1_899_900_000,
+            "grace_period_end_timestamp": 1_900_000_000})),
+        status(403, json!({"detail": "forbidden"})),
+        ok(json!({"account_id": "chatgpt-acct_member", "plan_type": "team", "is_active": true, "is_delinquent": true,
+            "grace_period_end_timestamp": 1_900_200_000})),
+    ]);
     let mut peer = Peer::start(json!({})).await;
+
     let (code, body) = peer
         .api("GET", "api/billing", "id=acct_a", None, &mut host)
         .await;
     assert_eq!(code, 200, "{body}");
-    assert_eq!(host.seen_http.len(), 1);
-    assert!(body["history"].get("subscription").is_none());
+    assert_eq!(host.seen_http.len(), 2);
+    assert_eq!(body["payment"]["status"], "paid");
+    assert_eq!(body["payment"]["subscription_status"], "past_due");
+    assert_eq!(body["payment"]["grace_ends_at_ms"], 1_900_000_000_000_i64);
+
+    let (code, member) = peer
+        .api("GET", "api/billing", "id=acct_member", None, &mut host)
+        .await;
+    assert_eq!(code, 200, "{member}");
+    assert!(member["history"]["problem"].is_string());
+    assert_eq!(member["payment"]["status"], "past_due");
+    assert_eq!(member["payment"]["grace_ends_at_ms"], 1_900_200_000_000_i64);
+
+    let (_, list) = peer.api("GET", "api/accounts", "", None, &mut host).await;
+    assert_eq!(
+        list["accounts"][0]["payment"]["grace_ends_at_ms"],
+        1_900_000_000_000_i64
+    );
+    assert_eq!(
+        list["accounts"][1]["payment"]["grace_ends_at_ms"],
+        1_900_200_000_000_i64
+    );
 }
 
 #[tokio::test]

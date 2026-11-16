@@ -28,15 +28,19 @@ import { api } from '../api'
 import {
   ago,
   attention,
-  billingTag,
   compact,
   formatPlanWithKind,
+  graceText,
+  graceTooltip,
+  hasGracePeriod,
   hasHighWeeklyQuota,
   hasPaymentAnomaly,
   isUnchecked,
   isUnqueryable,
   matchesAccountFilter,
   needsCredentialRelogin,
+  paymentIssue,
+  paymentTag,
   paymentText,
   rowAccentTone,
   shareOf,
@@ -71,9 +75,10 @@ const kinds = [
 ]
 
 const filter = ref<AccountFilterKey>('all')
-const sortBy = ref<'attention' | 'tokens' | 'weekly_quota' | 'name'>('attention')
+const sortBy = ref<'attention' | 'grace' | 'tokens' | 'weekly_quota' | 'name'>('attention')
 const sortOptions = [
   { label: '按关注度排序', value: 'attention' },
+  { label: '按宽限期到期排序', value: 'grace' },
   { label: '按 Token 用量排序', value: 'tokens' },
   { label: '按周额度排序', value: 'weekly_quota' },
   { label: '按账号名称排序', value: 'name' },
@@ -101,6 +106,7 @@ const filterChips = computed<Array<{
   const list = props.accounts ?? []
   return [
     { key: 'all', label: '全部', count: list.length },
+    { key: 'grace', label: '宽限期', dot: 'bad', count: list.filter(a => hasGracePeriod(a)).length },
     { key: 'payment', label: '扣款异常', dot: 'bad', count: list.filter(a => hasPaymentAnomaly(a)).length },
     { key: 'quota90', label: '周额度 >90%', dot: 'warn', count: list.filter(a => hasHighWeeklyQuota(a)).length },
     { key: 'unchecked', label: '未查询', dot: 'neutral', count: list.filter(a => isUnchecked(a)).length },
@@ -115,7 +121,16 @@ const rows = computed(() => {
     .filter(a => matchesAccountFilter(a, filter.value))
     .filter(a => !q || `${a.email ?? ''} ${a.name} ${a.plan_type ?? ''} ${a.id}`.toLowerCase().includes(q))
     .sort((a, b) => {
-      if (sortBy.value === 'tokens') {
+      if (sortBy.value === 'grace') {
+        const ga = a.payment?.grace_ends_at_ms ?? Infinity
+        const gb = b.payment?.grace_ends_at_ms ?? Infinity
+        if (ga !== gb)
+          return ga - gb
+        const anomalyDiff = Number(hasPaymentAnomaly(b)) - Number(hasPaymentAnomaly(a))
+        if (anomalyDiff !== 0)
+          return anomalyDiff
+      }
+      else if (sortBy.value === 'tokens') {
         const diff = tokenSum(b) - tokenSum(a)
         if (diff !== 0)
           return diff
@@ -128,7 +143,14 @@ const rows = computed(() => {
       else if (sortBy.value === 'name') {
         return title(a).localeCompare(title(b))
       }
-      return attention(a) - attention(b) || title(a).localeCompare(title(b))
+      const attDiff = attention(a) - attention(b)
+      if (attDiff !== 0)
+        return attDiff
+      const ga = a.payment?.grace_ends_at_ms ?? Infinity
+      const gb = b.payment?.grace_ends_at_ms ?? Infinity
+      if (ga !== gb)
+        return ga - gb
+      return title(a).localeCompare(title(b))
     })
 })
 
@@ -150,7 +172,7 @@ function allQueryBtnTitle(what: 'usage' | 'billing'): string {
     return '当前所有账号均无法查询（已停用或凭据不可用）'
   return what === 'usage'
     ? '查每个可查账号最近 7 天的官方用量，同时查 6 个'
-    : '查每个可查账号的第一页账单、记下最近一笔，同时查 6 个'
+    : '查每个可查账号的第一页账单与订阅宽限期，同时查 6 个'
 }
 
 function selectedQueryBtnTitle(what: 'usage' | 'billing'): string | undefined {
@@ -158,7 +180,7 @@ function selectedQueryBtnTitle(what: 'usage' | 'billing'): string | undefined {
     return '正在执行批量任务，请稍候'
   if (!selectedQueryableCount.value)
     return '所选账号当前均无法查询（已停用或凭据不可用）'
-  return what === 'usage' ? '查询所选可查账号最近 7 天的官方用量' : '查询所选可查账号的第一页账单'
+  return what === 'usage' ? '查询所选可查账号最近 7 天的官方用量' : '查询所选可查账号的第一页账单与订阅宽限期'
 }
 
 function selectedReloginBtnTitle(): string | undefined {
@@ -490,7 +512,7 @@ onBeforeUnmount(() => { stop = true })
           <span>账号与状态</span>
           <span>CPR 额度</span>
           <span>官方用量（每日 Token · 使用位置）</span>
-          <span>最近支付</span>
+          <span>最近支付 / 宽限期</span>
           <span class="text-right">操作</span>
         </div>
 
@@ -594,16 +616,29 @@ onBeforeUnmount(() => { stop = true })
             <span v-else class="muted text-xs">用量未查询</span>
           </div>
 
-          <!-- 4. 最近支付 -->
-          <div class="row-col-payment">
-            <ZTag
-              v-if="a.payment"
-              size="small"
-              :type="billingTag(a.payment.status)"
-              :title="a.payment.grace_ends_at_ms ? '付款逾期，宽限期内' : undefined"
-            >
-              {{ paymentText(a.payment) }}
-            </ZTag>
+          <!-- 4. 最近支付 / 宽限期 -->
+          <div class="payment-cell row-col-payment">
+            <template v-if="a.payment">
+              <ZTag
+                size="small"
+                :type="paymentTag(a.payment)"
+              >
+                {{ paymentText(a.payment) }}
+              </ZTag>
+              <span
+                v-if="hasGracePeriod(a.payment)"
+                class="verdict-pill bad"
+                :title="graceTooltip(a.payment)"
+              >
+                {{ graceText(a.payment.grace_ends_at_ms!) }}
+              </span>
+              <span
+                v-else-if="a.payment.subscription_status === 'past_due' && paymentIssue(a.payment.status) !== 'failed'"
+                class="verdict-pill bad"
+              >
+                订阅付款逾期
+              </span>
+            </template>
             <span v-else class="muted text-xs">账单未查询</span>
           </div>
 
@@ -638,7 +673,7 @@ onBeforeUnmount(() => { stop = true })
 
       <p class="list-legend muted">
         <span class="legend-note">
-          行左竖条：红=扣款失败/查询报错，黄=待续费/周额度 &gt;90%/令牌过期。CPR 额度是 CPR 自己记下的观测值；官方用量和账单点了才查。悬停饼图看各使用位置的占比。
+          行左竖条：红=宽限期/扣款失败/查询报错，黄=待续费/周额度 &gt;90%/令牌过期。CPR 额度是 CPR 自己记下的观测值；官方用量和账单（含订阅宽限期）点了才查。悬停饼图看各使用位置的占比。
         </span>
       </p>
     </div>

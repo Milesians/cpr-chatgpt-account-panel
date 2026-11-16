@@ -14,6 +14,7 @@ import {
   formatPlanName,
   money,
   paymentIssue,
+  paymentText,
   subscriptionStatusLabel,
 } from '../format'
 
@@ -21,7 +22,6 @@ const props = defineProps<{ accountId: string, payment: LastPayment | null, bloc
 const emit = defineEmits<{ payment: [payment: LastPayment | null] }>()
 
 const subscription = ref<Subscription | null>(null)
-const subLoading = ref(false)
 const subError = ref('')
 const rows = ref<Transaction[] | null>(null)
 const cursor = ref('')
@@ -33,34 +33,31 @@ const hostOpens = canOpenExternal()
 let copyTimer: ReturnType<typeof setTimeout> | null = null
 
 const hasData = computed(() => subscription.value !== null || rows.value !== null)
-const loadingInitial = computed(() => (subLoading.value || billLoading.value) && !hasData.value)
-const loadingRefresh = computed(() => (subLoading.value || billLoading.value) && hasData.value)
-
-async function loadSubscription() {
-  subLoading.value = true
-  subError.value = ''
-  try {
-    subscription.value = (await api.subscription(props.accountId)).subscription
-  }
-  catch (e) {
-    subError.value = (e as Error).message
-  }
-  finally {
-    subLoading.value = false
-  }
-}
+const loadingInitial = computed(() => billLoading.value && !hasData.value)
+const loadingRefresh = computed(() => billLoading.value && hasData.value)
 
 async function loadBilling(more = false) {
   billLoading.value = true
   billError.value = ''
+  if (!more)
+    subError.value = ''
   try {
     const r = await api.billing(props.accountId, more ? cursor.value : '')
-    rows.value = more ? [...(rows.value ?? []), ...r.history.transactions] : r.history.transactions
     cursor.value = r.history.next_cursor ?? ''
     if (!more) {
       emit('payment', r.payment)
-      if (r.history.subscription && !subscription.value)
-        subscription.value = r.history.subscription
+      subscription.value = r.history.subscription ?? null
+      subError.value = r.history.subscription_problem ?? ''
+      if (r.history.problem) {
+        billError.value = r.history.problem
+        rows.value = null
+      }
+      else {
+        rows.value = r.history.transactions
+      }
+    }
+    else {
+      rows.value = [...(rows.value ?? []), ...r.history.transactions]
     }
   }
   catch (e) {
@@ -72,10 +69,7 @@ async function loadBilling(more = false) {
 }
 
 async function loadAll() {
-  await Promise.allSettled([
-    loadSubscription(),
-    loadBilling(false),
-  ])
+  await loadBilling(false)
 }
 
 /** 新版 CPR 能经宿主弹窗打开外链；老版本只能复制 */
@@ -106,7 +100,7 @@ async function copy(url: string, id: string) {
           订阅与账单
         </h3>
         <span v-if="payment" class="muted">
-          最近一笔 {{ billingStatusLabel[payment.status.toLowerCase()] ?? payment.status }} · {{ day(payment.created_at_ms) }} · {{ ago(payment.checked_at_ms) }}查
+          {{ payment.created_at_ms ? `最近一笔 ${billingStatusLabel[payment.status.toLowerCase()] ?? payment.status} · ${day(payment.created_at_ms)} · ${ago(payment.checked_at_ms)}查` : paymentText(payment) }}
         </span>
       </div>
       <div class="card-actions">
@@ -155,7 +149,7 @@ async function copy(url: string, id: string) {
       </div>
       <div v-if="subscription.grace_ends_at_ms" class="fact-box">
         <dt>宽限期</dt>
-        <dd class="text-bad">至 {{ day(subscription.grace_ends_at_ms) }}（剩 {{ daysLeft(subscription.grace_ends_at_ms) }} 天）</dd>
+        <dd class="text-bad">至 {{ day(subscription.grace_ends_at_ms) }}（{{ daysLeft(subscription.grace_ends_at_ms) > 0 ? `剩 ${daysLeft(subscription.grace_ends_at_ms)} 天` : '已到期' }}）</dd>
       </div>
       <div v-if="subscription.delinquent_since_ms" class="fact-box">
         <dt>逾期开始</dt>

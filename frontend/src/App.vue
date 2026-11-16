@@ -8,7 +8,7 @@ import { computed, nextTick, onMounted, ref, shallowRef, watch } from 'vue'
 import { api } from './api'
 import AccountDetail from './components/AccountDetail.vue'
 import AccountList from './components/AccountList.vue'
-import { dateTime, hasPaymentAnomaly } from './format'
+import { dateTime, hasGracePeriod, hasPaymentAnomaly } from './format'
 import { loginApi } from './login/client'
 import LoginPage from './login/LoginPage.vue'
 
@@ -25,6 +25,7 @@ const loading = ref(false)
 const error = ref('')
 
 const current = computed(() => accounts.value?.find(a => a.id === opened.value) ?? null)
+const withGracePeriod = computed(() => accounts.value?.filter(a => hasGracePeriod(a)).length ?? 0)
 const withPaymentAnomaly = computed(() => accounts.value?.filter(a => hasPaymentAnomaly(a)).length ?? 0)
 
 async function loadLoginOverview() {
@@ -128,6 +129,7 @@ onMounted(load)
             <p class="m-0 mt-1 text-cp-xs text-cp-text-tertiary">
               <template v-if="accounts">
                 共 {{ accounts.length }} 个 OpenAI OAuth 账号
+                <template v-if="withGracePeriod"> · {{ withGracePeriod }} 个宽限期</template>
                 <template v-if="withPaymentAnomaly"> · {{ withPaymentAnomaly }} 个扣款异常</template>
                 · 更新于 {{ dateTime(checkedAt) }}
               </template>

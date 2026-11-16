@@ -161,6 +161,44 @@ export const subscriptionStatusLabel: Record<string, string> = {
   active: '有效', past_due: '付款逾期', inactive: '未生效', expired: '已到期', free: '免费', unknown: '未知',
 }
 
+/** 是否查到了宽限期截止时间 */
+export function hasGracePeriod(target: Account | LastPayment | null | undefined): boolean {
+  if (!target)
+    return false
+  const p = 'payment' in target ? target.payment : target
+  return typeof p?.grace_ends_at_ms === 'number' && p.grace_ends_at_ms > 0
+}
+
+/** 列表上显示的宽限期文字 */
+export function graceText(graceEndsAtMs: number, now = Date.now()): string {
+  const left = daysLeft(graceEndsAtMs, now)
+  return left > 0
+    ? `宽限期至 ${day(graceEndsAtMs)} · 剩 ${left} 天`
+    : `宽限期至 ${day(graceEndsAtMs)} · 已到期`
+}
+
+/** 宽限期悬停说明（精确到分，含逾期起始日） */
+export function graceTooltip(p: LastPayment): string {
+  if (!p.grace_ends_at_ms)
+    return ''
+  const since = p.delinquent_since_ms ? `（逾期始于 ${day(p.delinquent_since_ms)}）` : ''
+  return `付款逾期宽限期截止 ${dateTime(p.grace_ends_at_ms)}${since}`
+}
+
+export function paymentTag(p: LastPayment): TagType {
+  if (!p.created_at_ms) {
+    const sub = (p.subscription_status ?? p.status).trim().toLowerCase()
+    if (sub === 'past_due' || hasGracePeriod(p))
+      return 'danger'
+    if (sub === 'active')
+      return 'success'
+    if (sub === 'expired' || sub === 'inactive')
+      return 'warning'
+    return 'default'
+  }
+  return billingTag(p.status)
+}
+
 /** 最小货币单位的金额 */
 export function money(amount: number | undefined, currency: string | undefined): string {
   if (amount === undefined || !currency)
@@ -176,6 +214,11 @@ export function money(amount: number | undefined, currency: string | undefined):
 }
 
 export function paymentText(p: LastPayment): string {
+  if (!p.created_at_ms) {
+    const subKey = (p.subscription_status ?? p.status).trim().toLowerCase()
+    const label = subscriptionStatusLabel[subKey] ?? billingStatusLabel[subKey] ?? p.status
+    return `订阅${label} · ${ago(p.checked_at_ms)}查`
+  }
   return `${billingStatusLabel[p.status.toLowerCase()] ?? p.status} · ${day(p.created_at_ms)} · ${ago(p.checked_at_ms)}查`
 }
 
@@ -199,10 +242,12 @@ export function shareOf(s: Share, total: number): string {
 }
 
 /**
- * 列表排序：周额度超过 90% 的最前，其次没查过或查失败的，最后按名字。
+ * 列表排序：宽限期或周额度超过 90% 的最前，其次没查过或查失败的，最后按名字。
  * 返回越小越靠前
  */
 export function attention(a: Account): number {
+  if (hasGracePeriod(a))
+    return 0
   const u = a.usage
   if (u?.windows.some(([m, p]) => m === 10080 && p >= 90))
     return 0
@@ -222,11 +267,22 @@ export function hasHighWeeklyQuota(a: Account): boolean {
   return fromUsage || fromQuota
 }
 
-/** 最近一笔账单是否异常（扣款失败或待续费） */
+/** 最近一笔账单或当前订阅是否异常（宽限期、付款逾期、扣款失败或待续费） */
 export function hasPaymentAnomaly(a: Account): boolean {
   if (!a.payment)
     return false
+  if (hasGracePeriod(a.payment) || a.payment.subscription_status === 'past_due')
+    return true
   return paymentIssue(a.payment.status) !== null
+}
+
+/** 是否属于需要红色警示的严重账单状态（宽限期内、订阅付款逾期或扣款失败） */
+export function isPaymentCritical(a: Account): boolean {
+  if (!a.payment)
+    return false
+  return hasGracePeriod(a.payment)
+    || a.payment.subscription_status === 'past_due'
+    || paymentIssue(a.payment.status) === 'failed'
 }
 
 /** 账号是否查不了（有 blocker 或官方用量查询报错） */
@@ -250,12 +306,14 @@ export function needsCredentialRelogin(a: Account): boolean {
     || a.blocker.code === 'no_credentials'
 }
 
-export type AccountFilterKey = 'all' | 'payment' | 'quota90' | 'unchecked' | 'blocked'
+export type AccountFilterKey = 'all' | 'grace' | 'payment' | 'quota90' | 'unchecked' | 'blocked'
 
 export function matchesAccountFilter(a: Account, filter: AccountFilterKey): boolean {
   switch (filter) {
     case 'all':
       return true
+    case 'grace':
+      return hasGracePeriod(a)
     case 'payment':
       return hasPaymentAnomaly(a)
     case 'quota90':
@@ -275,9 +333,9 @@ export function weeklyQuotaPercent(a: Account): number {
   return fromQuota ?? -1
 }
 
-/** 行左竖条优先级：红（扣款失败/逾期/查询报错）> 黄（待续费/周额度 >90%/令牌过期或凭据不可查） */
+/** 行左竖条优先级：红（宽限期/扣款失败/逾期/查询报错）> 黄（待续费/周额度 >90%/令牌过期或凭据不可查） */
 export function rowAccentTone(a: Account): 'bad' | 'warn' | 'none' {
-  if ((hasPaymentAnomaly(a) && paymentIssue(a.payment?.status) === 'failed') || Boolean(a.usage?.error))
+  if (isPaymentCritical(a) || Boolean(a.usage?.error))
     return 'bad'
   if (hasPaymentAnomaly(a) || hasHighWeeklyQuota(a) || Boolean(a.blocker))
     return 'warn'

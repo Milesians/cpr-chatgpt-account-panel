@@ -51,9 +51,15 @@ pub struct History {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub next_cursor: String,
     pub checked_at_ms: i64,
-    /// 第一页最新一笔是扣款失败类时，顺带查的订阅（看宽限期）
+    /// 第一页一并读取的订阅（看宽限期与逾期状态）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription: Option<Subscription>,
+    /// 账单接口不可读（如 Team 成员无发票权限）但订阅读到了时的说明
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+    /// 订阅接口未读到时的说明
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_problem: Option<String>,
 }
 
 /// 扣款没成功：套餐有风险
@@ -115,14 +121,20 @@ pub fn safe_invoice_url(raw: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"_-./?=&%~:+".contains(&c))
 }
 
-/// RFC 3339 或 Unix 秒；别的格式丢掉，不让整次查询失败
+/// RFC 3339 或 Unix 秒 / 毫秒；别的格式丢掉，不让整次查询失败
 fn moment(v: Option<&Value>) -> Option<i64> {
     match v? {
         Value::String(s) => parse_rfc3339(s),
         Value::Number(n) => {
-            let secs = n.as_f64()?;
+            let x = n.as_f64()?;
             #[allow(clippy::cast_possible_truncation)]
-            ((1e9..1e11).contains(&secs)).then_some((secs * 1000.0) as i64)
+            if (1e9..1e11).contains(&x) {
+                Some((x * 1000.0) as i64)
+            } else if (1e12..1e14).contains(&x) {
+                Some(x as i64)
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -156,9 +168,10 @@ pub fn parse_subscription(body: &[u8], workspace: &str, now: i64) -> Result<Subs
         Some(_) => return Err(bad("上游返回的订阅到期时间无法识别")),
     };
     let active = b("is_active");
+    let delinquent = b("is_delinquent");
     let status = if plan == "free" {
         "free"
-    } else if b("is_delinquent") == Some(true) {
+    } else if delinquent == Some(true) {
         "past_due"
     } else if active == Some(true) {
         "active"
@@ -175,13 +188,21 @@ pub fn parse_subscription(body: &[u8], workspace: &str, now: i64) -> Result<Subs
             None => "unknown",
         }
     };
+    let raw_grace = moment(v.get("grace_period_end_timestamp"))
+        .or_else(|| moment(v.get("grace_period_ends_at")));
+    // 已恢复有效且未逾期时，忽略早已过去的旧宽限期时间戳；仍在宽限期内或仍标记逾期时保留
+    let grace_ends_at_ms =
+        raw_grace.filter(|&g| status == "past_due" || delinquent != Some(false) || g > now);
+    let delinquent_since_ms = moment(v.get("became_delinquent_timestamp"))
+        .or_else(|| moment(v.get("delinquent_since")))
+        .filter(|_| status == "past_due" || grace_ends_at_ms.is_some());
     Ok(Subscription {
         plan_type: plan.to_owned(),
         status: status.to_owned(),
         expires_at_ms: expires,
         will_renew: b("will_renew"),
-        delinquent_since_ms: moment(v.get("became_delinquent_timestamp")),
-        grace_ends_at_ms: moment(v.get("grace_period_end_timestamp")),
+        delinquent_since_ms,
+        grace_ends_at_ms,
         checked_at_ms: now,
     })
 }
@@ -267,6 +288,8 @@ pub fn parse_history(body: &[u8], cursor: &str, now: i64) -> Result<History, Pro
         next_cursor: next,
         checked_at_ms: now,
         subscription: None,
+        problem: None,
+        subscription_problem: None,
     })
 }
 
@@ -291,17 +314,7 @@ pub async fn subscription(session: &Session<'_>) -> Result<Subscription, Problem
     Ok(sub)
 }
 
-/// 查一页账单；第一页最新一笔是扣款失败类时顺带查订阅，看宽限期
-///
-/// # Errors
-/// 游标无效、账号不能查、上游拒绝或回答无法识别时返回错误
-pub async fn history(session: &Session<'_>, cursor: &str) -> Result<History, Problem> {
-    if !valid_cursor(cursor) {
-        return Err(Problem::new(
-            "invalid_cursor",
-            "账单分页参数无效，请重新查询",
-        ));
-    }
+async fn history_page(session: &Session<'_>, cursor: &str) -> Result<History, Problem> {
     let mut path = format!(
         "/backend-api/payments/transaction-history?account_id={}&limit=20",
         encode(&session.workspace)
@@ -311,7 +324,7 @@ pub async fn history(session: &Session<'_>, cursor: &str) -> Result<History, Pro
         path.push_str(&encode(cursor));
     }
     let body = session.get(&path).await?;
-    let mut h = parse_history(&body, cursor, now_ms())?;
+    let h = parse_history(&body, cursor, now_ms())?;
     let raw = serde_json::to_string(&h.transactions).unwrap_or_default();
     if session.leaks(&raw) || session.leaks(&h.next_cursor) {
         return Err(Problem::new(
@@ -319,13 +332,55 @@ pub async fn history(session: &Session<'_>, cursor: &str) -> Result<History, Pro
             "ChatGPT 返回的账单字段无法识别",
         ));
     }
-    if cursor.is_empty()
-        && newest(&h.transactions).is_some_and(|t| issue(&t.status) == Some("failed"))
-    {
-        // 订阅读不到不影响账单本身
-        h.subscription = subscription(session).await.ok();
-    }
     Ok(h)
+}
+
+/// 查一页账单；第一页同时查订阅，确保无论账单行状态如何（含上月已付、待支付或 Team 成员无发票权限）都能读到宽限期
+///
+/// # Errors
+/// 游标无效、账号不能查、上游拒绝或账单与订阅均无法识别时返回错误
+pub async fn history(session: &Session<'_>, cursor: &str) -> Result<History, Problem> {
+    if !valid_cursor(cursor) {
+        return Err(Problem::new(
+            "invalid_cursor",
+            "账单分页参数无效，请重新查询",
+        ));
+    }
+    if !cursor.is_empty() {
+        return history_page(session, cursor).await;
+    }
+
+    let hist = match history_page(session, "").await {
+        Ok(h) => Ok(h),
+        Err(p) if p.stops_query() || p.code == "account_mismatch" => return Err(p),
+        Err(p) => Err(p),
+    };
+    let sub = match subscription(session).await {
+        Ok(s) => Ok(s),
+        Err(p) if p.code == "account_mismatch" => return Err(p),
+        Err(p) if p.stops_query() && hist.is_err() => return Err(p),
+        Err(p) => Err(p),
+    };
+
+    match (hist, sub) {
+        (Ok(mut h), Ok(s)) => {
+            h.subscription = Some(s);
+            Ok(h)
+        }
+        (Ok(mut h), Err(sub_err)) => {
+            h.subscription_problem = Some(sub_err.message);
+            Ok(h)
+        }
+        (Err(hist_err), Ok(s)) => Ok(History {
+            transactions: Vec::new(),
+            next_cursor: String::new(),
+            checked_at_ms: s.checked_at_ms,
+            subscription: Some(s),
+            problem: Some(hist_err.message),
+            subscription_problem: None,
+        }),
+        (Err(hist_err), Err(_)) => Err(hist_err),
+    }
 }
 
 /// 一页里最新的一笔
@@ -334,16 +389,23 @@ pub fn newest(rows: &[Transaction]) -> Option<&Transaction> {
     rows.iter().max_by_key(|t| t.created_at_ms)
 }
 
-/// 列表上记下的最近一笔支付（不含发票链接和凭据）
+/// 列表上记下的最近一笔支付与订阅宽限期（不含发票链接和凭据）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastPayment {
-    pub created_at_ms: i64,
-    pub amount: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub currency: String,
     pub status: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub plan: String,
     pub checked_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delinquent_since_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grace_ends_at_ms: Option<i64>,
 }
@@ -351,16 +413,61 @@ pub struct LastPayment {
 impl LastPayment {
     #[must_use]
     pub fn of(h: &History) -> Option<Self> {
-        let t = newest(&h.transactions)?;
-        Some(Self {
-            created_at_ms: t.created_at_ms,
-            amount: t.amount,
-            currency: t.currency.clone(),
-            status: t.status.clone(),
-            plan: t.plan.clone(),
-            checked_at_ms: h.checked_at_ms,
-            grace_ends_at_ms: h.subscription.as_ref().and_then(|s| s.grace_ends_at_ms),
-        })
+        let sub = h.subscription.as_ref();
+        if let Some(t) = newest(&h.transactions) {
+            return Some(Self {
+                created_at_ms: Some(t.created_at_ms),
+                amount: Some(t.amount),
+                currency: t.currency.clone(),
+                status: t.status.clone(),
+                plan: if t.plan.is_empty() {
+                    sub.map(|s| s.plan_type.clone()).unwrap_or_default()
+                } else {
+                    t.plan.clone()
+                },
+                checked_at_ms: h.checked_at_ms,
+                subscription_status: sub.map(|s| s.status.clone()),
+                delinquent_since_ms: sub.and_then(|s| s.delinquent_since_ms),
+                grace_ends_at_ms: sub.and_then(|s| s.grace_ends_at_ms),
+            });
+        }
+        let s = sub?;
+        Some(Self::from_subscription(s))
+    }
+
+    #[must_use]
+    pub fn from_subscription(s: &Subscription) -> Self {
+        Self {
+            created_at_ms: None,
+            amount: None,
+            currency: String::new(),
+            status: s.status.clone(),
+            plan: s.plan_type.clone(),
+            checked_at_ms: s.checked_at_ms,
+            subscription_status: Some(s.status.clone()),
+            delinquent_since_ms: s.delinquent_since_ms,
+            grace_ends_at_ms: s.grace_ends_at_ms,
+        }
+    }
+
+    #[must_use]
+    pub fn with_subscription(existing: Option<Self>, s: &Subscription) -> Self {
+        match existing {
+            Some(mut p) => {
+                if p.plan.is_empty() {
+                    p.plan.clone_from(&s.plan_type);
+                }
+                if p.created_at_ms.is_none() {
+                    p.status.clone_from(&s.status);
+                }
+                p.checked_at_ms = s.checked_at_ms;
+                p.subscription_status = Some(s.status.clone());
+                p.delinquent_since_ms = s.delinquent_since_ms;
+                p.grace_ends_at_ms = s.grace_ends_at_ms;
+                p
+            }
+            None => Self::from_subscription(s),
+        }
     }
 }
 
@@ -396,6 +503,17 @@ mod tests {
         assert_eq!(
             p(r#"{"plan_type":"plus","grace_period_end_timestamp":"soon"}"#).grace_ends_at_ms,
             None
+        );
+        // 已恢复有效且未逾期时，早已过去的宽限期时间戳不再算宽限期；未来的仍保留
+        assert_eq!(
+            p(r#"{"plan_type":"plus","is_active":true,"is_delinquent":false,"grace_period_end_timestamp":1700000000}"#)
+                .grace_ends_at_ms,
+            None
+        );
+        assert_eq!(
+            p(r#"{"plan_type":"plus","is_active":true,"is_delinquent":false,"grace_period_end_timestamp":1900000000000}"#)
+                .grace_ends_at_ms,
+            Some(1_900_000_000_000)
         );
     }
 
@@ -470,5 +588,39 @@ mod tests {
         assert_eq!(issue("Past_Due"), Some("failed"));
         assert_eq!(issue("open"), Some("due"));
         assert_eq!(issue("paid"), None);
+    }
+
+    #[test]
+    fn last_payment_keeps_subscription_grace_even_without_transactions() {
+        let sub = parse_subscription(
+            br#"{"plan_type":"team","is_active":true,"is_delinquent":true,"became_delinquent_timestamp":1799000000,"grace_period_end_timestamp":1801000000}"#,
+            "ws",
+            NOW,
+        )
+        .unwrap();
+        let mut h = parse_history(br#"{"transactions":[],"next_cursor":""}"#, "", NOW).unwrap();
+        h.subscription = Some(sub.clone());
+        let last = LastPayment::of(&h).unwrap();
+        assert_eq!(last.created_at_ms, None);
+        assert_eq!(last.status, "past_due");
+        assert_eq!(last.subscription_status.as_deref(), Some("past_due"));
+        assert_eq!(last.grace_ends_at_ms, Some(1_801_000_000_000));
+
+        // 旧版状态记录反序列化兼容，且订阅恢复后清掉旧宽限期
+        let legacy: LastPayment = serde_json::from_str(
+            r#"{"created_at_ms":1790000000000,"amount":2000,"currency":"USD","status":"paid","plan":"plus","checked_at_ms":1790000000000,"grace_ends_at_ms":1791000000000}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.created_at_ms, Some(1_790_000_000_000));
+        let recovered = parse_subscription(
+            br#"{"plan_type":"plus","is_active":true,"is_delinquent":false}"#,
+            "ws",
+            NOW,
+        )
+        .unwrap();
+        let merged = LastPayment::with_subscription(Some(legacy), &recovered);
+        assert_eq!(merged.status, "paid");
+        assert_eq!(merged.subscription_status.as_deref(), Some("active"));
+        assert_eq!(merged.grace_ends_at_ms, None);
     }
 }

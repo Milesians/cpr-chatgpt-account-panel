@@ -83,10 +83,7 @@ async fn route(app: &App, call: &TypedCall<ManagementRequest>) -> Result<Value, 
                 .map_err(|_| ApiError::invalid("时间范围无效"))?;
             read_usage(host, required(&query, "id")?, days).await
         }
-        ("GET", "api/subscription") => {
-            let session = Session::open(host, required(&query, "id")?).await?;
-            Ok(json!({"subscription": billing::subscription(&session).await?}))
-        }
+        ("GET", "api/subscription") => read_subscription(host, required(&query, "id")?).await,
         ("GET", "api/billing") => {
             let id = required(&query, "id")?;
             let cursor = query.get("cursor").map_or("", String::as_str);
@@ -248,6 +245,15 @@ async fn read_usage(host: &HostClient, id: &str, days: u32) -> Result<Value, Api
         Ok(u) => Ok(json!({"usage": usage::to_value(&u), "summary": summary})),
         Err(p) => Err(p.into()),
     }
+}
+
+async fn read_subscription(host: &HostClient, id: &str) -> Result<Value, ApiError> {
+    let session = Session::open(host, id).await?;
+    let sub = billing::subscription(&session).await?;
+    let existing = store::payment(host, id).await.ok().flatten();
+    let payment = LastPayment::with_subscription(existing, &sub);
+    let _ = store::save_payment(host, id, &payment).await;
+    Ok(json!({"subscription": sub, "payment": payment}))
 }
 
 async fn read_billing(host: &HostClient, id: &str, cursor: &str) -> Result<Value, ApiError> {

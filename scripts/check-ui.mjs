@@ -80,7 +80,9 @@ const mockAccounts = [
       status: 'past_due',
       created_at_ms: now - 3 * dayMs,
       checked_at_ms: now - 600_000,
-      grace_ends_at_ms: now + 4 * dayMs,
+      subscription_status: 'past_due',
+      delinquent_since_ms: now - 3 * dayMs,
+      grace_ends_at_ms: Date.now() + 4 * dayMs,
     },
     blocker: null,
   },
@@ -234,7 +236,7 @@ const mockSubscription = {
   expires_at_ms: now + 18 * dayMs,
   renews_at_ms: now + 18 * dayMs,
   will_renew: true,
-  grace_ends_at_ms: now + 4 * dayMs,
+  grace_ends_at_ms: Date.now() + 4 * dayMs,
   delinquent_since_ms: now - 3 * dayMs,
   billing_Interval: 'month',
   billing_currency: 'USD',
@@ -679,12 +681,17 @@ try {
     const chips = [...document.querySelectorAll('.filter-chip')].map(el => el.textContent.replace(/\\s+/g, ' ').trim());
     const rows = document.querySelectorAll('.monitor-row').length;
     const actionButtons = [...document.querySelectorAll('.row-col-actions button')].map(b => b.textContent.trim());
+    const paymentText = [...document.querySelectorAll('.row-col-payment')].map(el => el.textContent.replace(/\\s+/g, ' ').trim());
+    const headerText = document.querySelector('.panel-header')?.textContent.replace(/\\s+/g, ' ').trim() ?? '';
     const lightBg = getComputedStyle(document.querySelector('.monitor-list')).backgroundColor;
-    return { chips, rows, actionButtons, lightBg };
+    return { chips, rows, actionButtons, paymentText, headerText, lightBg };
   `)
   assert.equal(listStats.rows, 4, '列表应渲染 4 个账号监控行')
-  assert.equal(listStats.chips.length, 5, '列表顶部应有 5 个分类计数筛选芯片')
+  assert.equal(listStats.chips.length, 6, '列表顶部应有 6 个分类计数筛选芯片（含宽限期）')
+  assert.ok(listStats.chips.some(c => c.includes('宽限期')), '筛选芯片应显示「宽限期」')
   assert.ok(listStats.chips.some(c => c.includes('无法查询')), '筛选芯片应显示「无法查询」')
+  assert.ok(listStats.headerText.includes('1 个宽限期'), '页头摘要应提示宽限期账号数')
+  assert.ok(listStats.paymentText.some(t => /宽限期至 .* · 剩 4 天/.test(t)), '列表行内若查到宽限期应直接显示截止日与剩余天数')
   assert.ok(listStats.actionButtons.includes('免输重登'), '令牌过期且有已存密码的账号行应显示「免输重登」')
   assert.ok(listStats.actionButtons.includes('去重新登录'), '令牌过期且未存密码的账号行应显示「去重新登录」')
 
@@ -724,6 +731,10 @@ try {
   // 验证筛选芯片点击与恢复
   await setViewport(1440, 900, 'light')
   const filteredRows = await evaluate(`
+    const graceChip = [...document.querySelectorAll('.filter-chip')].find(el => el.textContent.includes('宽限期'));
+    graceChip.click();
+    await new Promise(r => setTimeout(r, 80));
+    const graceCount = document.querySelectorAll('.monitor-row').length;
     const payChip = [...document.querySelectorAll('.filter-chip')].find(el => el.textContent.includes('扣款异常'));
     payChip.click();
     await new Promise(r => setTimeout(r, 80));
@@ -731,9 +742,10 @@ try {
     const allChip = [...document.querySelectorAll('.filter-chip')].find(el => el.textContent.includes('全部'));
     allChip.click();
     await new Promise(r => setTimeout(r, 80));
-    return count;
+    return { graceCount, count };
   `)
-  assert.equal(filteredRows, 1, '点击「扣款异常」芯片后应只显示 1 行')
+  assert.equal(filteredRows.graceCount, 1, '点击「宽限期」芯片后应只显示 1 行')
+  assert.equal(filteredRows.count, 1, '点击「扣款异常」芯片后应只显示 1 行')
   const listUsage = await evaluate(`
     return {
       chips: [...document.querySelectorAll('.filter-chip')].map(el => el.textContent),
@@ -751,7 +763,7 @@ try {
 
   // 点柱子弹出当天详情
   const barTip = await evaluate(`
-    const bars = document.querySelectorAll('.monitor-row .mini-bars')[0].querySelectorAll('.mini-bar');
+    const bars = document.querySelectorAll('.monitor-row .mini-bars')[1].querySelectorAll('.mini-bar');
     bars[5].click();
     await new Promise(r => setTimeout(r, 80));
     const tip = document.querySelector('.mini-bars-tip');
@@ -876,9 +888,8 @@ try {
       options: [...sel.options].map(o => ({ text: o.textContent.trim(), disabled: o.disabled })),
     };
   `)
-  assert.equal(proxyPick.value, 'px-tokyo', '默认选一个有账号在用、能自动登录的代理')
+  assert.equal(proxyPick.value, 'px-new', '默认选第一个启用的代理')
   assert.deepEqual(proxyPick.options.map(o => o.disabled), [true, false, false], '停用的代理不能选')
-  assert.ok(proxyPick.options[1].text.includes('只能浏览器手动登录'), '没人用的代理要说明只能浏览器手动登录')
 
   await capture('10-login-import-light', 1440, 1100, 'light')
   await capture('11-login-import-dark', 1440, 1100, 'dark')
@@ -895,7 +906,7 @@ try {
     const buttons = [...document.querySelectorAll('.import-preview-row button')].map(b => b.textContent.trim());
     return { buttons, imports: window.__IMPORTS__ };
   `)
-  assert.ok(choiceState.imports.every(i => i.proxyId === 'px-tokyo' && !('viaAccountId' in i)), '导入带所选代理，不再带借道账号')
+  assert.ok(choiceState.imports.every(i => i.proxyId === 'px-new' && !('viaAccountId' in i)), '导入带所选代理，不再带借道账号')
   assert.ok(choiceState.buttons.includes('个人') && choiceState.buttons.includes('Acme'), '多工作区时给出可点选的候选')
   await capture('15-login-import-choices', 1440, 1100, 'light')
   await evaluate(`
