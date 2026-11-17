@@ -23,6 +23,13 @@ export interface PendingOAuthView {
   expiresAtMs: number
 }
 
+export interface AutoLoginAttempt {
+  atMs: number
+  trigger: string
+  success: boolean
+  error?: string
+}
+
 export interface AccountLoginStatus {
   accountId: string
   name: string
@@ -35,6 +42,8 @@ export interface AccountLoginStatus {
   identity: IdentityInfo
   lastLoginAtMs?: number
   lastError?: StoredLoginError
+  autoLoginEnabled: boolean
+  autoLoginLast?: AutoLoginAttempt
   pendingOauth?: PendingOAuthView
 }
 

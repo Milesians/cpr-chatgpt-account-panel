@@ -73,6 +73,12 @@ export const loginApi = {
   }) =>
     call<{ ok: boolean, account: AccountLoginStatus }>('POST', 'api/login/credentials', undefined, data),
 
+  setAutoLogin: (accountId: string, enabled: boolean) =>
+    call<{ ok: boolean, account: AccountLoginStatus }>('POST', 'api/login/auto-login', undefined, {
+      accountId,
+      enabled,
+    }),
+
   runLogin: (data: {
     accountId: string
     email?: string

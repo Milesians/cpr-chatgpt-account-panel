@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::probe::fingerprint::Challenge;
-use crate::probe::health::{Blocked, Health, HealthView, NoticeKind, Notification};
+use crate::probe::health::{
+    AutoLoginNotice, Blocked, Health, HealthView, NoticeKind, Notification,
+};
 use crate::probe::host;
 use crate::probe::modeltrace::{Completion, ModelTraceResult};
 use crate::probe::series::{self, Bucket, HOUR_MS};
@@ -281,6 +283,7 @@ impl History {
                 model: summary.model.clone(),
                 at_ms: summary.finished_ms,
                 blocked: None,
+                auto_login: None,
                 attempts: 0,
                 retry_at_ms: 0,
                 last_error: None,
@@ -656,6 +659,7 @@ pub async fn set_blocked(
                 model: health.model,
                 at_ms,
                 blocked: about,
+                auto_login: None,
                 attempts: 0,
                 retry_at_ms: 0,
                 last_error: None,
@@ -679,7 +683,60 @@ const fn kind_name(kind: NoticeKind) -> &'static str {
         NoticeKind::Verdict => "verdict",
         NoticeKind::Blocked => "blocked",
         NoticeKind::Unblocked => "unblocked",
+        NoticeKind::AutoLoginSucceeded => "auto-login-succeeded",
+        NoticeKind::AutoLoginFailed => "auto-login-failed",
     }
+}
+
+/// 自动重登结果与测票共用一个持久通知队列；TG 未开启时直接丢弃。
+pub(crate) async fn enqueue_auto_login_notice(
+    host: &HostClient,
+    account_id: &str,
+    notice: &AutoLoginNotice,
+    notifications: bool,
+) -> Result<(), PluginFault> {
+    if !notifications {
+        return Ok(());
+    }
+    let key = history_key(account_id, Method::Turnstate);
+    for _ in 0..5 {
+        let (mut history, version) = history_record(host, account_id, Method::Turnstate).await?;
+        let health = history
+            .health
+            .clone()
+            .unwrap_or_else(|| Health::from_history(&history.runs));
+        let at_ms = crate::clock::now_ms();
+        history.enqueue(Notification {
+            id: format!(
+                "auto-login-{}-{at_ms}",
+                if notice.success { "ok" } else { "failed" }
+            ),
+            kind: if notice.success {
+                NoticeKind::AutoLoginSucceeded
+            } else {
+                NoticeKind::AutoLoginFailed
+            },
+            from: health.level,
+            to: health.level,
+            model: health.model,
+            at_ms,
+            blocked: None,
+            auto_login: Some(notice.clone()),
+            attempts: 0,
+            retry_at_ms: 0,
+            last_error: None,
+        });
+        let mut expired = Vec::new();
+        match put_history(host, &key, &mut history, version, &mut expired).await {
+            Ok(()) => return delete_runs(host, expired).await,
+            Err(error) if error.code == ErrorCode::Conflict => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Conflict,
+        "自动重登通知被同时修改",
+    ))
 }
 
 /// 账号测票的当前判定，和自动分组上次按哪个判定调整过

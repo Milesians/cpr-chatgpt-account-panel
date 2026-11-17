@@ -143,9 +143,41 @@ fn blocked_message(account: &AuthRuntimeAccount, event: &Notification) -> String
     lines.join("\n")
 }
 
+fn auto_login_message(account: &AuthRuntimeAccount, event: &Notification) -> String {
+    let success = event.kind == NoticeKind::AutoLoginSucceeded;
+    let mut lines = vec![format!(
+        "CPR 账号探测 | 自动重登{}",
+        if success { "成功" } else { "失败" }
+    )];
+    lines.extend(account_lines(account));
+    if let Some(notice) = &event.auto_login {
+        lines.push(format!("触发原因：{}", one_line(&notice.trigger, 240)));
+        if !notice.success
+            && let Some(error) = &notice.error
+        {
+            lines.push(format!("失败原因：{}", one_line(error, 300)));
+        }
+    }
+    lines.push(format!("时间：{}（北京时间）", beijing_time(event.at_ms)));
+    lines.push(if success {
+        "新令牌已写回 CPR，账号无需手动处理。".to_owned()
+    } else {
+        "本次失效周期不会再次自动尝试；请到账号详情检查登录信息。".to_owned()
+    });
+    lines.push(format!("账号 ID：{}", one_line(&account.account_id, 100)));
+    lines.push(format!("事件 ID：{}", one_line(&event.id, 100)));
+    lines.join("\n")
+}
+
 fn message(account: &AuthRuntimeAccount, event: &Notification) -> String {
-    if event.kind != NoticeKind::Verdict {
-        return blocked_message(account, event);
+    match event.kind {
+        NoticeKind::Verdict => {}
+        NoticeKind::Blocked | NoticeKind::Unblocked => {
+            return blocked_message(account, event);
+        }
+        NoticeKind::AutoLoginSucceeded | NoticeKind::AutoLoginFailed => {
+            return auto_login_message(account, event);
+        }
     }
     let recovered = event.to == Level::Ok;
     let mut lines = vec![format!(

@@ -78,6 +78,33 @@ struct StoredLoginRecord {
     pub last_login_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<StoredLoginError>,
+    #[serde(default)]
+    pub auto_login_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_login_last: Option<AutoLoginAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_login_signal: Option<AutoLoginSignal>,
+    /// 同一份失效凭据只自动尝试一次；重新登录后 CPR 的 credential_revision 会变化
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_login_trigger_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoLoginAttempt {
+    pub at_ms: i64,
+    pub trigger: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoLoginSignal {
+    pub at_ms: i64,
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +135,9 @@ pub struct AccountLoginStatus {
     pub last_login_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<StoredLoginError>,
+    pub auto_login_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_login_last: Option<AutoLoginAttempt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_oauth: Option<PendingOAuthView>,
 }
@@ -163,6 +193,7 @@ pub fn routes() -> Vec<ManagementRoute> {
         api::route("GET", "api/login/status"),
         api::route("GET", "api/login/proxies"),
         api::route("POST", "api/login/credentials"),
+        api::route("POST", "api/login/auto-login"),
         api::route("POST", "api/login/run"),
         api::route("POST", "api/login/oauth/start"),
         api::route("POST", "api/login/oauth/complete"),
@@ -185,6 +216,10 @@ pub async fn handle(login: &Login, call: &TypedCall<ManagementRequest>) -> Resul
         ("POST", "api/login/credentials") => {
             let body: CredentialsRequest = api::decode(call)?;
             handle_save_credentials(login, host, body).await
+        }
+        ("POST", "api/login/auto-login") => {
+            let body: AutoLoginConfigRequest = api::decode(call)?;
+            handle_auto_login_config(login, host, body).await
         }
         ("POST", "api/login/run") => {
             let body: RunLoginRequest = api::decode(call)?;
@@ -280,6 +315,7 @@ async fn handle_save_credentials(
 
     if req.clear_password {
         rec.password = None;
+        rec.auto_login_enabled = false;
     } else if !new_pw.is_empty() {
         rec.password = Some(new_pw.to_owned());
     }
@@ -295,6 +331,9 @@ async fn handle_save_credentials(
             )
         })?;
         rec.totp = Some(normalized);
+    }
+    if rec.password.as_ref().is_none_or(String::is_empty) {
+        rec.auto_login_enabled = false;
     }
 
     if let Some(email) = req
@@ -324,6 +363,47 @@ async fn handle_save_credentials(
         "ok": true,
         "account": status,
     }))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct AutoLoginConfigRequest {
+    account_id: String,
+    enabled: bool,
+}
+
+async fn handle_auto_login_config(
+    login: &Login,
+    host: &HostClient,
+    req: AutoLoginConfigRequest,
+) -> Result<Value, ApiError> {
+    let account_id = req.account_id.trim();
+    if account_id.is_empty() {
+        return Err(ApiError::invalid("缺少参数 accountId"));
+    }
+    let acct = host::account(host, account_id).await?;
+    if !supported(&acct) {
+        return Err(ApiError::new(
+            409,
+            "unsupported_account",
+            "只支持 OpenAI OAuth 账号",
+        ));
+    }
+    let rec = update_record(host, account_id, |rec| {
+        if req.enabled && rec.password.as_ref().is_none_or(String::is_empty) {
+            return Err("请先保存登录密码，再开启自动重登".to_owned());
+        }
+        if req.enabled && !rec.auto_login_enabled {
+            rec.auto_login_signal = None;
+            rec.auto_login_trigger_key = None;
+        }
+        rec.auto_login_enabled = req.enabled;
+        Ok(())
+    })
+    .await?
+    .map_err(ApiError::invalid)?;
+    let status = build_account_status(login, &acct, &rec, now_ms());
+    Ok(json!({ "ok": true, "account": status }))
 }
 
 #[derive(Deserialize, Default)]
@@ -738,6 +818,7 @@ async fn handle_oauth_complete(
         identity,
         last_login_at_ms: Some(now),
         last_error: None,
+        ..StoredLoginRecord::default()
     };
     save_record(host, &completed.account_id, &new_rec).await?;
     if let Some(ver) = staged_version {
@@ -960,6 +1041,7 @@ async fn handle_import(
         identity: out.identity,
         last_login_at_ms: Some(now),
         last_error: None,
+        ..StoredLoginRecord::default()
     };
 
     save_record(host, &completed.account_id, &new_rec).await?;
@@ -1216,6 +1298,8 @@ fn build_account_status(
         identity: rec.identity.clone(),
         last_login_at_ms: rec.last_login_at_ms,
         last_error: rec.last_error.clone(),
+        auto_login_enabled: rec.auto_login_enabled,
+        auto_login_last: rec.auto_login_last.clone(),
         pending_oauth,
     }
 }
@@ -1247,6 +1331,308 @@ async fn save_record(
         }
     }
     Ok(())
+}
+
+async fn update_record(
+    host: &HostClient,
+    key: &str,
+    mut change: impl FnMut(&mut StoredLoginRecord) -> Result<(), String>,
+) -> Result<Result<StoredLoginRecord, String>, PluginFault> {
+    for _ in 0..5 {
+        let (mut rec, version) = load_record(host, key).await?;
+        if let Err(reason) = change(&mut rec) {
+            return Ok(Err(reason));
+        }
+        let value = serde_json::to_value(&rec)
+            .map_err(|_| PluginFault::new(ErrorCode::Fault, "登录记录编码失败"))?;
+        match host::state_put(host, STATE_NAMESPACE, key, value, version).await {
+            Ok(_) => return Ok(Ok(rec)),
+            Err(error) if error.code == ErrorCode::Conflict => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Conflict,
+        "登录记录被同时修改，请重试",
+    ))
+}
+
+const MAX_AUTO_RELOGINS_PER_RECONCILE: usize = 2;
+
+struct AutoLoginTrigger {
+    key: String,
+    reason: String,
+}
+
+async fn auto_login_trigger(
+    host: &HostClient,
+    acct: &AuthRuntimeAccount,
+    rec: &StoredLoginRecord,
+) -> Result<Option<AutoLoginTrigger>, PluginFault> {
+    let now = now_ms();
+    let revision = acct.credential_revision;
+    if matches!(acct.credential_state.as_str(), "expired" | "invalid") {
+        return Ok(Some(AutoLoginTrigger {
+            key: format!("credential_state:{revision}:{}", acct.credential_state),
+            reason: format!("CPR 标记账号凭据为 {}", acct.credential_state),
+        }));
+    }
+    if acct
+        .access_token_expires_at_ms
+        .is_some_and(|expires| expires <= now + 30_000)
+    {
+        return Ok(Some(AutoLoginTrigger {
+            key: format!("token_expired:{revision}"),
+            reason: "访问令牌已过期或即将过期".to_owned(),
+        }));
+    }
+    if let Some(signal) = &rec.auto_login_signal
+        && rec
+            .last_login_at_ms
+            .is_none_or(|last_login| signal.at_ms > last_login)
+    {
+        return Ok(Some(AutoLoginTrigger {
+            key: format!("api_unauthorized:{revision}"),
+            reason: format!(
+                "ChatGPT 查询返回 401（{}）",
+                crate::probe::verdict::one_line(&signal.message, 160)
+            ),
+        }));
+    }
+    if let Some((started_ms, message)) = latest_unauthorized_probe(host, &acct.account_id).await?
+        && rec
+            .last_login_at_ms
+            .is_none_or(|last_login| started_ms > last_login)
+    {
+        return Ok(Some(AutoLoginTrigger {
+            key: format!("unauthorized:{revision}"),
+            reason: format!(
+                "探测请求返回 401（{}，记录开始于 {}）",
+                crate::probe::verdict::one_line(&message, 160),
+                crate::probe::telegram::beijing_time(started_ms)
+            ),
+        }));
+    }
+    Ok(None)
+}
+
+async fn latest_unauthorized_probe(
+    host: &HostClient,
+    account_id: &str,
+) -> Result<Option<(i64, String)>, PluginFault> {
+    use crate::probe::store::{Method, Status};
+
+    let mut latest: Option<(i64, String)> = None;
+    for method in Method::ALL {
+        let Some(summary) = crate::probe::store::history(host, account_id, method)
+            .await?
+            .into_iter()
+            .next_back()
+        else {
+            continue;
+        };
+        if summary.status != Status::Failed || !summary.detail {
+            continue;
+        }
+        let Some((run, _)) = crate::probe::store::run(host, &summary.id).await? else {
+            continue;
+        };
+        let Some(error) = run
+            .error
+            .filter(|error| error.status == Some(401) || error.kind == "unauthorized")
+        else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .is_none_or(|(started_ms, _)| summary.started_ms > *started_ms)
+        {
+            latest = Some((summary.started_ms, error.message));
+        }
+    }
+    Ok(latest)
+}
+
+/// 维护任务调用：给开了账号级自动重登的账号检查一次失效信号。
+pub(crate) async fn run_auto_relogins(
+    login: &Login,
+    host: &HostClient,
+    accounts: &[AuthRuntimeAccount],
+    telegram_enabled: bool,
+) -> usize {
+    let mut attempted = 0;
+    for acct in accounts
+        .iter()
+        .filter(|acct| acct.enabled && supported(acct))
+    {
+        if attempted >= MAX_AUTO_RELOGINS_PER_RECONCILE
+            || host
+                .remaining_budget()
+                .is_some_and(|budget| budget < std::time::Duration::from_secs(8))
+        {
+            break;
+        }
+        let rec = match load_record(host, &acct.account_id).await {
+            Ok((rec, _)) => rec,
+            Err(error) => {
+                host::log(
+                    host,
+                    "auto_login_record_failed",
+                    LogLevel::Warn,
+                    json!({"account_id": acct.account_id, "code": format!("{:?}", error.code)}),
+                )
+                .await;
+                continue;
+            }
+        };
+        if !rec.auto_login_enabled || rec.password.as_ref().is_none_or(String::is_empty) {
+            continue;
+        }
+        let trigger = match auto_login_trigger(host, acct, &rec).await {
+            Ok(Some(trigger)) => trigger,
+            Ok(None) => continue,
+            Err(error) => {
+                host::log(
+                    host,
+                    "auto_login_check_failed",
+                    LogLevel::Warn,
+                    json!({"account_id": acct.account_id, "code": format!("{:?}", error.code)}),
+                )
+                .await;
+                continue;
+            }
+        };
+        if rec.auto_login_trigger_key.as_deref() == Some(trigger.key.as_str()) {
+            continue;
+        }
+
+        attempted += 1;
+        let result = handle_run_login(
+            login,
+            host,
+            RunLoginRequest {
+                account_id: acct.account_id.clone(),
+                save_credentials: false,
+                ..RunLoginRequest::default()
+            },
+        )
+        .await;
+        let (success, error) = match result {
+            Ok(_) => (true, None),
+            Err(error) => (
+                false,
+                Some(format!(
+                    "{}（{}）",
+                    crate::probe::verdict::one_line(&error.message, 240),
+                    error.code
+                )),
+            ),
+        };
+        let at_ms = now_ms();
+        let attempt = AutoLoginAttempt {
+            at_ms,
+            trigger: trigger.reason.clone(),
+            success,
+            error: error.clone(),
+        };
+        if let Err(error) = update_record(host, &acct.account_id, |rec| {
+            rec.auto_login_trigger_key = Some(trigger.key.clone());
+            rec.auto_login_last = Some(attempt.clone());
+            rec.auto_login_signal = None;
+            Ok(())
+        })
+        .await
+        {
+            host::log(
+                host,
+                "auto_login_record_save_failed",
+                LogLevel::Warn,
+                json!({"account_id": acct.account_id, "code": format!("{:?}", error.code)}),
+            )
+            .await;
+        }
+        let notice = crate::probe::health::AutoLoginNotice {
+            trigger: trigger.reason,
+            success,
+            error,
+        };
+        if let Err(error) = crate::probe::store::enqueue_auto_login_notice(
+            host,
+            &acct.account_id,
+            &notice,
+            telegram_enabled,
+        )
+        .await
+        {
+            host::log(
+                host,
+                "auto_login_notice_failed",
+                LogLevel::Warn,
+                json!({"account_id": acct.account_id, "code": format!("{:?}", error.code)}),
+            )
+            .await;
+        }
+        host::log(
+            host,
+            if success {
+                "auto_login_succeeded"
+            } else {
+                "auto_login_failed"
+            },
+            if success {
+                LogLevel::Info
+            } else {
+                LogLevel::Warn
+            },
+            json!({"account_id": acct.account_id}),
+        )
+        .await;
+    }
+    attempted
+}
+
+/// 普通查询先把 401 持久化，下一轮维护会按账号开关尝试自动重登。
+pub(crate) async fn record_auth_failure(
+    host: &HostClient,
+    account_id: &str,
+    error: Option<&ApiError>,
+) {
+    let Some(error) = error else {
+        return;
+    };
+    if account_id.is_empty()
+        || (error.status != 401
+            && !matches!(
+                error.code.as_str(),
+                "token_revoked" | "oauth_unauthorized" | "cpr_voided_early"
+            ))
+    {
+        return;
+    }
+    match update_record(host, account_id, |rec| {
+        if rec.auto_login_enabled && rec.password.as_ref().is_some_and(|s| !s.is_empty()) {
+            rec.auto_login_signal = Some(AutoLoginSignal {
+                at_ms: now_ms(),
+                code: error.code.clone(),
+                message: error.message.clone(),
+            });
+        }
+        Ok(())
+    })
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {}
+        Err(error) => {
+            host::log(
+                host,
+                "auto_login_signal_failed",
+                LogLevel::Warn,
+                json!({"account_id": account_id, "code": format!("{:?}", error.code)}),
+            )
+            .await;
+        }
+    }
 }
 
 fn staged_email_key(email: &str, kind: &str) -> String {

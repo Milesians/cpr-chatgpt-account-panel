@@ -332,6 +332,12 @@ const mockLoginAccounts = [
     hasTotp: true,
     lastLoginAtMs: now - 2 * dayMs,
     lastError: null,
+    autoLoginEnabled: true,
+    autoLoginLast: {
+      atMs: now - 3 * dayMs,
+      trigger: '访问令牌已过期或即将过期',
+      success: true,
+    },
     pendingOauth: null,
   },
   {
@@ -509,6 +515,11 @@ window.codexProxyPlugin = {
         return __reply({ oauthRedirect: 'http://localhost:1455/auth/callback', account: found });
       }
       return __reply(__MOCK__.loginOverview);
+    }
+    if (fn === 'api/login/auto-login') {
+      const found = __MOCK__.loginOverview.accounts.find(a => a.accountId === payload.accountId);
+      found.autoLoginEnabled = payload.enabled;
+      return __reply({ ok: true, account: found });
     }
     if (fn === 'api/login/paste') return __reply(__MOCK__.pastePreview);
     if (fn === 'api/login/proxies') return __reply({ proxies: [
@@ -806,10 +817,31 @@ try {
     return {
       deviceRows: document.querySelectorAll('.device-row').length,
       loginSection: Boolean(document.querySelector('#account-login-section')),
+      hasAutoLoginToggle: document.body.innerText.includes('401 / 令牌过期时自动重登一次'),
+      hasAutoLoginResult: document.body.innerText.includes('自动重登成功'),
     };
   `)
   assert.equal(deviceStats.deviceRows, 3, '点击查询设备后应渲染 3 台登录设备行')
   assert.equal(deviceStats.loginSection, true, '详情页应包含重新登录卡片')
+  assert.equal(deviceStats.hasAutoLoginToggle, true, '重新登录卡片应包含账号级自动重登开关')
+  assert.equal(deviceStats.hasAutoLoginResult, true, '应显示最近一次自动重登结果')
+
+  const autoLoginToggle = await evaluate(`
+    const label = [...document.querySelectorAll('#account-login-section label')].find(el => el.textContent.includes('401 / 令牌过期时自动重登一次'));
+    const input = label.querySelector('input');
+    input.click();
+    await new Promise(r => setTimeout(r, 100));
+    const off = {
+      checked: input.checked,
+      status: document.body.innerText.includes('已关闭自动重登'),
+    };
+    input.click();
+    await new Promise(r => setTimeout(r, 100));
+    return { off, onChecked: input.checked };
+  `)
+  assert.equal(autoLoginToggle.off.checked, false, '关闭后账号级自动重登开关应取消')
+  assert.equal(autoLoginToggle.off.status, true, '关闭后应显示结果提示')
+  assert.equal(autoLoginToggle.onChecked, true, '可以重新开启账号级自动重登')
 
   await capture('07-detail-devices-login-light', 1440, 1100, 'light')
   await capture('08-detail-devices-login-dark', 1440, 1100, 'dark')

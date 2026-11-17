@@ -17,6 +17,7 @@ const status = ref<AccountLoginStatus | null>(null)
 const loadingStatus = ref(false)
 const runningLogin = ref(false)
 const savingCreds = ref(false)
+const savingAutoLogin = ref(false)
 const startingOAuth = ref(false)
 const completingOAuth = ref(false)
 
@@ -25,6 +26,7 @@ const totp = ref('')
 const workspaceId = ref('')
 const organizationId = ref('')
 const saveCredentials = ref(true)
+const autoLoginEnabled = ref(false)
 const showAdvanced = ref(false)
 const showManualOAuth = ref(false)
 
@@ -69,6 +71,14 @@ const saveOnlyTitle = computed(() => {
   return undefined
 })
 
+const autoLoginTitle = computed(() => {
+  if (blockedByDisabled.value)
+    return '账号在 CPR 里已停用，无法自动重登'
+  if (!status.value?.hasPassword)
+    return '请先保存登录密码'
+  return 'CPR 凭据过期/失效或最近一次探测返回 401 时，自动尝试一次登录'
+})
+
 const manualToggleTitle = computed(() => {
   if (blockedByDisabled.value)
     return '账号在 CPR 里已停用，无法发起登录'
@@ -90,6 +100,7 @@ async function loadStatus() {
   try {
     const r = await loginApi.accountStatus(props.accountId)
     status.value = r.account
+    autoLoginEnabled.value = r.account.autoLoginEnabled
     if (r.account.pendingOauth) {
       authorizeUrl.value = r.account.pendingOauth.authorizeUrl
       showManualOAuth.value = true
@@ -167,6 +178,7 @@ async function handleSaveCredentials() {
       ...(totp.value.trim() ? { totp: totp.value.trim() } : {}),
     })
     status.value = r.account
+    autoLoginEnabled.value = r.account.autoLoginEnabled
     password.value = ''
     totp.value = ''
     successMsg.value = '已保存密码与 2FA'
@@ -194,6 +206,7 @@ async function handleClearCredentials() {
       clearTotp: true,
     })
     status.value = r.account
+    autoLoginEnabled.value = r.account.autoLoginEnabled
     successMsg.value = '已清除该账号保存的密码与 2FA 密钥'
     emit('updated', r.account)
   }
@@ -204,6 +217,34 @@ async function handleClearCredentials() {
   }
   finally {
     savingCreds.value = false
+  }
+}
+
+async function handleAutoLoginChange() {
+  if (!status.value)
+    return
+  savingAutoLogin.value = true
+  errorMsg.value = ''
+  errorCode.value = ''
+  successMsg.value = ''
+  const desired = autoLoginEnabled.value
+  try {
+    const r = await loginApi.setAutoLogin(props.accountId, desired)
+    status.value = r.account
+    autoLoginEnabled.value = r.account.autoLoginEnabled
+    successMsg.value = desired
+      ? '已开启自动重登，失效后将尝试登录一次并通过 TG 推送结果'
+      : '已关闭自动重登'
+    emit('updated', r.account)
+  }
+  catch (e) {
+    const err = e as ApiError
+    autoLoginEnabled.value = status.value.autoLoginEnabled
+    errorMsg.value = err.message
+    errorCode.value = err.code ?? ''
+  }
+  finally {
+    savingAutoLogin.value = false
   }
 }
 
@@ -285,6 +326,7 @@ function selectInput(e: Event) {
 watch(() => props.accountId, () => {
   password.value = ''
   totp.value = ''
+  autoLoginEnabled.value = false
   authorizeUrl.value = ''
   callbackUrl.value = ''
   errorMsg.value = ''
@@ -311,6 +353,9 @@ onMounted(loadStatus)
           </ZTag>
           <ZTag size="small" :type="status.hasTotp ? 'success' : 'default'">
             {{ status.hasTotp ? '已保存 2FA' : '未存 2FA' }}
+          </ZTag>
+          <ZTag v-if="status.autoLoginEnabled" size="small" type="success">
+            自动重登已开启
           </ZTag>
         </template>
         <span v-if="status?.lastLoginAtMs" class="muted">
@@ -339,6 +384,16 @@ onMounted(loadStatus)
     </p>
     <p v-else-if="status?.lastError" class="banner banner-warn">
       上次登录失败（{{ dateTime(status.lastError.atMs) }}）：{{ formatLoginError(status.lastError.code, status.lastError.message) }}
+    </p>
+    <p
+      v-if="status?.autoLoginLast"
+      class="banner"
+      :class="status.autoLoginLast.success ? 'banner-ok' : 'banner-warn'"
+      role="status"
+    >
+      自动重登{{ status.autoLoginLast.success ? '成功' : '失败' }}
+      （{{ dateTime(status.autoLoginLast.atMs) }}）：{{ status.autoLoginLast.trigger }}
+      <template v-if="status.autoLoginLast.error">；{{ status.autoLoginLast.error }}</template>
     </p>
     <div v-if="choices.length" class="flex flex-wrap items-center gap-2 text-xs" role="group" aria-label="选一个重登">
       <span class="text-cp-text-secondary">选一个{{ choices[0]?.kind === 'organization' ? '组织' : '工作区' }}直接重登：</span>
@@ -410,6 +465,18 @@ onMounted(loadStatus)
             type="checkbox"
           >
           <span>保存密码与 2FA</span>
+        </label>
+        <label
+          class="inline-flex cursor-pointer items-center gap-1.5 text-cp-text-secondary"
+          :title="autoLoginTitle"
+        >
+          <input
+            v-model="autoLoginEnabled"
+            type="checkbox"
+            :disabled="!status?.hasPassword || blockedByDisabled || savingAutoLogin || runningLogin"
+            @change="handleAutoLoginChange"
+          >
+          <span>{{ savingAutoLogin ? '正在保存自动重登设置…' : '401 / 令牌过期时自动重登一次' }}</span>
         </label>
         <button
           type="button"

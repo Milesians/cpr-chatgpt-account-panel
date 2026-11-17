@@ -92,19 +92,41 @@ async fn route(app: &App, call: &TypedCall<ManagementRequest>) -> Result<Value, 
                 .get("days")
                 .map_or(Ok(7), |v| v.parse::<u32>())
                 .map_err(|_| ApiError::invalid("时间范围无效"))?;
-            read_usage(host, required(&query, "id")?, days).await
+            let id = required(&query, "id")?;
+            let result = read_usage(host, id, days).await;
+            login::record_auth_failure(host, id, result.as_ref().err()).await;
+            result
         }
-        ("GET", "api/subscription") => read_subscription(host, required(&query, "id")?).await,
+        ("GET", "api/subscription") => {
+            let id = required(&query, "id")?;
+            let result = read_subscription(host, id).await;
+            login::record_auth_failure(host, id, result.as_ref().err()).await;
+            result
+        }
         ("GET", "api/billing") => {
             let id = required(&query, "id")?;
             let cursor = query.get("cursor").map_or("", String::as_str);
-            read_billing(host, id, cursor).await
+            let result = read_billing(host, id, cursor).await;
+            login::record_auth_failure(host, id, result.as_ref().err()).await;
+            result
         }
         ("GET", "api/devices") => {
-            let session = Session::open(host, required(&query, "id")?).await?;
-            Ok(json!({"devices": devices::devices(&session).await?}))
+            let id = required(&query, "id")?;
+            let result: Result<Value, ApiError> = async {
+                let session = Session::open(host, id).await?;
+                Ok(json!({"devices": devices::devices(&session).await?}))
+            }
+            .await;
+            login::record_auth_failure(host, id, result.as_ref().err()).await;
+            result
         }
-        ("POST", "api/devices/sign-out") => sign_out(host, api::decode(call)?).await,
+        ("POST", "api/devices/sign-out") => {
+            let req: SignOut = api::decode(call)?;
+            let id = req.id.clone();
+            let result = sign_out(host, req).await;
+            login::record_auth_failure(host, &id, result.as_ref().err()).await;
+            result
+        }
         _ => Err(ApiError::new(404, "not_found", "没有这个接口")),
     }
 }

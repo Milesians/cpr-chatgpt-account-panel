@@ -124,6 +124,10 @@ pub enum NoticeKind {
     Blocked,
     /// 受阻解除
     Unblocked,
+    /// 账号级自动重登成功
+    AutoLoginSucceeded,
+    /// 账号级自动重登失败
+    AutoLoginFailed,
 }
 
 impl NoticeKind {
@@ -131,6 +135,15 @@ impl NoticeKind {
     const fn is_verdict(&self) -> bool {
         matches!(self, Self::Verdict)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoLoginNotice {
+    pub trigger: String,
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +158,8 @@ pub struct Notification {
     /// 受阻通知：原因和开始时间
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<Blocked>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_login: Option<AutoLoginNotice>,
     #[serde(default)]
     pub attempts: u32,
     #[serde(default)]

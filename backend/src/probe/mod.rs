@@ -35,10 +35,14 @@ impl Probe {
         }
     }
 
-    pub(crate) async fn reconcile(&self, host: &HostClient) -> Result<(), PluginFault> {
+    pub(crate) async fn reconcile(
+        &self,
+        host: &HostClient,
+        login: &crate::login::Login,
+    ) -> Result<(), PluginFault> {
         if self.runner.config.probe_maintenance_enabled {
             self.scheduler
-                .reconcile(&self.runner, &self.groups, host)
+                .reconcile(&self.runner, &self.groups, host, login)
                 .await?;
         }
         Ok(())

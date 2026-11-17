@@ -87,6 +87,7 @@ impl Scheduler {
         runner: &Runner,
         groups: &crate::probe::groups::Groups,
         host: &HostClient,
+        login: &crate::login::Login,
     ) -> Result<(), PluginFault> {
         runner
             .bank
@@ -95,6 +96,8 @@ impl Scheduler {
         let accounts = host::openai_accounts(host).await?;
         // 先记受阻，确认的通知这一轮就能发出去
         self.track_blocked(runner, host, &accounts).await;
+        crate::login::run_auto_relogins(login, host, &accounts, runner.config.telegram_enabled)
+            .await;
         let mut delivered = 0;
         for account in &accounts {
             if crate::probe::telegram::dispatch(host, &runner.config, account).await {

@@ -72,7 +72,7 @@ fn build_plugin(
         .on(methods::RECONCILE, move |call| {
             let app = Arc::clone(&maintenance);
             async move {
-                app.probe.reconcile(&call.host).await?;
+                app.probe.reconcile(&call.host, &app.login).await?;
                 Ok(TypedReply::new(Empty {}))
             }
         })?

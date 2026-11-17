@@ -3,8 +3,8 @@
   "name": "cpr-chatgpt-account-panel",
   "displayName": "ChatGPT 账号面板",
   "publisher": "milesians",
-  "version": "0.3.2",
-  "description": "按账号查看 ChatGPT 官方用量、订阅与账单、登录设备，用密码和 2FA 快速登录与导入账号，支持测票和 ModelTrace 探测",
+  "version": "0.3.3",
+  "description": "按账号查看 ChatGPT 官方用量、订阅与账单、登录设备，用密码和 2FA 快速登录与导入账号，支持失效自动重登、测票和 ModelTrace 探测",
   "license": "MIT",
   "author": "Milesians",
   "engines": {
@@ -28,7 +28,7 @@
       "probeMaintenanceEnabled": {
         "type": "boolean",
         "title": "运行探测后台任务",
-        "description": "运行自动测票、凭据异常监控、自动分组、待发通知和指纹库同步。旧插件迁移完成后再开启",
+        "description": "运行自动测票、账号失效自动重登、凭据异常监控、自动分组、待发通知和指纹库同步。旧插件迁移完成后再开启",
         "default": false
       },
       "probeEnabled": {
@@ -56,7 +56,7 @@
       "telegramEnabled": {
         "type": "boolean",
         "title": "TG 状态通知",
-        "description": "测票连续 3 次确认状态变化后通知；发送失败会重试，不影响探测结果",
+        "description": "测票变化和自动重登成功/失败后通知；发送失败会重试，不影响探测或登录结果",
         "default": false
       },
       "telegramBotToken": {

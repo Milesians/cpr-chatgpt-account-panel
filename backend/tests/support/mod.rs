@@ -734,6 +734,17 @@ impl Peer {
         )
     }
 
+    pub async fn reconcile(&mut self, host: &mut FakeHost) -> Frame {
+        self.call(
+            "plugin.reconcile",
+            Stage::Maintenance,
+            json!({}),
+            Vec::new(),
+            host,
+        )
+        .await
+    }
+
     async fn send(&mut self, frame: Frame) {
         write_frame(&mut self.writer, &frame).await.unwrap();
     }

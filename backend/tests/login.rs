@@ -775,3 +775,330 @@ async fn relogin_uses_the_account_egress_when_no_enabled_saved_proxy() {
     }
     assert!(!host.calls.iter().any(|c| c == "host.http.proxy"));
 }
+
+fn telegram_auto_login_config() -> Value {
+    json!({
+        "oauthRedirect": "http://localhost:1455/auth/callback",
+        "probeMaintenanceEnabled": true,
+        "fingerprintSyncHours": 0,
+        "telegramEnabled": true,
+        "telegramBotToken": "123456:abcdefghijklmnopqrstuvwxyz",
+        "telegramChatId": "-10012345",
+        "telegramThreadId": 42
+    })
+}
+
+async fn save_and_enable_auto_login(peer: &mut Peer, host: &mut FakeHost) {
+    let (code, body) = peer
+        .api(
+            "POST",
+            "api/login/credentials",
+            "",
+            Some(json!({
+                "accountId": "acct_a",
+                "password": TEST_PASSWORD,
+                "totp": TEST_TOTP,
+            })),
+            host,
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["account"]["autoLoginEnabled"], false);
+
+    let (code, body) = peer
+        .api(
+            "POST",
+            "api/login/auto-login",
+            "",
+            Some(json!({"accountId": "acct_a", "enabled": true})),
+            host,
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["account"]["autoLoginEnabled"], true);
+}
+
+fn successful_oauth_replies(host: &mut FakeHost, account_id: &str) {
+    let session_cookie_payload = base64_url_encode(
+        &serde_json::to_vec(&json!({
+            "client_auth_session": {
+                "workspaces": [
+                    {"id": format!("chatgpt-{account_id}"), "name": "Personal"}
+                ]
+            }
+        }))
+        .unwrap(),
+    );
+    let new_jwt = make_jwt(
+        &format!("{account_id}@example.com"),
+        &format!("chatgpt-{account_id}"),
+        "plus",
+    );
+    host.http.extend([
+        redirect("https://auth.openai.com/log-in"),
+        HttpReply {
+            status: 200,
+            headers: vec![
+                ("content-type".into(), b"text/html".to_vec()),
+                ("set-cookie".into(), b"login_session=sess1; Path=/".to_vec()),
+            ],
+            body: b"<html>login</html>".to_vec(),
+        },
+        ok(json!({
+            "token": "sentinel-1",
+            "proofofwork": {"required": true, "seed": "seed1", "difficulty": "f"}
+        })),
+        ok(json!({
+            "page": {"type": "password"},
+            "continue_url": "/log-in/password"
+        })),
+        ok(json!({
+            "token": "sentinel-2",
+            "proofofwork": {"required": true, "seed": "seed2", "difficulty": "f"}
+        })),
+        ok(json!({
+            "page": {"type": "mfa_challenge"},
+            "mfa_factors": [{"id": "factor_totp_1", "factor_type": "totp"}]
+        })),
+        ok(json!({"ok": true})),
+        HttpReply {
+            status: 200,
+            headers: vec![
+                ("content-type".into(), b"application/json".to_vec()),
+                (
+                    "set-cookie".into(),
+                    format!("oai-client-auth-session=s:{session_cookie_payload}.sig; Path=/")
+                        .into_bytes(),
+                ),
+            ],
+            body: serde_json::to_vec(&json!({
+                "page": {"type": "consent"}
+            }))
+            .unwrap(),
+        },
+        redirect("http://localhost:1455/auth/callback?code=auto_code&state=__OAUTH_STATE__"),
+        ok(json!({
+            "access_token": new_jwt,
+            "refresh_token": NEW_REFRESH_TOKEN,
+            "id_token": ""
+        })),
+    ]);
+}
+
+#[tokio::test]
+async fn auto_relogin_runs_once_when_the_token_expires_and_pushes_the_result() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    host.forbidden_secrets = vec![
+        TEST_PASSWORD.to_owned(),
+        TEST_TOTP.to_owned(),
+        NEW_ACCESS_TOKEN_SIG.to_owned(),
+        NEW_REFRESH_TOKEN.to_owned(),
+    ];
+    let mut peer = Peer::start(telegram_auto_login_config()).await;
+    save_and_enable_auto_login(&mut peer, &mut host).await;
+
+    let now = cpr_chatgpt_account_panel::clock::now_ms();
+    host.state.insert(
+        ("history".into(), "acct_a/turnstate".into()),
+        (
+            json!({"runs":[{
+                "id":"old-401","model":"gpt-6-astra","trigger":"auto",
+                "started_ms":now-10000,"finished_ms":now-9000,
+                "status":"failed","reason":"上游 unauthorized（HTTP 401）","detail":true
+            }]}),
+            1,
+        ),
+    );
+    host.state.insert(
+        ("runs".into(), "old-401".into()),
+        (
+            json!({
+                "id":"old-401","account_id":"acct_a","method":"turnstate",
+                "model":"gpt-6-astra","trigger":"auto",
+                "started_ms":now-10000,"finished_ms":now-9000,"status":"failed",
+                "error":{"status":401,"kind":"unauthorized","message":"access token expired"}
+            }),
+            1,
+        ),
+    );
+    host.accounts[0]["access_token_expires_at_ms"] =
+        json!(cpr_chatgpt_account_panel::clock::now_ms() - 1);
+    successful_oauth_replies(&mut host, "acct_a");
+    host.http
+        .push_back(ok(json!({"ok": true, "result": {"message_id": 1}})));
+
+    peer.reconcile(&mut host).await;
+
+    assert_eq!(host.accounts[0]["credential_revision"], 8);
+    assert_eq!(host.accounts[0]["credential_state"], "ready");
+    let login_record = host.get("login", "acct_a").unwrap();
+    assert_eq!(login_record["autoLoginEnabled"], true);
+    assert_eq!(login_record["autoLoginLast"]["success"], true);
+    assert!(
+        login_record["autoLoginLast"]["trigger"]
+            .as_str()
+            .unwrap()
+            .contains("访问令牌已过期")
+    );
+    let telegram = host
+        .seen_http
+        .iter()
+        .find(|request| request.url.contains("api.telegram.org"))
+        .expect("auto-login result notification");
+    let sent: Value = serde_json::from_slice(&telegram.body).unwrap();
+    let text = sent["text"].as_str().unwrap();
+    assert!(text.contains("自动重登成功"), "{text}");
+    assert!(text.contains("访问令牌已过期"), "{text}");
+    assert_no_secret_in_value(&sent, &[]);
+    assert!(
+        host.get("history", "acct_a/turnstate")
+            .unwrap()
+            .get("notifications")
+            .is_none()
+    );
+
+    let seen_before = host.seen_http.len();
+    peer.reconcile(&mut host).await;
+    assert_eq!(
+        host.seen_http.len(),
+        seen_before,
+        "a completed auto-login must not repeat for the same credential"
+    );
+}
+
+#[tokio::test]
+async fn auto_relogin_failure_is_latched_and_pushed_to_telegram() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    host.forbidden_secrets = vec![TEST_PASSWORD.to_owned(), TEST_TOTP.to_owned()];
+    let mut peer = Peer::start(telegram_auto_login_config()).await;
+    save_and_enable_auto_login(&mut peer, &mut host).await;
+
+    host.accounts[0]["credential_state"] = json!("expired");
+    host.http
+        .push_back(status(401, json!({"detail": "login rejected"})));
+    host.http
+        .push_back(ok(json!({"ok": true, "result": {"message_id": 2}})));
+
+    peer.reconcile(&mut host).await;
+
+    let login_record = host.get("login", "acct_a").unwrap();
+    assert_eq!(login_record["autoLoginEnabled"], true);
+    assert_eq!(login_record["autoLoginLast"]["success"], false);
+    assert!(
+        login_record["autoLoginLast"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("login_rejected")
+    );
+    let telegram = host
+        .seen_http
+        .iter()
+        .find(|request| request.url.contains("api.telegram.org"))
+        .expect("auto-login failure notification");
+    let sent: Value = serde_json::from_slice(&telegram.body).unwrap();
+    let text = sent["text"].as_str().unwrap();
+    assert!(text.contains("自动重登失败"), "{text}");
+    assert!(text.contains("本次失效周期不会再次自动尝试"), "{text}");
+    assert_no_secret_in_value(&sent, &[]);
+
+    let seen_before = host.seen_http.len();
+    peer.reconcile(&mut host).await;
+    assert_eq!(
+        host.seen_http.len(),
+        seen_before,
+        "a failed credential cycle must not retry every maintenance round"
+    );
+}
+
+#[tokio::test]
+async fn a_recent_probe_401_triggers_one_auto_relogin_attempt() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    let mut peer = Peer::start(telegram_auto_login_config()).await;
+    save_and_enable_auto_login(&mut peer, &mut host).await;
+
+    let now = cpr_chatgpt_account_panel::clock::now_ms();
+    host.state.insert(
+        ("history".into(), "acct_a/turnstate".into()),
+        (
+            json!({"runs":[{
+                "id":"probe-401","model":"gpt-6-astra","trigger":"auto",
+                "started_ms":now-10000,"finished_ms":now-9000,
+                "status":"failed","reason":"上游 unauthorized（HTTP 401）","detail":true
+            }]}),
+            1,
+        ),
+    );
+    host.state.insert(
+        ("runs".into(), "probe-401".into()),
+        (
+            json!({
+                "id":"probe-401","account_id":"acct_a","method":"turnstate",
+                "model":"gpt-6-astra","trigger":"auto",
+                "started_ms":now-10000,"finished_ms":now-9000,"status":"failed",
+                "error":{"status":401,"kind":"unauthorized","message":"access token expired"}
+            }),
+            1,
+        ),
+    );
+    host.http
+        .push_back(status(401, json!({"detail": "login rejected"})));
+    host.http
+        .push_back(ok(json!({"ok": true, "result": {"message_id": 3}})));
+
+    peer.reconcile(&mut host).await;
+
+    let login_record = host.get("login", "acct_a").unwrap();
+    assert_eq!(
+        login_record["autoLoginTriggerKey"], "unauthorized:7",
+        "{login_record}"
+    );
+    assert!(
+        login_record["autoLoginLast"]["trigger"]
+            .as_str()
+            .unwrap()
+            .contains("探测请求返回 401")
+    );
+    let telegram = host
+        .seen_http
+        .iter()
+        .find(|request| request.url.contains("api.telegram.org"))
+        .expect("401 auto-login notification");
+    let sent: Value = serde_json::from_slice(&telegram.body).unwrap();
+    assert!(sent["text"].as_str().unwrap().contains("探测请求返回 401"));
+}
+
+#[tokio::test]
+async fn an_api_401_is_remembered_and_triggers_on_the_next_maintenance_round() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    let mut peer = Peer::start(telegram_auto_login_config()).await;
+    save_and_enable_auto_login(&mut peer, &mut host).await;
+
+    host.http
+        .push_back(status(401, json!({"detail": "token revoked"})));
+    let (code, body) = peer
+        .api("GET", "api/usage", "id=acct_a&days=7", None, &mut host)
+        .await;
+    assert_eq!(code, 502, "{body}");
+    let signal = &host.get("login", "acct_a").unwrap()["autoLoginSignal"];
+    assert_eq!(signal["code"], "oauth_unauthorized", "{signal}");
+    assert_eq!(
+        signal["message"],
+        "ChatGPT 拒绝了当前 OAuth 凭据，请检查 CPR 里的账号授权"
+    );
+
+    host.http
+        .push_back(status(401, json!({"detail": "login rejected"})));
+    host.http
+        .push_back(ok(json!({"ok": true, "result": {"message_id": 4}})));
+    peer.reconcile(&mut host).await;
+
+    let login_record = host.get("login", "acct_a").unwrap();
+    assert!(login_record.get("autoLoginSignal").is_none());
+    assert_eq!(login_record["autoLoginTriggerKey"], "api_unauthorized:7");
+    assert!(
+        login_record["autoLoginLast"]["trigger"]
+            .as_str()
+            .unwrap()
+            .contains("ChatGPT 查询返回 401")
+    );
+}
