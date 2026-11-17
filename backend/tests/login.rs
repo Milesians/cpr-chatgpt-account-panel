@@ -568,7 +568,19 @@ async fn import_refuses_a_missing_or_disabled_proxy() {
     host.cpr_proxies[1].2 = false;
     let mut peer = Peer::start(test_config()).await;
 
-    let (code, body) = import(&mut peer, &mut host, "").await;
+    let (code, body) = peer
+        .api(
+            "POST",
+            "api/login/import",
+            "",
+            Some(json!({"email":"fresh@example.com", "kind":"personal", "password":TEST_PASSWORD})),
+            &mut host,
+        )
+        .await;
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(body["error"]["code"], "proxy_missing");
+
+    let (code, body) = import(&mut peer, &mut host, " ").await;
     assert_eq!(code, 400, "{body}");
     assert_eq!(body["error"]["code"], "proxy_missing");
 
@@ -584,34 +596,47 @@ async fn import_refuses_a_missing_or_disabled_proxy() {
 }
 
 #[tokio::test]
-async fn import_works_through_a_proxy_nobody_uses_yet() {
-    // 新代理没有账号绑着，CPR 里唯一的账号还停用了：照样能导入
-    let mut host = FakeHost::new(&["acct_a"]);
-    host.accounts[0]["enabled"] = json!(false);
-    host.cpr_proxies
-        .push(("proxy-new".into(), "新代理".into(), true));
-    host.http.extend([
-        redirect("https://auth.openai.com/log-in"),
-        status(200, json!({})),
-        ok(json!({"token": "t1", "proofofwork": {"required": false}})),
-        ok(json!({"page": {"type": "password"}})),
-        ok(json!({"token": "t2", "proofofwork": {"required": false}})),
-        redirect("http://127.0.0.1:1455/auth/callback?code=new_code&state=__OAUTH_STATE__"),
-    ]);
-    let mut peer = Peer::start(test_config()).await;
-    let (code, body) = import(&mut peer, &mut host, "proxy-new").await;
-    assert_eq!(code, 200, "{body}");
-    assert_eq!(host.cpr_oauth_starts[0]["outboundProxyId"], "proxy-new");
-    assert_eq!(host.seen_http.len(), 6);
-    assert!(
-        host.seen_http
-            .iter()
-            .all(|r| r.proxy_id.as_deref() == Some("proxy-new"))
-    );
-    assert_eq!(
-        host.cpr_account_proxies[body["accountId"].as_str().unwrap()].as_deref(),
-        Some("proxy-new")
-    );
+async fn import_uses_explicit_direct_or_unbound_proxy_without_borrowing_an_account() {
+    for proxy_id in ["", "proxy-new"] {
+        let mut host = FakeHost::new(&[]);
+        if !proxy_id.is_empty() {
+            host.cpr_proxies
+                .push((proxy_id.into(), "新代理".into(), true));
+        }
+        host.http.extend([
+            redirect("https://auth.openai.com/log-in"),
+            status(200, json!({})),
+            ok(json!({"token": "t1", "proofofwork": {"required": false}})),
+            ok(json!({"page": {"type": "password"}})),
+            ok(json!({"token": "t2", "proofofwork": {"required": false}})),
+            redirect("http://127.0.0.1:1455/auth/callback?code=new_code&state=__OAUTH_STATE__"),
+        ]);
+        let mut peer = Peer::start(test_config()).await;
+        let (code, body) = import(&mut peer, &mut host, proxy_id).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(host.cpr_oauth_starts[0]["outboundProxyId"], proxy_id);
+        assert_eq!(host.seen_http.len(), 6);
+        let proxy = (!proxy_id.is_empty()).then_some(proxy_id);
+        assert!(
+            host.seen_http
+                .iter()
+                .all(|r| r.proxy_id.as_deref() == proxy && r.account_id.is_empty())
+        );
+        assert_eq!(
+            host.calls
+                .iter()
+                .filter(|c| *c == "host.http.do_stream")
+                .count(),
+            if proxy.is_none() { 6 } else { 0 }
+        );
+        if proxy.is_none() {
+            assert!(!host.calls.iter().any(|c| c == "host.proxies.list"));
+        }
+        assert_eq!(
+            host.cpr_account_proxies[body["accountId"].as_str().unwrap()].as_deref(),
+            proxy
+        );
+    }
 }
 
 #[tokio::test]
@@ -631,38 +656,43 @@ async fn import_reports_a_proxy_disabled_mid_login() {
 }
 
 #[tokio::test]
-async fn browser_login_can_use_a_proxy_nobody_uses_yet() {
-    let mut host = FakeHost::new(&["acct_a"]);
-    host.cpr_proxies
-        .push(("proxy-new".into(), "新代理".into(), true));
-    let mut peer = Peer::start(test_config()).await;
-    let (code, body) = peer
-        .api(
-            "POST",
-            "api/login/oauth/start",
-            "",
-            Some(json!({"email": "fresh@example.com", "kind": "personal", "proxyId": "proxy-new"})),
-            &mut host,
-        )
-        .await;
-    assert_eq!(code, 200, "{body}");
-    // CPR 给的是桌面登录入口；回调地址要用它内层的 redirect_uri，而不是插件配置的 localhost
-    assert!(
-        body["authorizeUrl"]
-            .as_str()
-            .unwrap()
-            .starts_with("https://chatgpt.com/codex/desktop-auth?authorize_url=")
-    );
-    assert_eq!(body["redirectUrl"], "http://127.0.0.1:1455/auth/callback");
-    assert_eq!(host.cpr_oauth_starts[0]["outboundProxyId"], "proxy-new");
-    assert!(
-        host.seen_http.is_empty(),
-        "browser login sends nothing itself"
-    );
+async fn browser_login_completes_on_the_selected_egress() {
+    for proxy_id in ["", "proxy-new"] {
+        let mut host = FakeHost::new(&[]);
+        if !proxy_id.is_empty() {
+            host.cpr_proxies
+                .push((proxy_id.into(), "新代理".into(), true));
+        }
+        let mut peer = Peer::start(test_config()).await;
+        let (code, body) = peer
+            .api(
+                "POST",
+                "api/login/oauth/start",
+                "",
+                Some(
+                    json!({"email": "fresh@example.com", "kind": "personal", "proxyId": proxy_id}),
+                ),
+                &mut host,
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        // CPR 给的是桌面登录入口；回调地址要用它内层的 redirect_uri，而不是插件配置的 localhost
+        assert!(
+            body["authorizeUrl"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://chatgpt.com/codex/desktop-auth?authorize_url=")
+        );
+        assert_eq!(body["redirectUrl"], "http://127.0.0.1:1455/auth/callback");
+        assert_eq!(host.cpr_oauth_starts[0]["outboundProxyId"], proxy_id);
+        assert!(
+            host.seen_http.is_empty(),
+            "browser login sends nothing itself"
+        );
 
-    // 浏览器里登录完，把 127.0.0.1 的回调链接贴回来；state 取自内层链接
-    let state = host.last_oauth_state.clone();
-    let (code, done) = peer
+        // 浏览器里登录完，把 127.0.0.1 的回调链接贴回来；state 取自内层链接
+        let state = host.last_oauth_state.clone();
+        let (code, done) = peer
         .api(
             "POST",
             "api/login/oauth/complete",
@@ -675,12 +705,17 @@ async fn browser_login_can_use_a_proxy_nobody_uses_yet() {
             &mut host,
         )
         .await;
-    assert_eq!(code, 200, "{done}");
-    assert_eq!(host.cpr_oauth_completes.len(), 1);
-    assert!(
-        host.seen_http.is_empty(),
-        "browser login sends nothing itself"
-    );
+        assert_eq!(code, 200, "{done}");
+        assert_eq!(host.cpr_oauth_completes.len(), 1);
+        assert_eq!(
+            host.cpr_account_proxies[done["accountId"].as_str().unwrap()].as_deref(),
+            (!proxy_id.is_empty()).then_some(proxy_id),
+        );
+        assert!(
+            host.seen_http.is_empty(),
+            "browser login sends nothing itself"
+        );
+    }
 }
 
 #[tokio::test]

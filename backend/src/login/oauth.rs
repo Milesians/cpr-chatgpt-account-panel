@@ -1,7 +1,6 @@
 //! OpenAI OAuth PKCE 登录状态机、手动 OAuth 授权链接与令牌交换
 //!
-//! 全部认证与 Sentinel 请求经 [`Egress`] 选定的出口发出：`host.http.proxy`（按代理 ID）
-//! 或 `host.http.account`（账号在 CPR 里的实际出口），绝不调用 `host.http.do`。
+//! 全部认证与 Sentinel 请求经 [`Egress`] 选定的出口发出。
 
 use std::collections::BTreeMap;
 
@@ -34,6 +33,8 @@ const MAX_STEPS: usize = 24;
 /// 登录请求的出口
 #[derive(Debug, Clone)]
 pub enum Egress {
+    /// 新账号明确选了直连；管理调用没有账号或代理上下文
+    Direct,
     /// `host.http.proxy`：按代理 ID 现读配置，不依赖任何账号；代理不存在、停用或连不上都失败，不回退直连
     Proxy { proxy_id: String },
     /// `host.http.account`：账号在 CPR 里的实际出口（绑定的代理；没绑或代理停用时直连），
@@ -1120,6 +1121,7 @@ async fn raw_http(
         headers,
     };
     let response = match egress {
+        Egress::Direct => host.http(request, body).await,
         Egress::Proxy { proxy_id } => {
             host.proxy_http(
                 ProxyHttpRequest {
@@ -1171,6 +1173,11 @@ fn map_host_fault(egress: &Egress, stage: &'static str, fault: &PluginFault) -> 
         return LoginError::new(stage, "network_timeout", "连接 OpenAI 认证服务超时");
     }
     match egress {
+        Egress::Direct => LoginError::new(
+            stage,
+            "network",
+            "CPR 直连 OpenAI 认证服务失败，请检查服务器网络",
+        ),
         // 宿主按 ID 解析代理：停用或 ID 不合法是 InvalidInput，不存在是 Rejected，连不上是 Upstream
         Egress::Proxy { .. } => match fault.code {
             ErrorCode::InvalidInput => LoginError::new(

@@ -166,14 +166,15 @@ impl<'a> Admin<'a> {
         Ok(detail.account.proxy_id())
     }
 
-    /// 发起新建 OpenAI OAuth 账号流程（不带 `accountId`，带 `outboundProxyId`，`name` 为邮箱）
+    /// 发起新建 OpenAI OAuth 账号流程（不带 `accountId`，`name` 为邮箱）。
+    /// CPR 将空 `outboundProxyId` 解析为明确直连。
     ///
     /// # Errors
     /// 管理接口失败时返回原因
     pub async fn oauth_start(
         &self,
         email: &str,
-        outbound_proxy_id: &str,
+        outbound_proxy_id: Option<&str>,
     ) -> Result<OAuthStartData, String> {
         self.call(
             "POST",
@@ -182,7 +183,7 @@ impl<'a> Admin<'a> {
             Some(json!({
                 "provider": "openai",
                 "name": email,
-                "outboundProxyId": outbound_proxy_id,
+                "outboundProxyId": outbound_proxy_id.unwrap_or_default(),
             })),
         )
         .await

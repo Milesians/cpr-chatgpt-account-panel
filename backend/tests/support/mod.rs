@@ -93,7 +93,7 @@ pub struct FakeHost {
     pub cpr_next_plan_type: Option<String>,
     /// 下一次 `host.http.proxy` 之前把这个代理停用（模拟核对之后、发请求之前被管理员停用）
     pub disable_proxy_before_http: Option<String>,
-    cpr_pending_flows: HashMap<String, (String, String, String)>,
+    cpr_pending_flows: HashMap<String, (String, Option<String>, String)>,
     streams: HashMap<String, Vec<u8>>,
     next_version: u64,
 }
@@ -191,8 +191,10 @@ impl FakeHost {
                     "oauth/start for new import must not send accountId: {body}"
                 );
                 let name = body["name"].as_str().unwrap().to_owned();
-                let proxy_id = body["outboundProxyId"].as_str().unwrap().to_owned();
-                assert!(!proxy_id.is_empty(), "outboundProxyId must be non-empty");
+                let proxy_id = body["outboundProxyId"]
+                    .as_str()
+                    .expect("explicit import egress");
+                let proxy_id = (!proxy_id.is_empty()).then(|| proxy_id.to_owned());
                 let idx = self.cpr_oauth_starts.len();
                 let flow_id = format!("flow_{idx}");
                 let state = format!("cpr_oauth_state_{idx}");
@@ -252,7 +254,7 @@ impl FakeHost {
                     "access_token_expires_at_ms": 4_102_444_800_000_i64,
                     "next_refresh_at_ms": null,
                 }));
-                self.cpr_account_proxies.insert(id.clone(), Some(proxy_id));
+                self.cpr_account_proxies.insert(id.clone(), proxy_id);
                 ok(json!({ "accountId": id }))
             }
             _ => panic!("plugin called an unexpected CPR admin route: {method} {path}"),
@@ -548,6 +550,9 @@ impl FakeHost {
                     Some(_) => {}
                 }
                 self.serve_http(params, payload, String::new(), 0, Some(proxy_id))
+            }
+            "host.http.do_stream" => {
+                self.serve_http(&json!({"request": params}), payload, String::new(), 0, None)
             }
             "host.http.account" => {
                 let account_id = params["account_id"].as_str().unwrap().to_owned();

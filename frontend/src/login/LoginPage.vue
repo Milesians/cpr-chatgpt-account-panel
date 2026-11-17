@@ -38,9 +38,9 @@ interface ImportExecutionState {
   choices?: LoginChoice[]
 }
 
-// 新账号绑定的 CPR 代理；登录请求经 host.http.proxy 直接从它发出
+// null 表示尚未选择，空字符串表示明确直连。
 const proxies = ref<ImportProxy[]>([])
-const proxyId = ref('')
+const proxyId = ref<string | null>(null)
 const loadingProxies = ref(false)
 const proxiesError = ref('')
 
@@ -87,6 +87,16 @@ const importAction = computed(() => resolveImportAction({
 }))
 
 const hasImportProgress = computed(() => importing.value || Object.keys(rowStates.value).length > 0)
+const missingProxy = computed(() => proxyId.value !== null && proxyId.value !== '' && !proxies.value.some(p => p.id === proxyId.value))
+
+function selectedEgress(): string {
+  const id = proxyId.value
+  if (id === null)
+    throw new Error('请选择直连或一个可用的出站代理')
+  if (id && !proxies.value.some(p => p.id === id && p.enabled))
+    throw new Error('所选代理不可用，请重新选择出口')
+  return id
+}
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 let previewSeq = 0
@@ -127,7 +137,7 @@ async function loadProxies() {
   try {
     const r = await loginApi.proxies()
     proxies.value = r.proxies
-    if (!proxies.value.some(p => p.id === proxyId.value && p.enabled)) {
+    if (proxyId.value === null) {
       const best = r.proxies.find(p => p.enabled)
       proxyId.value = best?.id ?? ''
     }
@@ -171,8 +181,13 @@ async function handleStartImport() {
     importError.value = importAction.value.title ?? '没有可导入的行'
     return
   }
-  if (!proxyId.value) {
-    importError.value = '先选一个出站代理，新账号会绑在它上面'
+  let egress: string | undefined
+  try {
+    if (queue.some(task => task.action === 'create'))
+      egress = selectedEgress()
+  }
+  catch (e) {
+    importError.value = (e as Error).message
     return
   }
 
@@ -190,7 +205,7 @@ async function handleStartImport() {
       break
     rowStates.value[task.line] = { status: 'running' }
     try {
-      await executeImportTask(task)
+      await executeImportTask(task, undefined, egress)
       succeeded += 1
     }
     catch {
@@ -208,14 +223,14 @@ async function handleStartImport() {
   emit('accountsChanged')
 }
 
-async function executeImportTask(task: QueuedImportTask, choice?: LoginChoice) {
+async function executeImportTask(task: QueuedImportTask, choice?: LoginChoice, egress?: string) {
   try {
     const res = await loginApi.importAccount({
       email: task.email,
       password: task.password,
       ...(task.totp ? { totp: task.totp } : {}),
       kind: task.kind,
-      proxyId: proxyId.value,
+      ...(task.action === 'create' ? { proxyId: egress ?? selectedEgress() } : {}),
       ...(choice?.kind === 'workspace' ? { workspaceId: choice.id } : {}),
       ...(choice?.kind === 'organization' ? { organizationId: choice.id } : {}),
       replaceExisting: task.action === 'update',
@@ -272,7 +287,7 @@ async function toggleManualForImport(line: number, email: string, kind: string) 
   manualRedirectUrl.value = ''
   manualBusy.value = true
   try {
-    const r = await loginApi.oauthStart({ email, kind, proxyId: proxyId.value })
+    const r = await loginApi.oauthStart({ email, kind, proxyId: selectedEgress() })
     manualAuthUrl.value = r.authorizeUrl
     manualRedirectUrl.value = r.redirectUrl
   }
@@ -364,9 +379,11 @@ onMounted(loadProxies)
       <div class="flex flex-wrap items-center justify-between gap-3 text-xs">
         <div class="flex flex-wrap items-center gap-4">
           <label class="inline-flex items-center gap-2 text-cp-text-secondary">
-            <span class="whitespace-nowrap">新账号用哪个代理：</span>
-            <select v-model="proxyId" class="cp-select w-72" aria-label="新账号用哪个代理" :disabled="loadingProxies">
-              <option v-if="!proxies.length" value="">{{ loadingProxies ? '正在读取代理…' : 'CPR 里没有代理' }}</option>
+            <span class="whitespace-nowrap">新账号出口：</span>
+            <select v-model="proxyId" class="cp-select w-72" aria-label="新账号出口" :disabled="loadingProxies || importing">
+              <option v-if="proxyId === null" :value="null" disabled>{{ loadingProxies ? '正在读取代理…' : '选择直连或代理' }}</option>
+              <option value="">直连（不使用代理）</option>
+              <option v-if="missingProxy" :value="proxyId" disabled>原代理已移除，请重新选择</option>
               <option v-for="p in proxies" :key="p.id" :value="p.id" :disabled="!p.enabled">
                 {{ proxyLabel(p) }}
               </option>

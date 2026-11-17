@@ -862,14 +862,15 @@ try {
   assert.equal(loginPageStats.hasPreviewBtn, false, '「解析并预览」按钮应已删除')
 
   const proxyPick = await evaluate(`
-    const sel = document.querySelector('select[aria-label="新账号用哪个代理"]');
+    const sel = document.querySelector('select[aria-label="新账号出口"]');
     return {
       value: sel.value,
       options: [...sel.options].map(o => ({ text: o.textContent.trim(), disabled: o.disabled })),
     };
   `)
   assert.equal(proxyPick.value, 'px-new', '默认选第一个启用的代理')
-  assert.deepEqual(proxyPick.options.map(o => o.disabled), [true, false, false], '停用的代理不能选')
+  assert.match(proxyPick.options[0].text, /直连/)
+  assert.deepEqual(proxyPick.options.map(o => o.disabled), [false, true, false, false], '直连可选，停用的代理不能选')
 
   await capture('10-login-import-light', 1440, 1100, 'light')
   await capture('11-login-import-dark', 1440, 1100, 'dark')
@@ -897,6 +898,19 @@ try {
   const retried = await evaluate(`return { last: window.__IMPORTS__.at(-1), text: document.body.textContent }`)
   assert.equal(retried.last.workspaceId, 'ws-acme', '点候选后带着工作区 ID 重试')
   assert.equal(retried.last.email, 'new-team@acme.io')
+
+  const direct = await evaluate(`
+    const select = document.querySelector('select[aria-label="新账号出口"]');
+    select.value = '';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    const earlier = window.__IMPORTS__.length;
+    [...document.querySelectorAll('button')].find(b => b.textContent.includes('导入 2 个')).click();
+    await new Promise(r => setTimeout(r, 400));
+    return { imports: window.__IMPORTS__.slice(earlier), egress: select.value };
+  `)
+  assert.equal(direct.imports.length, 2)
+  assert.ok(direct.imports.every(i => i.proxyId === ''))
+  assert.equal(direct.egress, '', '刷新代理列表后保留用户选的直连')
 
   assert.deepEqual(errors, [], `页面运行不应有未捕获异常: ${errors.join('; ')}`)
   console.log('UI check passed. Generated screenshots:')

@@ -506,7 +506,7 @@ struct OAuthStartRequest {
     account_id: String,
     email: String,
     kind: String,
-    proxy_id: String,
+    proxy_id: Option<String>,
 }
 
 async fn handle_oauth_start(
@@ -576,10 +576,10 @@ async fn handle_oauth_start(
         .map_err(|code| ApiError::new(400, code, "账号类型无效"))?
         .to_owned();
     let admin = Admin::new(host);
-    // 浏览器手动登录不经插件发请求，换码由 CPR 自己经这个代理完成
-    let proxy_id = import_proxy(host, &req.proxy_id).await?;
+    // 浏览器负责登录，CPR 按所选出口换码。
+    let proxy_id = import_proxy(host, req.proxy_id.as_deref()).await?;
     let start = admin
-        .oauth_start(&email, &proxy_id)
+        .oauth_start(&email, proxy_id.as_deref())
         .await
         .map_err(|msg| ApiError::new(502, "admin_error", msg))?;
 
@@ -797,7 +797,7 @@ struct ImportRequest {
     password: String,
     totp: String,
     kind: String,
-    proxy_id: String,
+    proxy_id: Option<String>,
     workspace_id: String,
     organization_id: String,
     replace_existing: bool,
@@ -883,18 +883,15 @@ async fn handle_import(
         String::new()
     };
 
-    // 1. 选的代理要在 CPR 里启用；登录请求经 host.http.proxy 直接从它出去，不借任何账号，也不建直连账号
     let admin = Admin::new(host);
-    let outbound_proxy_id = import_proxy(host, &req.proxy_id).await?;
-    let egress = Egress::Proxy {
-        proxy_id: outbound_proxy_id.clone(),
-    };
+    let outbound_proxy_id = import_proxy(host, req.proxy_id.as_deref()).await?;
 
-    // 2. 经 CPR 管理 API 调 POST /api/admin/accounts/oauth/start（不带 accountId，带 outboundProxyId，name 写邮箱）
+    // 登录和 CPR 换码使用同一个显式出口。
     let oauth_start = admin
-        .oauth_start(&email, &outbound_proxy_id)
+        .oauth_start(&email, outbound_proxy_id.as_deref())
         .await
         .map_err(|msg| ApiError::new(502, "admin_error", msg))?;
+    let egress = outbound_proxy_id.map_or(Egress::Direct, |proxy_id| Egress::Proxy { proxy_id });
 
     let (identity, _, _) = ensure_identity(&staged_rec.identity);
     let input = LoginInput {
@@ -908,7 +905,7 @@ async fn handle_import(
         redirect_url: login.redirect_url.clone(),
     };
 
-    // 3. 经所选代理跑完登录步骤，截下回调地址交给 POST /api/admin/accounts/oauth/complete
+    // 经所选出口跑完登录步骤，截下回调地址交给 POST /api/admin/accounts/oauth/complete
     let out = match login_with_authorize_url(host, &egress, &input, &oauth_start.authorization_url)
         .await
     {
@@ -1021,16 +1018,21 @@ async fn handle_proxies(host: &HostClient) -> Result<Value, ApiError> {
     Ok(json!({ "proxies": list }))
 }
 
-/// 核对导入选的代理：要在 CPR 里存在且启用（发请求时宿主还会再核对一次）
-async fn import_proxy(host: &HostClient, proxy_id: &str) -> Result<String, ApiError> {
-    let proxy_id = proxy_id.trim();
-    if proxy_id.is_empty() {
+/// 空字符串表示明确选择直连；缺失或无效的代理不能悄悄回退。
+async fn import_proxy(
+    host: &HostClient,
+    proxy_id: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    if proxy_id == Some("") {
+        return Ok(None);
+    }
+    let Some(proxy_id) = proxy_id.map(str::trim).filter(|id| !id.is_empty()) else {
         return Err(ApiError::new(
             400,
             "proxy_missing",
-            "先选一个出站代理，新账号会绑在它上面",
+            "先选择直连或一个可用的出站代理",
         ));
-    }
+    };
     let proxies = host::proxies(host).await?;
     let Some(proxy) = proxies.iter().find(|p| p.id == proxy_id) else {
         return Err(ApiError::new(
@@ -1046,7 +1048,7 @@ async fn import_proxy(host: &HostClient, proxy_id: &str) -> Result<String, ApiEr
             "这个代理在 CPR 里已停用，请换一个",
         ));
     }
-    Ok(proxy_id.to_owned())
+    Ok(Some(proxy_id.to_owned()))
 }
 
 /// 已有账号重登的出口

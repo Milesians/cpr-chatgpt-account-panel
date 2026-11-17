@@ -73,7 +73,7 @@ export interface QueuedImportTask {
 
 const ERROR_LABELS: Record<string, string> = {
   admin_error: 'CPR 管理接口调用失败',
-  proxy_missing: '没选代理',
+  proxy_missing: '没选出口',
   proxy_unavailable: '代理不可用',
   mfa_issue_failed: '发起 2FA 验证失败',
   source_proxy_unavailable: '经代理连不上 OpenAI',

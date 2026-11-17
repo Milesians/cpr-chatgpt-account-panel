@@ -90,11 +90,11 @@
   - 绑着启用的已保存代理：经管理接口 `GET /api/admin/accounts/detail` 读出代理 ID，按 ID 经 `host.http.proxy` 发，不带账号凭据版本，CPR 中途刷新令牌不会打断登录
   - 没绑代理、绑的代理已停用（CPR 这时直连）、用内联代理地址，或读不到绑定：经账号自己的 `host.http.account`
   - 停用的账号不能重登
-- **导入账号（选代理导入）**：
-  1. 粘贴文本后自动防抖预览（统计总行数、待新建、已在 CPR、跳过），选新账号用哪个 CPR 代理，点“导入 N 个”逐条执行。
+- **导入账号（直连或选代理）**：
+  1. 粘贴文本后自动防抖预览（统计总行数、待新建、已在 CPR、跳过），为新账号选直连或 CPR 代理，点“导入 N 个”逐条执行。
   2. 代理列表经宿主的 `host.proxies.list` 读出，只有代理的 ID、名称和是否启用，没有地址和认证。停用的代理不能选。
-  3. 登录请求经 `host.http.proxy` 按所选代理的 ID 直接发出（宿主每次现读代理配置，不注入任何认证；代理不存在、停用或连不上都失败，不回退直连）。不借任何现有账号，新建的、还没有账号在用的代理也能直接导入。
-  4. 调 CPR 管理接口 `POST /api/admin/accounts/oauth/start`（不带 `accountId`，带所选代理的 `outboundProxyId`，`name` 为邮箱），经所选代理跑完登录步骤截下回调地址，交给 `POST /api/admin/accounts/oauth/complete`，由 CPR 自己经该代理换码并建好已绑定代理的新账号（不调 `host.auth.save Create`）。
+  3. 选直连时，自动登录请求由 CPR 服务器直接发出；选代理时经 `host.http.proxy` 按 ID 发出，代理无效时不会回退直连。两种方式都不借现有账号。
+  4. 调 CPR 管理接口 `POST /api/admin/accounts/oauth/start`（不带 `accountId`，`outboundProxyId` 为空字符串表示直连，`name` 为邮箱）。自动登录或浏览器手动登录得到回调地址后，交给 `POST /api/admin/accounts/oauth/complete`，由 CPR 按所选出口换码并创建账号，直连账号不绑定代理（不调 `host.auth.save Create`）。
   5. 建号完成后核对新账号邮箱，将明文密码与 2FA 保存到新账号 ID 下，并用 `host.state.delete`（带 `expectedVersion`）删掉 `email:<邮箱>:<kind>` 暂存记录。
 - **CPR 管理接口**：经 `host.http.dispatch` 调宿主自己的路由（只传 `/api/admin/...` 相对路径），宿主给子请求注入插件身份，不需要管理 API Key，也不出本机网络。v0.1.5 起清单里不再有 v0.1.3 及以前的 `cprAdminUrl`、`cprAdminApiKey`，从旧版本升级时按发布说明删掉它们。
 - **多个工作区**：账号有多个工作区或组织时，错误里带上候选（`details.choices`），详情页和导入行直接点选重试，不用手抄 ID。
