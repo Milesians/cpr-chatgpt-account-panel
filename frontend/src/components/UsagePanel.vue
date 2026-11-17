@@ -4,11 +4,10 @@ import { ZButton, ZSegmented } from '@codex-proxy/ui'
 import { RefreshCw, Sparkles } from '@lucide/vue'
 import { computed, ref } from 'vue'
 import { api } from '../api'
-import { compact, dateTime, percent, shortDate, unitNote, windowName } from '../format'
+import { compact, dateTime, percent, shortDate, unitNote } from '../format'
 import { featureLabel, isWork, slotColour, slotOf, surfaceLabel } from '../surfaces'
 import DailyChart from './DailyChart.vue'
 import ShareBars from './ShareBars.vue'
-import WindowMeter from './WindowMeter.vue'
 
 const props = defineProps<{ accountId: string, summary: UsageSummary | null, blocked: string | null }>()
 const emit = defineEmits<{ checked: [summary: UsageSummary] }>()
@@ -42,8 +41,8 @@ async function load() {
 
 const work = computed(() => usage.value?.work ?? null)
 const unit = computed(() => unitNote(usage.value?.breakdown?.unit))
-const problems = computed(() => Object.entries(usage.value?.problems ?? {}))
-const partName: Record<string, string> = { limits: '额度窗口', tokens: '每日 Token', breakdown: '用量明细' }
+const problems = computed(() => Object.entries(usage.value?.problems ?? {}).filter(([part]) => part !== 'limits'))
+const partName: Record<string, string> = { tokens: '每日 Token', breakdown: '用量明细' }
 
 const tokenDaily = computed(() => usage.value?.tokens?.daily ?? [])
 const tokenMax = computed(() => Math.max(0, ...tokenDaily.value.map(d => d.tokens)))
@@ -111,17 +110,6 @@ function surfaceColour(key: string): string {
       <p v-else-if="!work" class="banner banner-warn">
         用量明细未读到，判断不了 Work 有没有用量
       </p>
-
-      <div v-if="usage.limits?.windows.length" class="meters">
-        <WindowMeter
-          v-for="w in usage.limits.windows"
-          :key="w.window_minutes"
-          :label="windowName(w.window_minutes)"
-          :used="w.used_percent"
-          :resets-at="w.resets_at_ms"
-        />
-        <span v-if="usage.limits.limit_reached" class="chip-bad">已触顶</span>
-      </div>
 
       <template v-if="usage.breakdown">
         <DailyChart :days="usage.breakdown.days" :unit="unit" />

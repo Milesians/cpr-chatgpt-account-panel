@@ -65,6 +65,20 @@ async fn list_reads_cpr_facts_without_credentials_or_upstream() {
         host.calls
     );
     assert!(host.seen_http.is_empty());
+
+    host.calls.clear();
+    let (code, body) = peer
+        .api(
+            "GET",
+            "api/accounts",
+            "include_quota=false",
+            None,
+            &mut host,
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert!(body["accounts"][0]["quota"].is_null());
+    assert!(!host.calls.iter().any(|c| c == "host.data.quota.get"));
 }
 
 #[tokio::test]
@@ -259,6 +273,11 @@ async fn first_billing_page_records_the_newest_payment_and_grace_period() {
     assert_eq!(body["history"]["subscription"]["status"], "past_due");
     let saved = host.get("payments", "acct_a").unwrap();
     assert_eq!(saved["status"], "failed");
+    assert_eq!(saved["subscription_expires_at_ms"], 1_793_491_200_000_i64);
+    assert_eq!(
+        saved["subscription_checked_at_ms"],
+        body["history"]["subscription"]["checked_at_ms"]
+    );
     assert_eq!(saved["grace_ends_at_ms"], 1_900_000_000_000_i64);
     assert!(saved.get("document_url").is_none());
 
@@ -272,6 +291,20 @@ async fn first_billing_page_records_the_newest_payment_and_grace_period() {
     assert_eq!(host.seen_http.len(), 3);
     assert!(host.seen_http[2].path().ends_with("&cursor=c2"));
     assert_eq!(host.get("payments", "acct_a").unwrap()["status"], "failed");
+
+    // 能读到新账单但没读到订阅，不抹去上一次查到的到期日和宽限期。
+    host.http
+        .extend([ok(history("paid", "")), status(500, json!({}))]);
+    let (code, body) = peer
+        .api("GET", "api/billing", "id=acct_a", None, &mut host)
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert!(body["history"]["subscription_problem"].is_string());
+    let payment = &body["payment"];
+    assert_eq!(payment["status"], "paid");
+    assert_eq!(payment["subscription_status"], "past_due");
+    assert_eq!(payment["subscription_expires_at_ms"], 1_793_491_200_000_i64);
+    assert_eq!(payment["grace_ends_at_ms"], 1_900_000_000_000_i64);
 }
 
 #[tokio::test]

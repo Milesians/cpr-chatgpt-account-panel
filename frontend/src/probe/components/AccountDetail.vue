@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import type { AccountDetail, Counts, Method, Models, Run, Schedule, Summary } from '../api'
 import { ZButton, ZDialog, ZEmpty, ZInputNumber, ZSegmented, ZSelect, ZSwitch, ZTag } from '@codex-proxy/ui'
-import { ArrowLeft } from '@lucide/vue'
 import { computed, onMounted, ref, shallowRef } from 'vue'
 import { api, methodLabel, methods, scheduledMethods } from '../api'
 import { ago, dateTime, levelLabel, levelTag, rate, span, statusLabel } from '../format'
@@ -11,8 +10,7 @@ import ProbeDialog from './ProbeDialog.vue'
 import RunView from './RunView.vue'
 import TrendChart from './TrendChart.vue'
 
-const props = defineProps<{ accountId: string, models: Models | null, initialRun?: string, backLabel?: string }>()
-const emit = defineEmits<{ back: [] }>()
+const props = defineProps<{ accountId: string, models: Models | null, initialRun?: string }>()
 
 const detail = shallowRef<AccountDetail | null>(null)
 const error = ref('')
@@ -112,22 +110,6 @@ onMounted(async () => {
 
 <template>
   <div class="probe-detail-page">
-    <header class="detail-header">
-      <ZButton variant="text" @click="emit('back')">
-        <ArrowLeft class="size-4" aria-hidden="true" /> {{ backLabel ?? '返回探测总览' }}
-      </ZButton>
-      <template v-if="detail">
-        <div class="min-w-0">
-          <h1 class="m-0 truncate text-lg font-semibold text-cp-text">{{ detail.account.email || detail.account.name }}</h1>
-          <p class="m-0 mt-0.5 flex flex-wrap items-center gap-2 text-cp-xs text-cp-text-tertiary">
-            <span v-if="detail.account.email && detail.account.name !== detail.account.email">{{ detail.account.name }}</span>
-            <span v-if="detail.account.plan_type" class="account-plan">{{ detail.account.plan_type }}</span>
-            <span v-if="!detail.account.enabled" class="text-cp-error">已停用</span>
-            <span v-if="!detail.account.supported">不支持探测</span>
-          </p>
-        </div>
-      </template>
-    </header>
     <p v-if="error" class="m-0 rounded-cp bg-cp-error-container px-3 py-2 text-cp-sm text-cp-error-on-container">{{ error }}</p>
     <p v-if="saveError" class="m-0 rounded-cp bg-cp-warning-container px-3 py-2 text-cp-sm text-cp-warning-on-container">{{ saveError }}</p>
     <div v-if="!detail && !error" class="monitor-loading">正在读取…</div>

@@ -1,8 +1,4 @@
-// Headless UI verification & screenshot generator for cpr-chatgpt-account-panel.
-// Renders the built frontend bundle against a mocked CPR host bridge across
-// light, dark, and 390px narrow viewports, verifies layout/DOM invariants,
-// and saves persistent screenshots for List, Batch Relogin, Detail (Usage & Billing),
-// Detail (Devices & Login), and Import Account pages.
+// Headless verification of the unified list, account detail tabs and import flow.
 
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
@@ -499,7 +495,10 @@ window.codexProxyPlugin = {
     if (fn.startsWith('api/probe/') && __MOCK__.probe[fn.slice('api/probe/'.length)])
       return __reply(__MOCK__.probe[fn.slice('api/probe/'.length)]);
     if (fn === 'api/usage') return __reply(__MOCK__.usage);
-    if (fn === 'api/subscription') return __reply(__MOCK__.subscription);
+    if (fn === 'api/subscription') {
+      if (query.id === 'acc-work') return __reply({ ...__MOCK__.subscription, payment: __MOCK__.billing.payment });
+      return __reply({ payment: { status: 'paid', subscription_status: 'active', checked_at_ms: Date.now(), subscription_expires_at_ms: Date.now() + 604800000, subscription_will_renew: true } });
+    }
     if (fn === 'api/billing') return __reply(__MOCK__.billing);
     if (fn === 'api/devices') return __reply(__MOCK__.devices);
     if (fn === 'api/devices/sign-out') return __reply(__MOCK__.signOutVoided);
@@ -695,167 +694,99 @@ try {
   await cdp('Page.navigate', { url: baseUrl }, sessionId)
   await sleep(600)
 
-  // ── 1. 列表页验收与截图 (Light / Dark / 390px) ──
   const listStats = await evaluate(`
-    const chips = [...document.querySelectorAll('.filter-chip')].map(el => el.textContent.replace(/\\s+/g, ' ').trim());
-    const rows = document.querySelectorAll('.monitor-row').length;
-    const actionButtons = [...document.querySelectorAll('.row-col-actions button')].map(b => b.textContent.trim());
-    const paymentText = [...document.querySelectorAll('.row-col-payment')].map(el => el.textContent.replace(/\\s+/g, ' ').trim());
-    const headerText = document.querySelector('.panel-header')?.textContent.replace(/\\s+/g, ' ').trim() ?? '';
-    const lightBg = getComputedStyle(document.querySelector('.monitor-list')).backgroundColor;
-    return { chips, rows, actionButtons, paymentText, headerText, lightBg };
+    const rows = [...document.querySelectorAll('.probe-monitor-row')];
+    const work = rows.find(row => row.dataset.account === 'acc-work');
+    const paid = rows.find(row => row.dataset.account === 'acc-codex');
+    return {
+      count: rows.length, work: work?.innerText, paid: paid?.innerText,
+      cells: work?.querySelectorAll('.probe-cell').length,
+      stripHeight: work?.querySelector('.probe-strip').getBoundingClientRect().height,
+      lightBg: getComputedStyle(document.querySelector('.probe-monitor-list')).backgroundColor,
+      text: document.body.innerText,
+    };
   `)
-  assert.equal(listStats.rows, 4, '列表应渲染 4 个账号监控行')
-  assert.equal(listStats.chips.length, 6, '列表顶部应有 6 个分类计数筛选芯片（含宽限期）')
-  assert.ok(listStats.chips.some(c => c.includes('宽限期')), '筛选芯片应显示「宽限期」')
-  assert.ok(listStats.chips.some(c => c.includes('无法查询')), '筛选芯片应显示「无法查询」')
-  assert.ok(listStats.headerText.includes('1 个宽限期'), '页头摘要应提示宽限期账号数')
-  assert.ok(listStats.paymentText.some(t => /宽限期至 .* · 剩 4 天/.test(t)), '列表行内若查到宽限期应直接显示截止日与剩余天数')
-  assert.ok(listStats.actionButtons.includes('免输重登'), '令牌过期且有已存密码的账号行应显示「免输重登」')
-  assert.ok(listStats.actionButtons.includes('去重新登录'), '令牌过期且未存密码的账号行应显示「去重新登录」')
+  assert.equal(listStats.count, 4, '探测、订阅共用一个账号列表')
+  assert.match(listStats.work, /降智/)
+  assert.match(listStats.work, /付款逾期/)
+  assert.match(listStats.work, /宽限期至 .*剩 4 天/)
+  assert.match(listStats.paid, /未查订阅/, '旧的已支付账单不能当作订阅有效')
+  assert.match(listStats.text, /免输重登/)
+  assert.match(listStats.text, /去重新登录/)
+  assert.doesNotMatch(listStats.text, /额度|周额度/)
+  assert.ok(listStats.cells > 0, '默认保留可点开的探针时间条')
+  assert.ok(listStats.stripHeight <= 14, '探针默认采用紧凑高度')
 
-  await capture('01-list-light', 1440, 900, 'light')
-  await capture('02-list-dark', 1440, 900, 'dark')
-  const darkBg = await evaluate(`return getComputedStyle(document.querySelector('.monitor-list')).backgroundColor;`)
-  assert.notEqual(darkBg, listStats.lightBg, '深色模式下列表背景色应切换为深色容器色')
-  await capture('03-list-390px', 390, 980, 'light')
-  await assertNoClippedButtons('390px 列表页')
+  const expanded = await evaluate(`
+    const toggle = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === '展开探针');
+    toggle.click();
+    await new Promise(r => setTimeout(r, 80));
+    const height = document.querySelector('.probe-strip').getBoundingClientRect().height;
+    toggle.click();
+    return height;
+  `)
+  assert.ok(expanded > listStats.stripHeight)
+  await capture('01-unified-light', 1440, 900, 'light')
+  await capture('02-unified-dark', 1440, 900, 'dark')
+  assert.notEqual(await evaluate(`return getComputedStyle(document.querySelector('.probe-monitor-list')).backgroundColor;`), listStats.lightBg)
+  await capture('03-unified-390px', 390, 960, 'light')
+  await assertNoClippedButtons('390px 合并列表')
+
+  const filtered = await evaluate(`
+    const select = label => [...document.querySelectorAll('.probe-filter-chip')].find(b => b.textContent.includes(label)).click();
+    select('订阅宽限期');
+    await new Promise(r => setTimeout(r, 70));
+    const grace = document.querySelectorAll('.probe-monitor-row').length;
+    select('降智');
+    await new Promise(r => setTimeout(r, 70));
+    const degraded = document.querySelectorAll('.probe-monitor-row').length;
+    select('全部');
+    return { grace, degraded };
+  `)
+  assert.deepEqual(filtered, { grace: 1, degraded: 1 })
+
+  const refreshed = await evaluate(`
+    [...document.querySelectorAll('button')].find(b => b.textContent.includes('查询全部订阅')).click();
+    await new Promise(r => setTimeout(r, 140));
+    return document.querySelector('[data-account="acc-codex"] .subscription-cell').innerText;
+  `)
+  assert.match(refreshed, /有效.*续费/s)
 
   const probeDetail = await evaluate(`
-    const status = [...document.querySelectorAll('.panel-probe-status')].find(el => el.textContent.includes('探测降智'));
-    status.click();
-    await new Promise(r => setTimeout(r, 150));
-    return document.querySelector('.probe-detail-page')?.textContent;
+    const row = document.querySelector('[data-account="acc-work"]');
+    row.querySelector('.monitor-account').click();
+    await new Promise(r => setTimeout(r, 140));
+    return document.body.innerText;
   `)
   assert.match(probeDetail, /alpha@acme\.io/)
   assert.match(probeDetail, /测票当前判定.*降智/s)
   await assertNoClippedButtons('390px 探测详情')
-  const probeOverview = await evaluate(`
-    const detail = document.querySelector('.probe-detail-page');
-    [...detail.querySelectorAll('button')].find(b => b.textContent.includes('返回账号监控')).click();
-    await new Promise(r => setTimeout(r, 150));
-    const tabs = [...document.querySelectorAll('.panel-header [role="radio"], .panel-header .z-segmented-item')];
-    tabs.find(tab => tab.textContent.includes('账号探测')).click();
-    await new Promise(r => setTimeout(r, 150));
-    return document.querySelector('.probe-workspace')?.textContent;
-  `)
-  assert.match(probeOverview, /后台任务未开启/)
-  assert.match(probeOverview, /alpha@acme\.io/)
-  await capture('03b-probes-390px', 390, 980, 'light')
-  await assertNoClippedButtons('390px 探测总览')
+
   await evaluate(`
-    const tabs = [...document.querySelectorAll('.panel-header [role="radio"], .panel-header .z-segmented-item')];
-    tabs.find(tab => tab.textContent.includes('账号监控')).click();
-    await new Promise(r => setTimeout(r, 150));
+    document.querySelector('button[aria-label="返回列表"]').click();
+    await new Promise(r => setTimeout(r, 100));
+    document.querySelector('[data-account="acc-work"] .subscription-cell').click();
+    await new Promise(r => setTimeout(r, 100));
+    [...document.querySelectorAll('button')].find(b => b.textContent.includes('查询订阅与账单')).click();
+    await new Promise(r => setTimeout(r, 160));
   `)
+  assert.equal(await evaluate(`return document.querySelectorAll('.billing-row').length;`), 2)
+  await capture('04-billing-390px', 390, 1300, 'light')
+  await assertNoClippedButtons('390px 订阅与账单')
 
-  // ── 1b. 列表行内「免输重登」与批量免输重登进度截图 ──
-  await setViewport(1440, 900, 'light')
   await evaluate(`
-    window.__LOGIN_DELAY_MS__ = 500;
-    const allCheckbox = document.querySelector('.monitor-toolbar input[type="checkbox"]');
-    allCheckbox.click();
-    await new Promise(r => setTimeout(r, 120));
-    const batchBtn = [...document.querySelectorAll('.selection-bar button')].find(b => b.textContent.includes('批量免输重登'));
-    batchBtn.click();
-    await new Promise(r => setTimeout(r, 150));
+    const tabs = [...document.querySelectorAll('[aria-label="账号详情分类"] [role="radio"], [aria-label="账号详情分类"] .z-segmented-item')];
+    tabs.find(el => el.textContent.includes('官方用量')).click();
+    await new Promise(r => setTimeout(r, 90));
+    [...document.querySelectorAll('button')].find(b => b.textContent.trim() === '查询用量').click();
+    await new Promise(r => setTimeout(r, 160));
   `)
-  const batchProgressStats = await evaluate(`
-    const barText = document.querySelector('.selection-bar')?.textContent ?? '';
-    return {
-      hasReloginProgress: barText.includes('正在批量免输重登'),
-      hasSkippedReason: barText.includes('跳过') && barText.includes('未存密码'),
-    };
-  `)
-  assert.equal(batchProgressStats.hasReloginProgress, true, '批量重登时底部操作栏应显示进度')
-  assert.equal(batchProgressStats.hasSkippedReason, true, '批量重登时应说明跳过未存密码账号的原因')
-  await capture('13-list-relogin-batch-progress', 1440, 900, 'light')
-  await sleep(1600)
+  assert.equal(await evaluate(`return document.querySelectorAll('[aria-labelledby="usage-title"] .trend-chart').length;`), 2)
+  assert.equal(await evaluate(`return document.querySelector('[aria-labelledby="usage-title"] .meters');`), null)
   await evaluate(`
-    window.__LOGIN_DELAY_MS__ = 0;
+    const tabs = [...document.querySelectorAll('[aria-label="账号详情分类"] [role="radio"], [aria-label="账号详情分类"] .z-segmented-item')];
+    tabs.find(el => el.textContent.includes('登录与设备')).click();
   `)
-
-  // 验证筛选芯片点击与恢复
-  await setViewport(1440, 900, 'light')
-  const filteredRows = await evaluate(`
-    const graceChip = [...document.querySelectorAll('.filter-chip')].find(el => el.textContent.includes('宽限期'));
-    graceChip.click();
-    await new Promise(r => setTimeout(r, 80));
-    const graceCount = document.querySelectorAll('.monitor-row').length;
-    const payChip = [...document.querySelectorAll('.filter-chip')].find(el => el.textContent.includes('扣款异常'));
-    payChip.click();
-    await new Promise(r => setTimeout(r, 80));
-    const count = document.querySelectorAll('.monitor-row').length;
-    const allChip = [...document.querySelectorAll('.filter-chip')].find(el => el.textContent.includes('全部'));
-    allChip.click();
-    await new Promise(r => setTimeout(r, 80));
-    return { graceCount, count };
-  `)
-  assert.equal(filteredRows.graceCount, 1, '点击「宽限期」芯片后应只显示 1 行')
-  assert.equal(filteredRows.count, 1, '点击「扣款异常」芯片后应只显示 1 行')
-  const listUsage = await evaluate(`
-    return {
-      chips: [...document.querySelectorAll('.filter-chip')].map(el => el.textContent),
-      bars: document.querySelectorAll('.monitor-row .mini-bars').length,
-      donuts: document.querySelectorAll('.monitor-row .mini-donut').length,
-      firstBars: document.querySelector('.monitor-row .mini-bars')?.querySelectorAll('.mini-bar').length ?? 0,
-      tones: [...document.querySelectorAll('.monitor-row')].map(el => el.dataset.tone),
-    };
-  `)
-  assert.ok(!listUsage.chips.some(t => t.includes('Work')), '列表不再有 Work 筛选')
-  assert.equal(listUsage.bars, 2, '查过用量的两行都有每日 Token 柱状图')
-  assert.equal(listUsage.donuts, 2, '查过用量的两行都有使用位置饼图')
-  assert.equal(listUsage.firstBars, 7, '每天一根柱子')
-  assert.ok(!listUsage.tones.includes('work'), '行左竖条不再有 Work 紫色')
-
-  // 点柱子弹出当天详情
-  const barTip = await evaluate(`
-    const bars = document.querySelectorAll('.monitor-row .mini-bars')[1].querySelectorAll('.mini-bar');
-    bars[5].click();
-    await new Promise(r => setTimeout(r, 80));
-    const tip = document.querySelector('.mini-bars-tip');
-    return tip ? tip.textContent.replace(/\\s+/g, ' ').trim() : '';
-  `)
-  assert.match(barTip, /11\/5 周四/, '点柱子应显示日期和星期')
-  assert.match(barTip, /4,700,000 Token/, '点柱子应显示当天 Token 原值')
-  assert.match(barTip, /占 7 天的/, '点柱子应显示占这段时间的比例')
-  await capture('14-list-bar-tip', 1440, 900, 'light')
-  await evaluate(`document.querySelector('.mini-bar.is-active')?.click();`)
-
-  // ── 2. 详情页（官方用量 + 订阅账单）验收与截图 ──
-  await evaluate(`
-    document.querySelector('.row-title-btn').click();
-    await new Promise(r => setTimeout(r, 150));
-    const buttons = [...document.querySelectorAll('button')];
-    buttons.find(b => b.textContent.trim() === '查询用量')?.click();
-    buttons.find(b => b.textContent.includes('查询订阅与账单'))?.click();
-    await new Promise(r => setTimeout(r, 250));
-  `)
-
-  const detailStats = await evaluate(`
-    const buttons = [...document.querySelectorAll('button')].map(b => b.textContent.trim());
-    return {
-      verdictVisible: Boolean(document.querySelector('.verdict-panel')),
-      segmentedCount: document.querySelectorAll('.detail-topbar .z-segmented').length,
-      rateTiles: document.querySelectorAll('.rate-tile').length,
-      trendCharts: document.querySelectorAll('.trend-chart').length,
-      billingRows: document.querySelectorAll('.billing-row').length,
-      invoiceInputs: document.querySelectorAll('.invoice-url').length,
-      hasRefreshBtn: buttons.includes('刷新'),
-    };
-  `)
-  assert.equal(detailStats.verdictVisible, true, '详情页顶部应有身份头部')
-  assert.equal(detailStats.segmentedCount, 0, '详情页应去掉分段切换器')
-  assert.equal(detailStats.rateTiles, 4, '详情页顶部应有 4 个核心指标块')
-  assert.equal(detailStats.trendCharts, 2, '查询用量后应渲染每日位置走势图和每日 Token 走势图')
-  assert.equal(detailStats.billingRows, 2, '查询订阅与账单后应渲染 2 条账单记录')
-  assert.equal(detailStats.invoiceInputs, 0, '账单行不应再包含只读网址输入框')
-  assert.equal(detailStats.hasRefreshBtn, true, '查询后按钮应变为「刷新」')
-
-  await capture('04-detail-usage-billing-light', 1440, 1380, 'light')
-  await capture('05-detail-usage-billing-dark', 1440, 1380, 'dark')
-  await capture('06-detail-usage-billing-390px', 390, 1650, 'light')
-  await assertNoClippedButtons('390px 详情页（用量与账单）')
 
   // ── 3. 详情页（重新登录 + 登录设备）验收与截图 ──
   await setViewport(1440, 1100, 'light')
@@ -905,7 +836,9 @@ try {
 
   // ── 4. 导入账号页验收与截图 ──
   await evaluate(`
-    const loginTab = [...document.querySelectorAll('[role="radio"], .z-segmented button, .z-segmented-item')].find(el => el.textContent.includes('导入账号'));
+    document.querySelector('button[aria-label="返回列表"]').click();
+    await new Promise(r => setTimeout(r, 100));
+    const loginTab = [...document.querySelectorAll('.monitor-header button')].find(el => el.textContent.includes('导入账号'));
     loginTab.click();
     await new Promise(r => setTimeout(r, 200));
     const ta = document.querySelector('textarea');

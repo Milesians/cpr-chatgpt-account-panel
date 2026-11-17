@@ -63,6 +63,9 @@ export interface LastPayment {
   plan?: string
   checked_at_ms: number
   subscription_status?: Subscription['status']
+  subscription_expires_at_ms?: number
+  subscription_will_renew?: boolean
+  subscription_checked_at_ms?: number
   delinquent_since_ms?: number
   grace_ends_at_ms?: number
 }
@@ -263,7 +266,7 @@ function describeFailure(status: number, code: string, body: string): string {
 }
 
 export const api = {
-  accounts: () => call<{ accounts: Account[], checked_at_ms: number }>('GET', 'api/accounts'),
+  accounts: () => call<{ accounts: Account[], checked_at_ms: number }>('GET', 'api/accounts', { include_quota: 'false' }),
   usage: (id: string, days: number) => call<{ usage: CodexUsage, summary: UsageSummary }>('GET', 'api/usage', { id, days: String(days) }),
   subscription: (id: string) => call<{ subscription: Subscription, payment?: LastPayment }>('GET', 'api/subscription', { id }),
   devices: (id: string) => call<{ devices: Devices }>('GET', 'api/devices', { id }),

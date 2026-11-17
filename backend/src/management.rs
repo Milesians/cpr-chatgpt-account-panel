@@ -80,7 +80,13 @@ async fn route(app: &App, call: &TypedCall<ManagementRequest>) -> Result<Value, 
     let host = &call.host;
     let query = parse_query(&call.request.query);
     match (call.request.method.as_str(), call.request.path.as_str()) {
-        ("GET", "api/accounts") => accounts(host).await,
+        ("GET", "api/accounts") => {
+            accounts(
+                host,
+                query.get("include_quota").is_none_or(|v| v != "false"),
+            )
+            .await
+        }
         ("GET", "api/usage") => {
             let days = query
                 .get("days")
@@ -178,7 +184,7 @@ struct Row {
     payment: Option<LastPayment>,
 }
 
-async fn accounts(host: &HostClient) -> Result<Value, ApiError> {
+async fn accounts(host: &HostClient, include_quota: bool) -> Result<Value, ApiError> {
     let now = now_ms();
     let list: Vec<AuthRuntimeAccount> = host::openai_accounts(host)
         .await?
@@ -188,7 +194,13 @@ async fn accounts(host: &HostClient) -> Result<Value, ApiError> {
     let rows: Vec<Row> = stream::iter(list)
         .map(|a| async move {
             let (quota, usage, payment) = futures::join!(
-                host::quota(host, &a.account_id),
+                async {
+                    if include_quota {
+                        host::quota(host, &a.account_id).await.ok()
+                    } else {
+                        None
+                    }
+                },
                 store::usage(host, &a.account_id),
                 store::payment(host, &a.account_id),
             );
@@ -199,7 +211,7 @@ async fn accounts(host: &HostClient) -> Result<Value, ApiError> {
                     None => "unknown",
                 },
                 blocker: chatgpt::blocker(&a, now),
-                quota: quota.ok().map(|q| Quota {
+                quota: quota.map(|q| Quota {
                     observed_at_ms: q.observed_at_ms,
                     windows: q
                         .windows
@@ -267,6 +279,16 @@ async fn read_billing(host: &HostClient, id: &str, cursor: &str) -> Result<Value
     let mut payment = None;
     if cursor.is_empty() {
         payment = LastPayment::of(&history);
+        if history.subscription.is_none() {
+            let previous = store::payment(host, id).await.ok().flatten();
+            payment = match (payment, previous) {
+                (Some(mut current), Some(previous)) => {
+                    current.retain_subscription_from(previous);
+                    Some(current)
+                }
+                (current, previous) => current.or(previous),
+            };
+        }
         if let Some(p) = &payment {
             let _ = store::save_payment(host, id, p).await;
         }

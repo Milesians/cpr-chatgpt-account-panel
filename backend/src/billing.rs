@@ -405,6 +405,12 @@ pub struct LastPayment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_expires_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_will_renew: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_checked_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delinquent_since_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grace_ends_at_ms: Option<i64>,
@@ -427,6 +433,9 @@ impl LastPayment {
                 },
                 checked_at_ms: h.checked_at_ms,
                 subscription_status: sub.map(|s| s.status.clone()),
+                subscription_expires_at_ms: sub.and_then(|s| s.expires_at_ms),
+                subscription_will_renew: sub.and_then(|s| s.will_renew),
+                subscription_checked_at_ms: sub.map(|s| s.checked_at_ms),
                 delinquent_since_ms: sub.and_then(|s| s.delinquent_since_ms),
                 grace_ends_at_ms: sub.and_then(|s| s.grace_ends_at_ms),
             });
@@ -445,6 +454,9 @@ impl LastPayment {
             plan: s.plan_type.clone(),
             checked_at_ms: s.checked_at_ms,
             subscription_status: Some(s.status.clone()),
+            subscription_expires_at_ms: s.expires_at_ms,
+            subscription_will_renew: s.will_renew,
+            subscription_checked_at_ms: Some(s.checked_at_ms),
             delinquent_since_ms: s.delinquent_since_ms,
             grace_ends_at_ms: s.grace_ends_at_ms,
         }
@@ -462,12 +474,28 @@ impl LastPayment {
                 }
                 p.checked_at_ms = s.checked_at_ms;
                 p.subscription_status = Some(s.status.clone());
+                p.subscription_expires_at_ms = s.expires_at_ms;
+                p.subscription_will_renew = s.will_renew;
+                p.subscription_checked_at_ms = Some(s.checked_at_ms);
                 p.delinquent_since_ms = s.delinquent_since_ms;
                 p.grace_ends_at_ms = s.grace_ends_at_ms;
                 p
             }
             None => Self::from_subscription(s),
         }
+    }
+
+    /// 查询账单成功但订阅读不到时，保留最近一次可用的订阅信息。
+    pub fn retain_subscription_from(&mut self, previous: Self) {
+        self.subscription_checked_at_ms = previous.subscription_checked_at_ms.or_else(|| {
+            (previous.subscription_status.is_some() || previous.grace_ends_at_ms.is_some())
+                .then_some(previous.checked_at_ms)
+        });
+        self.subscription_status = previous.subscription_status;
+        self.subscription_expires_at_ms = previous.subscription_expires_at_ms;
+        self.subscription_will_renew = previous.subscription_will_renew;
+        self.delinquent_since_ms = previous.delinquent_since_ms;
+        self.grace_ends_at_ms = previous.grace_ends_at_ms;
     }
 }
 
