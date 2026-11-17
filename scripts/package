@@ -51,4 +51,5 @@ esac
   --binary "$binary" \
   --target "$target" \
   --resource-map web=frontend/dist \
+  --resource-map legal=backend/data \
   --output-dir dist

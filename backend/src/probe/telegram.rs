@@ -1,0 +1,292 @@
+//! Telegram delivery uses the host HTTP client and never returns transport errors/URLs.
+
+use std::time::Duration;
+
+use gateway_plugin_sdk::{
+    call::host::{AuthRuntimeAccount, HttpRequest, LogLevel},
+    client::HostClient,
+};
+use serde_json::json;
+
+use crate::probe::{
+    config::Config,
+    health::{NoticeKind, Notification},
+    host, store,
+    verdict::{Level, one_line},
+};
+
+pub fn configuration_error(config: &Config) -> Option<&'static str> {
+    let token = config.telegram_bot_token.trim();
+    let valid_token = token.split_once(':').is_some_and(|(id, secret)| {
+        !id.is_empty()
+            && id.bytes().all(|b| b.is_ascii_digit())
+            && !secret.is_empty()
+            && secret
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    });
+    if !valid_token || token.len() > 256 {
+        return Some("请在插件敏感配置中填写有效的 TG Bot Token");
+    }
+    let chat = config.telegram_chat_id.trim();
+    if chat.is_empty() || chat.len() > 128 || chat.chars().any(char::is_control) {
+        return Some("请在插件设置中填写有效的 TG Chat ID");
+    }
+    None
+}
+
+fn label(level: Level) -> &'static str {
+    match level {
+        Level::Unknown => "未判定",
+        Level::Ok => "正常",
+        Level::Suspect => "疑似",
+        Level::Degraded => "降智",
+    }
+}
+
+/// Unix 毫秒 → 东八区（北京时间）`YYYY-MM-DD HH:MM:SS`
+#[must_use]
+pub fn beijing_time(ms: i64) -> String {
+    let secs = ms.div_euclid(1000) + 8 * 3600;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Howard Hinnant 的 civil_from_days
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+fn account_lines(account: &AuthRuntimeAccount) -> Vec<String> {
+    let mut lines = Vec::new();
+    let name = one_line(&account.name, 120);
+    let email = account
+        .email
+        .as_deref()
+        .map(|e| one_line(e, 120))
+        .unwrap_or_default();
+    if !name.is_empty() && name != email {
+        lines.push(format!("账号：{name}"));
+    }
+    if !email.is_empty() {
+        lines.push(format!("邮箱：{email}"));
+    }
+    lines
+}
+
+/// 时长：“2 小时 5 分钟”
+fn span(ms: i64) -> String {
+    let minutes = (ms / 60_000).max(1);
+    if minutes < 60 {
+        format!("{minutes} 分钟")
+    } else if minutes % 60 == 0 {
+        format!("{} 小时", minutes / 60)
+    } else {
+        format!("{} 小时 {} 分钟", minutes / 60, minutes % 60)
+    }
+}
+
+/// 账号凭据异常 / 恢复：不是判定，说明当前判定保持不变
+fn blocked_message(account: &AuthRuntimeAccount, event: &Notification) -> String {
+    let unblocked = event.kind == NoticeKind::Unblocked;
+    let mut lines = vec![format!(
+        "CPR 账号探测 | {}",
+        if unblocked {
+            "账号凭据已恢复"
+        } else {
+            "账号凭据异常"
+        }
+    )];
+    lines.extend(account_lines(account));
+    if let Some(b) = &event.blocked {
+        lines.push(format!(
+            "{}：{}",
+            if unblocked {
+                "原因已解除"
+            } else {
+                "原因"
+            },
+            one_line(&b.message, 200)
+        ));
+        lines.push(format!("开始：{}（北京时间）", beijing_time(b.since_ms)));
+        lines.push(format!(
+            "{}：{}",
+            if unblocked {
+                "受阻时长"
+            } else {
+                "已持续"
+            },
+            span(event.at_ms - b.since_ms)
+        ));
+    }
+    lines.push(format!("时间：{}（北京时间）", beijing_time(event.at_ms)));
+    lines.push(if unblocked {
+        "可以正常测票了；开着自动测票的下一轮维护起继续。".to_owned()
+    } else {
+        format!(
+            "测票发不出去，这不是降智判定；当前判定保持“{}”。原因解除后自动恢复并通知。",
+            label(event.to)
+        )
+    });
+    lines.push(format!("账号 ID：{}", one_line(&account.account_id, 100)));
+    lines.push(format!("事件 ID：{}", one_line(&event.id, 100)));
+    lines.join("\n")
+}
+
+fn message(account: &AuthRuntimeAccount, event: &Notification) -> String {
+    if event.kind != NoticeKind::Verdict {
+        return blocked_message(account, event);
+    }
+    let recovered = event.to == Level::Ok;
+    let mut lines = vec![format!(
+        "CPR 账号探测 | {}",
+        if recovered {
+            "测票恢复正常"
+        } else {
+            "测票异常确认"
+        }
+    )];
+    lines.extend(account_lines(account));
+    lines.push(format!("判定：{} → {}", label(event.from), label(event.to)));
+    lines.push(format!("模型：{}", one_line(&event.model, 100)));
+    lines.push(format!("时间：{}（北京时间）", beijing_time(event.at_ms)));
+    lines.push(format!(
+        "连续 3 次{}，已更新当前判定。",
+        if recovered {
+            "测票正常"
+        } else {
+            "测票降智或疑似"
+        }
+    ));
+    lines.push(format!("账号 ID：{}", one_line(&account.account_id, 100)));
+    lines.push(format!("事件 ID：{}", one_line(&event.id, 100)));
+    lines.join("\n")
+}
+
+pub struct SendError {
+    pub message: String,
+    pub retry_after_ms: Option<i64>,
+}
+
+impl From<&str> for SendError {
+    fn from(message: &str) -> Self {
+        Self {
+            message: message.into(),
+            retry_after_ms: None,
+        }
+    }
+}
+
+async fn send_inner(host: &HostClient, config: &Config, text: &str) -> Result<(), SendError> {
+    if let Some(error) = configuration_error(config) {
+        return Err(error.into());
+    }
+    let mut body = json!({
+        "chat_id": config.telegram_chat_id.trim(), "text": text,
+        "link_preview_options": {"is_disabled": true},
+    });
+    if config.telegram_thread_id != 0 {
+        body["message_thread_id"] = json!(config.telegram_thread_id);
+    }
+    let response = host
+        .http(
+            HttpRequest {
+                method: "POST".into(),
+                url: format!(
+                    "https://api.telegram.org/bot{}/sendMessage",
+                    config.telegram_bot_token.trim()
+                ),
+                headers: vec![("Content-Type".into(), b"application/json".to_vec())],
+            },
+            serde_json::to_vec(&body).map_err(|_| SendError::from("TG 请求编码失败"))?,
+        )
+        .await
+        .map_err(|_| SendError::from("无法连接 Telegram，请检查服务器网络"))?;
+    let status = response.status;
+    let body = response
+        .body
+        .collect(16 * 1024)
+        .await
+        .map_err(|_| SendError::from("读取 TG 响应失败"))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|_| SendError::from("TG 返回无效响应"))?;
+    if status == 200 && value["ok"] == true {
+        return Ok(());
+    }
+    // Telegram descriptions and host errors may contain request data, including the token.
+    let message = match value["error_code"].as_u64().unwrap_or(u64::from(status)) {
+        401 => "TG 认证失败，请检查 Bot Token",
+        403 => "TG 拒绝发送，请检查机器人是否被屏蔽或缺少群组权限",
+        400 => "TG 参数无效，请检查 Chat ID、话题 ID，并先向机器人发送 /start",
+        429 => "TG 发送限流，稍后自动重试",
+        _ => "TG 发送失败，稍后自动重试",
+    };
+    Err(SendError {
+        message: message.into(),
+        retry_after_ms: value["parameters"]["retry_after"]
+            .as_i64()
+            .filter(|s| *s > 0)
+            .map(|s| s.min(86_400) * 1000),
+    })
+}
+
+pub async fn send(host: &HostClient, config: &Config, text: &str) -> Result<(), SendError> {
+    let budget = host
+        .remaining_budget()
+        .unwrap_or(Duration::from_secs(120))
+        .saturating_sub(Duration::from_secs(3))
+        .min(Duration::from_secs(8));
+    tokio::time::timeout(budget, send_inner(host, config, text))
+        .await
+        .unwrap_or_else(|_| Err("TG 请求超时，稍后自动重试".into()))
+}
+
+/// At-least-once delivery: a crash after Telegram accepts but before ACK may duplicate.
+pub async fn dispatch(host: &HostClient, config: &Config, account: &AuthRuntimeAccount) -> bool {
+    if host
+        .remaining_budget()
+        .is_some_and(|b| b < Duration::from_secs(12))
+    {
+        return false;
+    }
+    let event =
+        match store::claim_notification(host, &account.account_id, config.telegram_enabled).await {
+            Ok(Some(event)) => event,
+            Ok(None) => return false,
+            Err(_) => {
+                host::log(host, "telegram_queue_failed", LogLevel::Warn, json!({})).await;
+                return false;
+            }
+        };
+    let result = send(host, config, &message(account, &event)).await;
+    let (error, retry_after) = match result {
+        Ok(()) => (None, None),
+        Err(e) => (Some(e.message), e.retry_after_ms),
+    };
+    if error.is_some() {
+        host::log(
+            host,
+            "telegram_send_failed",
+            LogLevel::Warn,
+            json!({"account_id": account.account_id}),
+        )
+        .await;
+    }
+    if store::finish_notification(host, &account.account_id, &event, error, retry_after)
+        .await
+        .is_err()
+    {
+        host::log(host, "telegram_ack_failed", LogLevel::Warn, json!({})).await;
+    }
+    true
+}

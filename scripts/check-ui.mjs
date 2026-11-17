@@ -432,6 +432,23 @@ const bridgePayload = {
   billing: mockBilling,
   devices: { devices: mockDevices },
   signOutVoided: { signed_out: 3, remaining: 0, cpr_voided: true },
+  probe: (() => {
+    const account = { ...mockAccounts[0], supported: true, running: null, blocked: null }
+    const health = { level: 'degraded', last_run_id: 'probe-1', model: 'gpt-6-luna', changed_ms: now }
+    const turnstate = { schedule: { enabled: false, model: 'gpt-6-luna', interval_minutes: 60 }, health, runs: [], daily: [] }
+    const modeltrace = { ...turnstate, health: null, schedule: { ...turnstate.schedule, model: 'gpt-6.1-sol' } }
+    const config = { probe_enabled: false, probe_maintenance_enabled: false, min_interval_minutes: 30, fingerprint_sync_hours: 6 }
+    const rate = { judged: 1, ok: 0 }
+    return {
+      status: { accounts: { [account.id]: { level: health.level, blocked: false, running: false } } },
+      account: { account: { ...account, methods: { turnstate, modeltrace } }, config },
+      overview: {
+        now_ms: now, range: { hours: 24, start_ms: now - dayMs, slot_ms: 1800_000, slots: 48 }, config,
+        accounts: [{ ...account, health, schedule: { turnstate: turnstate.schedule, modeltrace: modeltrace.schedule }, latest: {}, rate, rate_24h: rate, rate_7d: rate, strip: [{ i: 40, degraded: 1 }] }],
+      },
+      models: { bank: [], cpr: ['gpt-6-luna', 'gpt-6.1-sol'], aliases: {} },
+    }
+  })(),
   loginOverview: {
     oauthRedirect: 'http://localhost:1455/auth/callback',
     accounts: mockLoginAccounts,
@@ -479,6 +496,8 @@ window.codexProxyPlugin = {
     const query = Object.fromEntries(new URLSearchParams(input.query || ''));
     const payload = input.body ? JSON.parse(input.body) : {};
     if (fn === 'api/accounts') return __reply(__MOCK__.accounts);
+    if (fn.startsWith('api/probe/') && __MOCK__.probe[fn.slice('api/probe/'.length)])
+      return __reply(__MOCK__.probe[fn.slice('api/probe/'.length)]);
     if (fn === 'api/usage') return __reply(__MOCK__.usage);
     if (fn === 'api/subscription') return __reply(__MOCK__.subscription);
     if (fn === 'api/billing') return __reply(__MOCK__.billing);
@@ -701,6 +720,34 @@ try {
   assert.notEqual(darkBg, listStats.lightBg, '深色模式下列表背景色应切换为深色容器色')
   await capture('03-list-390px', 390, 980, 'light')
   await assertNoClippedButtons('390px 列表页')
+
+  const probeDetail = await evaluate(`
+    const status = [...document.querySelectorAll('.panel-probe-status')].find(el => el.textContent.includes('探测降智'));
+    status.click();
+    await new Promise(r => setTimeout(r, 150));
+    return document.querySelector('.probe-detail-page')?.textContent;
+  `)
+  assert.match(probeDetail, /alpha@acme\.io/)
+  assert.match(probeDetail, /测票当前判定.*降智/s)
+  await assertNoClippedButtons('390px 探测详情')
+  const probeOverview = await evaluate(`
+    const detail = document.querySelector('.probe-detail-page');
+    [...detail.querySelectorAll('button')].find(b => b.textContent.includes('返回账号监控')).click();
+    await new Promise(r => setTimeout(r, 150));
+    const tabs = [...document.querySelectorAll('.panel-header [role="radio"], .panel-header .z-segmented-item')];
+    tabs.find(tab => tab.textContent.includes('账号探测')).click();
+    await new Promise(r => setTimeout(r, 150));
+    return document.querySelector('.probe-workspace')?.textContent;
+  `)
+  assert.match(probeOverview, /后台任务未开启/)
+  assert.match(probeOverview, /alpha@acme\.io/)
+  await capture('03b-probes-390px', 390, 980, 'light')
+  await assertNoClippedButtons('390px 探测总览')
+  await evaluate(`
+    const tabs = [...document.querySelectorAll('.panel-header [role="radio"], .panel-header .z-segmented-item')];
+    tabs.find(tab => tab.textContent.includes('账号监控')).click();
+    await new Promise(r => setTimeout(r, 150));
+  `)
 
   // ── 1b. 列表行内「免输重登」与批量免输重登进度截图 ──
   await setViewport(1440, 900, 'light')

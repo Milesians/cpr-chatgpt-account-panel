@@ -66,7 +66,7 @@ jobs:
           "$RUNNER_TEMP/zig/bin/pip" install --disable-pip-version-check ziglang==0.15.2 cargo-zigbuild==0.23.4
           echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
       - name: Install pinned package tool
-        run: cargo install --locked --git https://github.com/zyycn/codex-proxy-rs.git --rev 47d30474af7c3e1fab433f2d4a70430fae548ff2 codex-proxy-plugin-cli --root .tools
+        run: cargo install --locked --git https://github.com/zyycn/codex-proxy-rs.git --rev c622f085748f812936a7371fcc85d1621fa72ca8 codex-proxy-plugin-cli --root .tools
       - name: Build installable package
         env:
           REQUIRE_GLIBC_FLOOR: '1'
@@ -102,7 +102,7 @@ jobs:
             release_flags=(--prerelease --latest=false)
           fi
           (cd dist && sha256sum *.tar.gz > checksums.txt)
-          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.sha256 dist/checksums.txt \
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.sha256 dist/checksums.txt scripts/migrate-turnstate.sql \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "ChatGPT 账号面板 $RELEASE_TAG" --notes-file release/notes.md \
             "${release_flags[@]}"

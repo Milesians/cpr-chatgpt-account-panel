@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { Account } from './api'
 import type { AccountLoginStatus } from './login/helpers'
+import type { Models, ProbeStatus } from './probe/api'
 import { ZButton, ZConfigProvider, ZSegmented } from '@codex-proxy/ui'
 import { zhHans } from '@codex-proxy/ui/locale'
 import { RefreshCw, UserRound } from '@lucide/vue'
@@ -11,12 +12,20 @@ import AccountList from './components/AccountList.vue'
 import { dateTime, hasGracePeriod, hasPaymentAnomaly } from './format'
 import { loginApi } from './login/client'
 import LoginPage from './login/LoginPage.vue'
+import { api as probeApi } from './probe/api'
+import ProbeDetail from './probe/components/AccountDetail.vue'
+import ProbeWorkspace from './probe/ProbeWorkspace.vue'
 
-const section = ref<'accounts' | 'login'>('accounts')
+const section = ref<'accounts' | 'login' | 'probe'>('accounts')
 const sections = [
   { label: '账号监控', value: 'accounts' },
+  { label: '账号探测', value: 'probe' },
   { label: '导入账号', value: 'login' },
 ]
+const probeVisited = ref(false)
+const probeStatuses = shallowRef<Record<string, ProbeStatus>>({})
+const probeOpened = ref<string | null>(null)
+const probeModels = shallowRef<Models | null>(null)
 const accounts = shallowRef<Account[] | null>(null)
 const loginAccounts = shallowRef<AccountLoginStatus[]>([])
 const checkedAt = ref(0)
@@ -38,7 +47,21 @@ async function loadLoginOverview() {
   }
 }
 
+let probeStatusRequest = 0
+async function loadProbeStatuses() {
+  const request = ++probeStatusRequest
+  try {
+    const r = await probeApi.statuses()
+    if (request === probeStatusRequest)
+      probeStatuses.value = r.accounts
+  }
+  catch {
+    // 探测状态和账号监控各自刷新，探测失败时不阻塞用量与账单。
+  }
+}
+
 async function load() {
+  void loadProbeStatuses()
   loading.value = true
   error.value = ''
   try {
@@ -73,6 +96,7 @@ function patchLoginAccount(updated: AccountLoginStatus) {
 
 // 列表一直挂着（只是 v-show 隐藏），从详情或导入页返回时筛选、排序、选中和滚动位置都保留
 let listScroll = 0
+let beforeProbeScroll = 0
 const app = () => document.querySelector<HTMLElement>('#app')
 
 function saveListScroll() {
@@ -101,11 +125,30 @@ function back() {
   nextTick(() => app()?.scrollTo({ top: listScroll }))
 }
 
+function openProbe(id: string) {
+  beforeProbeScroll = app()?.scrollTop ?? 0
+  probeOpened.value = id
+  nextTick(() => app()?.scrollTo({ top: 0 }))
+  void probeApi.models().then(r => { probeModels.value = r }).catch(() => {})
+}
+
+function closeProbe() {
+  probeOpened.value = null
+  nextTick(() => app()?.scrollTo({ top: beforeProbeScroll }))
+  void loadProbeStatuses()
+}
+
 watch(section, (next, prev) => {
-  if (prev === 'accounts' && !opened.value) {
+  if (prev === 'accounts' && !opened.value && !probeOpened.value) {
     listScroll = app()?.scrollTop ?? 0
   }
-  if (next === 'accounts' && !opened.value) {
+  if (next === 'probe') {
+    probeVisited.value = true
+  }
+  if (next === 'accounts' && prev === 'probe') {
+    void loadProbeStatuses()
+  }
+  if (next === 'accounts' && !opened.value && !probeOpened.value) {
     nextTick(() => app()?.scrollTo({ top: listScroll }))
   }
   else {
@@ -134,7 +177,7 @@ onMounted(load)
                 · 更新于 {{ dateTime(checkedAt) }}
               </template>
               <template v-else>
-                官方用量、订阅账单、登录设备与免输重登
+                官方用量、订阅账单、登录设备和账号探测
               </template>
             </p>
           </div>
@@ -142,6 +185,7 @@ onMounted(load)
         <div class="flex flex-wrap items-center gap-2">
           <ZSegmented v-model="section" :options="sections" size="small" aria-label="页面切换" />
           <ZButton
+            v-if="section !== 'probe'"
             size="small"
             :loading="loading"
             :title="loading ? '正在刷新账号列表' : undefined"
@@ -153,16 +197,17 @@ onMounted(load)
         </div>
       </header>
 
-      <p v-if="error" class="banner banner-error mb-4" role="alert">
+      <p v-if="error && section !== 'probe'" class="banner banner-error mb-4" role="alert">
         {{ error }}
       </p>
 
-      <div v-show="section === 'accounts'">
+      <div v-show="section === 'accounts' && !probeOpened">
         <AccountDetail
           v-if="current"
           :key="current.id"
           :account="current"
           @back="back"
+          @probe="openProbe(current.id)"
           @patch="patch"
           @login-updated="a => { patchLoginAccount(a); load() }"
         />
@@ -171,12 +216,26 @@ onMounted(load)
             :accounts="accounts"
             :login-accounts="loginAccounts"
             :loading="loading"
+            :probe-statuses="probeStatuses"
             @open="open"
+            @probe="openProbe"
             @patch="patch"
             @relogged="a => { patchLoginAccount(a); load() }"
           />
         </div>
       </div>
+
+      <ProbeDetail
+        v-if="probeOpened"
+        v-show="section === 'accounts'"
+        :key="probeOpened"
+        :account-id="probeOpened"
+        :models="probeModels"
+        :back-label="opened ? '返回账号详情' : '返回账号监控'"
+        @back="closeProbe"
+      />
+
+      <ProbeWorkspace v-if="probeVisited" v-show="section === 'probe'" :active="section === 'probe'" />
 
       <div v-show="section === 'login'">
         <LoginPage @accounts-changed="load" />

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { ProbeStatus } from '../probe/api'
 import type { Account, ApiError, Share } from '../api'
 import type { Slice } from '../surfaces'
 import type { AccountFilterKey } from '../format'
@@ -50,6 +51,7 @@ import {
 } from '../format'
 import { loginApi } from '../login/client'
 import { formatLoginError } from '../login/helpers'
+import { stateLabel } from '../probe/timeline'
 import { slices, SURFACE_ORDER, surfaceLabel } from '../surfaces'
 import MiniDonut from './MiniDonut.vue'
 import MiniTokenBars from './MiniTokenBars.vue'
@@ -59,12 +61,24 @@ const props = defineProps<{
   accounts: Account[] | null
   loginAccounts: AccountLoginStatus[]
   loading: boolean
+  probeStatuses: Record<string, ProbeStatus>
 }>()
 const emit = defineEmits<{
   open: [id: string, focusLogin?: boolean]
+  probe: [id: string]
   patch: [id: string, patch: Partial<Account>]
   relogged: [account: AccountLoginStatus]
 }>()
+
+function probeStatusLabel(status: ProbeStatus | undefined): string {
+  if (!status)
+    return '探测记录'
+  if (status.blocked)
+    return '探测受阻'
+  if (status.running)
+    return stateLabel.running
+  return status.level ? `探测${stateLabel[status.level]}` : '未探测'
+}
 
 const search = ref('')
 const kind = ref<'all' | 'personal' | 'team'>('all')
@@ -546,6 +560,12 @@ onBeforeUnmount(() => { stop = true })
                 <span v-if="a.email && a.name !== a.email">{{ a.name }}</span>
                 <span v-if="!a.enabled" class="text-warn">CPR 已停用</span>
               </span>
+            </button>
+            <button
+              type="button" class="panel-probe-status mt-1" :data-state="probeStatuses[a.id]?.blocked ? 'blocked' : probeStatuses[a.id]?.running ? 'running' : probeStatuses[a.id]?.level ?? 'empty'"
+              :aria-label="`${title(a)}：${probeStatusLabel(probeStatuses[a.id])}，查看探测记录`" @click="emit('probe', a.id)"
+            >
+              <i aria-hidden="true" />{{ probeStatusLabel(probeStatuses[a.id]) }}
             </button>
           </div>
 

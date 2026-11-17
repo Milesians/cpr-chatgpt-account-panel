@@ -14,6 +14,7 @@ pub mod devices;
 mod host;
 pub mod login;
 mod management;
+pub mod probe;
 pub mod store;
 pub mod usage;
 
@@ -24,7 +25,7 @@ mod session;
 
 use gateway_plugin_sdk::{
     Manifest, ManifestError,
-    client::{AuthorError, ComposedPlugin, PluginBuilder},
+    client::{AuthorError, ComposedPlugin, Empty, PluginBuilder, TypedReply, methods},
 };
 
 pub const PLUGIN_ID: &str = "milesians.cpr-chatgpt-account-panel";
@@ -42,6 +43,7 @@ pub fn manifest() -> Result<Manifest, ManifestError> {
 pub struct App {
     pub config: config::Config,
     pub login: login::Login,
+    probe: probe::Probe,
 }
 
 /// 组装处理器
@@ -49,14 +51,30 @@ pub struct App {
 /// # Errors
 /// 清单与处理器不一致时返回错误
 pub fn plugin(config: config::Config) -> Result<ComposedPlugin, AuthorError> {
+    build_plugin(config, probe::config::Config::default())
+}
+
+fn build_plugin(
+    config: config::Config,
+    probe_config: probe::config::Config,
+) -> Result<ComposedPlugin, AuthorError> {
     let app = Arc::new(App {
         login: login::Login::new(&config),
         config,
+        probe: probe::Probe::new(probe_config),
     });
+    let maintenance = Arc::clone(&app);
     PluginBuilder::from_json(MANIFEST)?
         .management(management::registration(), move |call| {
             let app = Arc::clone(&app);
             async move { management::handle(&app, call).await }
+        })?
+        .on(methods::RECONCILE, move |call| {
+            let app = Arc::clone(&maintenance);
+            async move {
+                app.probe.reconcile(&call.host).await?;
+                Ok(TypedReply::new(Empty {}))
+            }
         })?
         .build()
 }

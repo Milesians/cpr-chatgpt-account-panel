@@ -3,6 +3,7 @@ import type { Account } from '../api'
 import type { AccountLoginStatus } from '../login/helpers'
 import { ZButton, ZTag } from '@codex-proxy/ui'
 import {
+  Activity,
   ArrowLeft,
   Clock,
   CreditCard,
@@ -33,6 +34,7 @@ import UsagePanel from './UsagePanel.vue'
 const props = defineProps<{ account: Account }>()
 const emit = defineEmits<{
   back: []
+  probe: []
   patch: [id: string, patch: Partial<Account>]
   loginUpdated: [account: AccountLoginStatus]
 }>()
@@ -147,6 +149,9 @@ const tokenSummary = computed(() => {
     <div class="detail-topbar">
       <ZButton size="small" aria-label="返回列表" @click="emit('back')">
         <ArrowLeft :size="14" aria-hidden="true" /> 返回列表
+      </ZButton>
+      <ZButton size="small" @click="emit('probe')">
+        <Activity :size="14" aria-hidden="true" /> 探测记录
       </ZButton>
     </div>
 

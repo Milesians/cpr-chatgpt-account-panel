@@ -1,4 +1,4 @@
-use crate::{PLUGIN_ID, config::Config, manifest, plugin};
+use crate::{PLUGIN_ID, build_plugin, config::Config, manifest, probe};
 use gateway_plugin_sdk::client::{PluginSession, SessionConfig, SessionError};
 
 /// 生产进程和 RPC 测试共用入口，沿用 SDK 默认的 120 秒阶段预算
@@ -17,7 +17,9 @@ where
     {
         return Err(SessionError::Handshake.into());
     }
-    let config = Config::from_handshake(&session.handshake().configuration);
-    session.run(plugin(config)?).await?;
+    let configuration = &session.handshake().configuration;
+    let config = Config::from_handshake(configuration);
+    let probe_config = probe::config::Config::from_handshake(configuration);
+    session.run(build_plugin(config, probe_config)?).await?;
     Ok(())
 }

@@ -1,13 +1,13 @@
 # ChatGPT 账号面板（CPR 插件）
 
-[Codex Proxy RS](https://github.com/zyycn/codex-proxy-rs)（CPR）的插件：在 CPR 的“插件”导航里按账号查看 OpenAI OAuth 账号的 **ChatGPT 官方用量**（按使用位置，重点看 **Work** 有没有用量）、**订阅与账单**和**登录设备**。登录（用登录凭据换令牌、快速导入）在 `login` 模块，单独维护，见[模块分工](#模块分工)。
+[Codex Proxy RS](https://github.com/zyycn/codex-proxy-rs)（CPR）的插件：在 CPR 的“插件”导航里统一管理 OpenAI OAuth 账号，查看 **ChatGPT 官方用量**（重点看 **Work**）、**订阅与账单**、**登录设备**和**探测记录**，也可以导入或重新登录账号。
 
 插件 ID `milesians.cpr-chatgpt-account-panel`（发布者 `milesians`），要求 CPR `>=3.44.0, <4.0.0`（清单 v2、RPC v7、`management` v2；导入和重登要用 3.44.0 新增的 `host.http.proxy` 和 `host.proxies.list`）。SDK 和打包 CLI 都固定在 CPR 的 `v3.44.0`（`c622f085748f812936a7371fcc85d1621fa72ca8`）。
 
 ## 怎么读
 
 - 每次查询前经 `host.auth.get` 现读这个账号的凭据，只放内存；经 `host.http.account` 走账号在 CPR 绑定的代理（没绑就直连；绑了但不可用就失败，不回退直连），带凭据版本号，凭据刚变就失败、让人重试
-- **只发 GET**（唯一的例外是管理员点了的登出设备，见下），不跟随跳转，不刷新令牌（访问令牌过期或 30 秒内过期就不查，等 CPR 自己刷新），不改 CPR 里的账号
+- **查询用量、账单和设备只发 GET**（管理员点了登出设备时才发 POST），不跟随跳转，不刷新令牌（访问令牌过期或 30 秒内过期就不查，等 CPR 自己刷新），不改 CPR 里的账号
 - 请求头只有 `Authorization`、`Accept`、`User-Agent`、`Originator`、`Chatgpt-Account-Id`。UA 和 Originator 实时取 CPR 的 Codex 客户端身份：宿主的 TLS 栈是 rustls，和 Codex CLI 一致，不冒充浏览器
 - 停用的账号、CPR 标记 expired/banned/invalid 的账号、缺 ChatGPT 账号 ID 的账号不查；API Key 账号不列出
 - 令牌被拒（`token_revoked` 单独说明）、Cloudflare 挑战页、限流时整次查询停下，不再发后面的请求；回答里的 `account_id` 和这个账号对不上就拒绝（`account_mismatch`）
@@ -54,6 +54,37 @@
 
 使用位置的颜色跟着位置走、不跟名次，浅色和深色都用 dataviz 校验脚本检查过（浅色下有 3 个颜色对底色不到 3:1，所以每处都有文字图例和数值）。
 
+## 账号探测
+
+从账号监控的任意一行可直接打开该账号的探测记录。「账号探测」页提供时间条、趋势、批量探测、批量配置和设置。测票沿用账号在 CPR 绑定的代理；ModelTrace 走 CPR 模型链，需要填写 `modeltraceClientKeyId`。测票连续三次确认判定变化，可触发 Telegram 通知和自动分组。指纹库同步和 Telegram 通知继续直连。
+
+- **发出真实探测**：默认关。打开后才能手动实际发出测票或 ModelTrace，会消耗账号额度。
+- **运行探测后台任务**：默认关。打开后才会自动测票、监控凭据异常、按判定调整分组、重试待发通知和定期同步指纹库。自动测票还需要打开真实探测，并给账号开启自动测票。
+
+## 从独立账号探测插件迁移
+
+从 `milesians.cpr-turnstate` v0.2.4 迁到原 `milesians.cpr-chatgpt-account-panel` 实例：
+
+1. **先就地升级账号面板**，成功打开一次新版。先别在新版发起探测、改探测规则或开启后台任务。不要卸载旧探测插件，历史还在旧实例下。
+2. 在 CPR 中停用旧探测和新版面板两个实例，然后停止 CPR 服务（保留 PostgreSQL 运行），备份 CPR 数据库。以下查询用来找**实例 UUID**；存在多个同名实例时，按名称核对源和目标：
+
+   ```sql
+   SELECT i.id, i.name, a.plugin_id, a.version, i.enabled
+   FROM plugin_instances i JOIN plugin_artifacts a ON a.sha256 = i.artifact_sha256
+   WHERE a.plugin_id IN ('milesians.cpr-turnstate', 'milesians.cpr-chatgpt-account-panel');
+   ```
+
+3. 在服务器上用连接到 CPR PostgreSQL 的 `psql` 执行 [迁移脚本](scripts/migrate-turnstate.sql)（以下假定已配置 `PGHOST`、`PGDATABASE`、`PGUSER` 等连接参数）。先预演，核对各命名空间记录数和自建分组数，再提交：
+
+   ```bash
+   psql -X -v source=旧探测实例UUID -v target=账号面板实例UUID -f migrate-turnstate.sql
+   psql -X -v source=旧探测实例UUID -v target=账号面板实例UUID -v apply=true -f migrate-turnstate.sql
+   ```
+
+4. 启动 CPR，**只启用新版账号面板**。核对判定、历史、每账号的自动测票配置和分组规则，再在面板插件设置里开启「运行探测后台任务」。旧探测实例保留停用，避免重复探测或通知。
+
+脚本复制自动探测配置、判定、历史和待发通知，搬入探测设置及 Telegram 敏感配置。自建分组只转移归属，分组 ID、成员关系和 Client Key 绑定不变。面板原有用量、账单、登录状态和 OAuth 配置保留。脚本默认回滚，正式迁移拒绝覆盖已存在的探测状态。若要完整回退（包括恢复自建分组归属），用迁移前的数据库备份；请在开启新版后台前做好核验。
+
 ## 重新登录与导入账号
 
 - **凭据存储**：账号的密码与 2FA 密钥（Base32 或 `otpauth://totp/` 链接）以**明文**存在 CPR 数据库 `plugin_state_records` 表的 `login` 命名空间里（键为 CPR 账号 ID；粘贴待导入时暂存在 `email:<邮箱>:<kind>` 下）。密码与 2FA 绝不写入宿主日志 `host.log` 或错误信息，前端页面也绝不回显明文（只返回 `hasPassword` / `hasTotp` 显示“已保存密码 / 已保存 2FA”或“未存密码 / 未存 2FA”）。库里若有旧版加密字段（`passwordEnc` / `totpEnc`），反序列化时自然当作未保存密码（`None`）。
@@ -74,6 +105,7 @@
 ## 模块分工
 
 - **面板**（用量、账单、登录设备、列表、详情）：`backend/src/{chatgpt,usage,billing,devices,store,management,api,host}.rs`、`frontend/src/{App.vue,api.ts,format.ts,surfaces.ts,components/}`
+- **探测**（测票、ModelTrace、历史、调度、通知和分组）：`backend/src/probe/`、`frontend/src/probe/`。路由在 `api/probe/`；维护由 CPR 的 `plugin.reconcile` 触发。
 - **登录**（用登录凭据换令牌并写回 CPR、导入新账号）：`backend/src/{admin.rs,login/}`、`frontend/src/login/`，单独维护。和面板的接口：
   - 后端：`login::routes()` 返回本模块的管理路由（路径都以 `api/login/` 开头，`management` 合进注册），`api/login/` 开头的请求交给 `login::handle`；`login::Login` 是进程内状态，用 `Config` 建一次。错误用 `api::ApiError`，路由用 `api::route`
   - 前端：`login/LoginPage.vue` 是顶部“导入账号”页，`login/AccountLogin.vue` 放在账号详情页（props `accountId`）。请求用 `api.ts` 的 `call`
@@ -108,4 +140,4 @@ Linux 安装包用 `cargo zigbuild --target <平台>.2.28` 构建，二进制最
 
 ## 许可
 
-MIT。
+MIT。ModelTrace 算法和内置指纹库来自 xqy2006/ModelTrace（MIT），内置 Codex 提示词来自 openai/codex（Apache-2.0）。来源和许可证见 [`backend/data/`](backend/data/)。

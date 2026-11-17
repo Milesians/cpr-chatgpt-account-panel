@@ -22,6 +22,7 @@ use crate::clock::now_ms;
 use crate::devices;
 use crate::host;
 use crate::login;
+use crate::probe;
 use crate::store;
 use crate::usage::{self, Summary};
 
@@ -38,6 +39,7 @@ pub fn registration() -> ManagementRegistration {
         api::route("POST", "api/devices/sign-out"),
     ];
     routes.extend(login::routes());
+    routes.extend(probe::management::routes());
     ManagementRegistration {
         routes,
         resources: ["web/index.html", "web/app.js", "web/app.css"]
@@ -50,7 +52,7 @@ pub fn registration() -> ManagementRegistration {
         pages: vec![ManagementPage {
             id: "chatgpt-accounts".to_owned(),
             title: "ChatGPT 账号".to_owned(),
-            description: Some("官方用量（看 Work）、订阅与账单、登录设备".to_owned()),
+            description: Some("官方用量、订阅账单、登录设备和账号探测".to_owned()),
             entry: "web/index.html".to_owned(),
             icon: None,
         }],
@@ -59,6 +61,9 @@ pub fn registration() -> ManagementRegistration {
 }
 
 pub async fn handle(app: &App, call: TypedCall<ManagementRequest>) -> Result<Reply, PluginFault> {
+    if call.request.path.starts_with(probe::management::PREFIX) {
+        return probe::management::handle(&app.probe, call).await;
+    }
     match route(app, &call).await {
         Ok(body) => api::reply(200, &body),
         Err(e) => api::error_reply(&e),

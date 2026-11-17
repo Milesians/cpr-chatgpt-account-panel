@@ -3,8 +3,8 @@
   "name": "cpr-chatgpt-account-panel",
   "displayName": "ChatGPT 账号面板",
   "publisher": "milesians",
-  "version": "0.2.1",
-  "description": "按账号查看 ChatGPT 官方用量、订阅与账单、登录设备，用密码和 2FA 快速登录与导入账号",
+  "version": "0.3.0",
+  "description": "按账号查看 ChatGPT 官方用量、订阅与账单、登录设备，用密码和 2FA 快速登录与导入账号，支持测票和 ModelTrace 探测",
   "license": "MIT",
   "author": "Milesians",
   "engines": {
@@ -15,7 +15,8 @@
   "contributes": {
     "management": {
       "version": 2
-    }
+    },
+    "maintenance": {}
   },
   "configurationSchema": {
     "type": "object",
@@ -23,14 +24,79 @@
       "oauthRedirect": {
         "type": "string",
         "description": "OAuth 回调地址（默认 http://localhost:1455/auth/callback）"
+      },
+      "probeMaintenanceEnabled": {
+        "type": "boolean",
+        "title": "运行探测后台任务",
+        "description": "运行自动测票、凭据异常监控、自动分组、待发通知和指纹库同步。旧插件迁移完成后再开启",
+        "default": false
+      },
+      "probeEnabled": {
+        "type": "boolean",
+        "title": "发出真实探测",
+        "description": "探测会消耗账号的真实额度。关闭时什么也不会发出，手动和自动探测都被拦截",
+        "default": false
+      },
+      "minIntervalMinutes": {
+        "type": "integer",
+        "title": "自动探测最短间隔（分钟）",
+        "description": "同一账号同一方法两次自动探测的最短间隔；手动探测不受限制",
+        "minimum": 0,
+        "maximum": 10080,
+        "default": 30
+      },
+      "fingerprintSyncHours": {
+        "type": "integer",
+        "title": "指纹库同步间隔（小时）",
+        "description": "从 GitHub 上的 xqy2006/ModelTrace 同步指纹库的间隔，0 表示只用内置的一份",
+        "minimum": 0,
+        "maximum": 720,
+        "default": 6
+      },
+      "telegramEnabled": {
+        "type": "boolean",
+        "title": "TG 状态通知",
+        "description": "测票连续 3 次确认状态变化后通知；发送失败会重试，不影响探测结果",
+        "default": false
+      },
+      "telegramBotToken": {
+        "type": "string",
+        "title": "TG Bot Token（敏感字段）",
+        "description": "从 BotFather 获取，通过 CPR 独立敏感配置保存，不要填入普通配置",
+        "maxLength": 256
+      },
+      "telegramChatId": {
+        "type": "string",
+        "title": "TG Chat ID",
+        "description": "接收通知的用户、群组 ID 或 @频道名；私聊需先向机器人发送 /start",
+        "maxLength": 128,
+        "default": ""
+      },
+      "telegramThreadId": {
+        "type": "integer",
+        "title": "TG 话题 ID",
+        "description": "发送到群组话题时填写，0 表示不指定话题",
+        "minimum": 0,
+        "maximum": 2147483647,
+        "default": 0
+      },
+      "modeltraceClientKeyId": {
+        "type": "string",
+        "title": "ModelTrace 使用的 Client Key ID",
+        "description": "ModelTrace 经 CPR 模型链发题时用的 Client Key 的 ID（CPR Client Key 列表里的 ID，不是 Key 本身）。这个 Key 要能访问所有要测的账号（建议不绑分组）；探测用量计入它，也受它的限额约束。不填则 ModelTrace 不可用",
+        "maxLength": 128,
+        "default": ""
       }
     },
     "additionalProperties": false
   },
+  "secretFields": ["telegramBotToken"],
   "resources": {
     "web/index.html": "text/html",
     "web/app.js": "text/javascript",
-    "web/app.css": "text/css"
+    "web/app.css": "text/css",
+    "legal/LICENSE.ModelTrace": "text/plain",
+    "legal/LICENSE.openai-codex": "text/plain"
   },
   "state": [
     {
@@ -58,6 +124,33 @@
       "maximumRecords": 2000,
       "maximumBytes": 4194304,
       "maximumValueBytes": 16384,
+      "migratesFrom": []
+    },
+    {
+      "namespace": "settings",
+      "schemaVersion": 1,
+      "schema": { "type": "object" },
+      "maximumRecords": 4,
+      "maximumBytes": 1048576,
+      "maximumValueBytes": 262144,
+      "migratesFrom": []
+    },
+    {
+      "namespace": "history",
+      "schemaVersion": 1,
+      "schema": { "type": "object" },
+      "maximumRecords": 2000,
+      "maximumBytes": 16777216,
+      "maximumValueBytes": 262144,
+      "migratesFrom": []
+    },
+    {
+      "namespace": "runs",
+      "schemaVersion": 1,
+      "schema": { "type": "object" },
+      "maximumRecords": 10000,
+      "maximumBytes": 16777216,
+      "maximumValueBytes": 65536,
       "migratesFrom": []
     }
   ]

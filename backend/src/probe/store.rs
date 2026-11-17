@@ -1,0 +1,905 @@
+//! 探测设置、历史与单次记录，存在插件私有状态里
+//!
+//! - `settings/schedules`：每个账号每种方法的自动探测开关、模型与间隔
+//! - `history/<账号>/<方法>`：当前判定、TG 待发队列，和这种方法 30 天的探测历史：最近
+//!   [`series::RAW_HOURS`] 小时（至少 [`series::RAW_KEEP`] 条）逐条保存，更早的按小时只记次数
+//!   （见 [`crate::probe::series`]）。旧版只有逐条摘要，读的时候照样能用，下次写入时压缩。
+//!   超过 [`HISTORY_MAX_BYTES`] 时先去掉旧摘要的理由，再把最旧的逐条摘要并进按小时汇总
+//!   （宿主单条私有状态最多 256 KiB）
+//! - `runs/<记录 ID>`：单次探测的详情，每个账号每种方法只留最近 [`DETAIL_KEEP`] 条
+//!
+//! 私有状态只有按键读写，没有列表；摘要里记着哪些详情还在，清理时据此删除。
+//! 凭据和票都不进状态。
+
+use std::collections::BTreeMap;
+
+use gateway_plugin_sdk::{ErrorCode, PluginFault, client::HostClient};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::probe::fingerprint::Challenge;
+use crate::probe::health::{Blocked, Health, HealthView, NoticeKind, Notification};
+use crate::probe::host;
+use crate::probe::modeltrace::{Completion, ModelTraceResult};
+use crate::probe::series::{self, Bucket, HOUR_MS};
+use crate::probe::turnstate::TurnStateResult;
+use crate::probe::verdict::{Level, UpstreamError, Verdict};
+
+const SETTINGS: &str = "settings";
+const SCHEDULES: &str = "schedules";
+const GROUPS: &str = "groups";
+const HISTORY: &str = "history";
+const RUNS: &str = "runs";
+
+/// 摘要保留的时间
+pub const HISTORY_DAYS: i64 = 30;
+/// 每个账号每种方法保留详情的条数
+pub const DETAIL_KEEP: usize = 50;
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+/// 一个账号一种方法的历史记录编码后最多多少字节。宿主单条上限 256 KiB，留出余量
+pub const HISTORY_MAX_BYTES: usize = 240 * 1024;
+
+/// 探测方法
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Method {
+    Turnstate,
+    Modeltrace,
+}
+
+impl Method {
+    /// 按发起顺序：便宜的在前
+    pub const ALL: [Self; 2] = [Self::Turnstate, Self::Modeltrace];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Turnstate => "turnstate",
+            Self::Modeltrace => "modeltrace",
+        }
+    }
+
+    /// 只有测票支持自动探测；ModelTrace 只手动探测（用户 2026-11-02）
+    #[must_use]
+    pub const fn schedulable(self) -> bool {
+        matches!(self, Self::Turnstate)
+    }
+
+    #[must_use]
+    pub const fn default_model(self) -> &'static str {
+        match self {
+            Self::Turnstate => "gpt-6-luna",
+            Self::Modeltrace => "gpt-6.1-sol",
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Turnstate => "测票",
+            Self::Modeltrace => "ModelTrace",
+        }
+    }
+}
+
+/// 一种方法的自动探测设置
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MethodSchedule {
+    pub enabled: bool,
+    pub model: String,
+    pub interval_minutes: u32,
+}
+
+impl Default for MethodSchedule {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: String::new(),
+            interval_minutes: 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSchedule {
+    #[serde(default = "turnstate_schedule")]
+    pub turnstate: MethodSchedule,
+    #[serde(default = "modeltrace_schedule")]
+    pub modeltrace: MethodSchedule,
+}
+
+fn turnstate_schedule() -> MethodSchedule {
+    MethodSchedule {
+        model: Method::Turnstate.default_model().into(),
+        ..MethodSchedule::default()
+    }
+}
+fn modeltrace_schedule() -> MethodSchedule {
+    MethodSchedule {
+        model: Method::Modeltrace.default_model().into(),
+        ..MethodSchedule::default()
+    }
+}
+
+impl Default for AccountSchedule {
+    fn default() -> Self {
+        Self {
+            turnstate: turnstate_schedule(),
+            modeltrace: modeltrace_schedule(),
+        }
+    }
+}
+
+impl AccountSchedule {
+    #[must_use]
+    pub const fn get(&self, method: Method) -> &MethodSchedule {
+        match method {
+            Method::Turnstate => &self.turnstate,
+            Method::Modeltrace => &self.modeltrace,
+        }
+    }
+
+    pub const fn get_mut(&mut self, method: Method) -> &mut MethodSchedule {
+        match method {
+            Method::Turnstate => &mut self.turnstate,
+            Method::Modeltrace => &mut self.modeltrace,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Schedules {
+    #[serde(default)]
+    pub accounts: BTreeMap<String, AccountSchedule>,
+}
+
+/// 批量配置只修改显式提交的字段，未选中的方法和账号保持原值。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulePatch {
+    pub enabled: Option<bool>,
+    pub model: Option<String>,
+    pub interval_minutes: Option<u32>,
+}
+
+/// 记录状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Running,
+    Done,
+    Failed,
+}
+
+/// 历史里的一条摘要
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Summary {
+    pub id: String,
+    pub model: String,
+    /// manual 或 auto
+    pub trigger: String,
+    pub started_ms: i64,
+    #[serde(default)]
+    pub finished_ms: i64,
+    pub status: Status,
+    /// 完成时的判定；失败时为空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<Level>,
+    /// 判定理由或失败原因
+    #[serde(default)]
+    pub reason: String,
+    /// 详情还在 `runs` 里
+    #[serde(default)]
+    pub detail: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct History {
+    /// 最近的逐条摘要，旧的在前
+    #[serde(default)]
+    runs: Vec<Summary>,
+    /// 更早的按小时汇总，旧的在前；旧版没有
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hours: Vec<Bucket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    health: Option<Health>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    notifications: Vec<Notification>,
+    #[serde(default)]
+    notifications_dropped: u32,
+    /// 自动分组上次按哪个当前判定调整过；没有表示还没记下起点
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grouped_level: Option<Level>,
+    /// 自动测票正因为账号本身的问题受阻（只记在测票的历史里）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocked: Option<Blocked>,
+}
+
+impl History {
+    /// 把逐条摘要压到最近 [`series::RAW_HOURS`] 小时（至少留最近 [`series::RAW_KEEP`] 条），
+    /// 更早的并进按小时汇总；丢掉 [`HISTORY_DAYS`] 天前的。返回被并掉、该删的详情 ID
+    fn compact(&mut self, now: i64) -> Vec<String> {
+        let cutoff = now - HISTORY_DAYS * DAY_MS;
+        let raw_since = now - series::RAW_HOURS * HOUR_MS;
+        let keep_from = self.runs.len().saturating_sub(series::RAW_KEEP);
+        let mut expired = Vec::new();
+        let mut kept = Vec::with_capacity(self.runs.len());
+        for (i, s) in std::mem::take(&mut self.runs).into_iter().enumerate() {
+            // 进行中的留给维护任务标成中断
+            if s.status == Status::Running
+                || s.started_ms >= raw_since
+                || (i >= keep_from && s.started_ms >= cutoff)
+            {
+                kept.push(s);
+                continue;
+            }
+            if s.detail {
+                expired.push(s.id.clone());
+            }
+            if s.started_ms >= cutoff {
+                series::fold(&mut self.hours, &s);
+            }
+        }
+        self.runs = kept;
+        let first_hour = series::floor(cutoff, HOUR_MS);
+        self.hours.retain(|b| b.at >= first_hour);
+        expired
+    }
+
+    fn health_view(&self) -> HealthView {
+        HealthView {
+            health: self
+                .health
+                .clone()
+                .unwrap_or_else(|| Health::from_history(&self.runs)),
+            notification_pending: self.notifications.len(),
+            notification_error: self.notifications.iter().find_map(|n| n.last_error.clone()),
+            notifications_dropped: self.notifications_dropped,
+        }
+    }
+
+    fn observe(&mut self, summary: &Summary, notifications: bool) {
+        let health = self
+            .health
+            .get_or_insert_with(|| Health::from_history(&self.runs));
+        let transition = health.observe(summary);
+        if !notifications {
+            self.notifications.clear();
+            return;
+        }
+        if let Some((from, to)) = transition {
+            // A fresh healthy baseline is not a recovery notification, and
+            // 降智 ↔ 疑似 stays abnormal: only crossing normal/abnormal alerts.
+            if (from == Level::Unknown && to == Level::Ok) || (from.abnormal() && to.abnormal()) {
+                return;
+            }
+            self.enqueue(Notification {
+                id: summary.id.clone(),
+                kind: NoticeKind::Verdict,
+                from,
+                to,
+                model: summary.model.clone(),
+                at_ms: summary.finished_ms,
+                blocked: None,
+                attempts: 0,
+                retry_at_ms: 0,
+                last_error: None,
+            });
+        }
+    }
+
+    /// 放进 TG 待发队列；最多留 32 条，超出丢最旧的
+    fn enqueue(&mut self, notification: Notification) {
+        if self.notifications.len() == 32 {
+            self.notifications.remove(0);
+            self.notifications_dropped = self.notifications_dropped.saturating_add(1);
+        }
+        self.notifications.push(notification);
+    }
+}
+
+/// 页面分步发起的 ModelTrace 在完成前保存的题目和已收到的回答
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pending {
+    pub challenges: Vec<Challenge>,
+    pub completions: Vec<Completion>,
+}
+
+/// 单次探测的详情
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Run {
+    pub id: String,
+    pub account_id: String,
+    pub method: Method,
+    pub model: String,
+    pub trigger: String,
+    pub started_ms: i64,
+    #[serde(default)]
+    pub finished_ms: i64,
+    pub status: Status,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<UpstreamError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turnstate: Option<TurnStateResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modeltrace: Option<ModelTraceResult>,
+    /// 只在进行中的 ModelTrace 上有，完成后删掉（回答原文不长期保存）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Pending>,
+}
+
+impl Run {
+    #[must_use]
+    pub fn summary(&self) -> Summary {
+        Summary {
+            id: self.id.clone(),
+            model: self.model.clone(),
+            trigger: self.trigger.clone(),
+            started_ms: self.started_ms,
+            finished_ms: self.finished_ms,
+            status: self.status,
+            level: self.verdict.as_ref().map(|v| v.level),
+            reason: match (&self.verdict, &self.error) {
+                (Some(v), _) => v.reason.clone(),
+                (None, Some(e)) => e.to_string(),
+                (None, None) => String::new(),
+            },
+            detail: true,
+        }
+    }
+}
+
+fn history_key(account_id: &str, method: Method) -> String {
+    format!("{account_id}/{}", method.as_str())
+}
+
+fn json_len<T: Serialize>(value: &T) -> Result<usize, PluginFault> {
+    serde_json::to_vec(value)
+        .map(|v| v.len())
+        .map_err(|_| PluginFault::new(ErrorCode::Fault, "记录编码失败"))
+}
+
+/// 把历史压到 [`HISTORY_MAX_BYTES`] 以内：先从最旧的开始去掉没有详情的摘要的理由，
+/// 还不够就把最旧的逐条摘要按 15 分钟并进汇总（进行中的不动），次数不丢。返回被并掉、该删的详情 ID
+fn fit(history: &mut History) -> Result<Vec<String>, PluginFault> {
+    let mut expired = Vec::new();
+    let mut len = json_len(history)?;
+    if len <= HISTORY_MAX_BYTES {
+        return Ok(expired);
+    }
+    for s in &mut history.runs {
+        if len <= HISTORY_MAX_BYTES {
+            break;
+        }
+        if !s.detail && !s.reason.is_empty() {
+            // 编码后的字符串去掉两侧引号就是省下的字节
+            len -= json_len(&s.reason)? - 2;
+            s.reason.clear();
+        }
+    }
+    while len > HISTORY_MAX_BYTES {
+        let mut dropped = false;
+        let mut i = 0;
+        while i < history.runs.len() && len > HISTORY_MAX_BYTES {
+            if history.runs[i].status == Status::Running {
+                i += 1;
+                continue;
+            }
+            let s = history.runs.remove(i);
+            // 摘要本身加上分隔它的逗号；并进汇总多出的字节由下面的实际编码核对
+            len = len.saturating_sub(json_len(&s)? + 1);
+            // 逐条摘要都还在 48 小时内，按 15 分钟汇总，24 小时时间条的格子仍然准确
+            series::fold_fine(&mut history.hours, &s);
+            if s.detail {
+                expired.push(s.id);
+            }
+            dropped = true;
+        }
+        // 估算可能有出入，按实际编码再核一次
+        len = json_len(history)?;
+        if !dropped {
+            break;
+        }
+    }
+    Ok(expired)
+}
+
+/// 写入历史前压到上限以内；被丢掉的摘要的详情一并删除
+async fn put_history(
+    host: &HostClient,
+    key: &str,
+    history: &mut History,
+    version: Option<u64>,
+    expired: &mut Vec<String>,
+) -> Result<(), PluginFault> {
+    expired.extend(fit(history)?);
+    host::state_put(host, HISTORY, key, encode(&*history)?, version)
+        .await
+        .map(|_| ())
+}
+
+async fn delete_runs(host: &HostClient, ids: Vec<String>) -> Result<(), PluginFault> {
+    for id in ids {
+        if let Some((_, v)) = run(host, &id).await? {
+            let _ = host::state_delete(host, RUNS, &id, v).await;
+        }
+    }
+    Ok(())
+}
+
+fn encode<T: Serialize>(value: &T) -> Result<Value, PluginFault> {
+    serde_json::to_value(value).map_err(|_| PluginFault::new(ErrorCode::Fault, "记录编码失败"))
+}
+
+/// 读全部自动探测设置和它的版本
+///
+/// # Errors
+/// 回调失败时返回错误
+pub async fn schedules(host: &HostClient) -> Result<(Schedules, Option<u64>), PluginFault> {
+    let (mut schedules, version): (Schedules, _) =
+        match host::state_get(host, SETTINGS, SCHEDULES).await? {
+            Some(record) => (
+                serde_json::from_value(record.value).unwrap_or_default(),
+                Some(record.version),
+            ),
+            None => (Schedules::default(), None),
+        };
+    for account in schedules.accounts.values_mut() {
+        for method in Method::ALL {
+            let schedule = account.get_mut(method);
+            if schedule.model.is_empty() {
+                schedule.model = method.default_model().into();
+            }
+            // 旧版保存的 ModelTrace 自动探测开关作废
+            if !method.schedulable() {
+                schedule.enabled = false;
+            }
+        }
+    }
+    Ok((schedules, version))
+}
+
+/// 读自动分组设置和它的版本
+///
+/// # Errors
+/// 回调失败时返回错误
+pub async fn group_config(
+    host: &HostClient,
+) -> Result<(crate::probe::groups::GroupConfig, Option<u64>), PluginFault> {
+    Ok(match host::state_get(host, SETTINGS, GROUPS).await? {
+        Some(record) => (
+            serde_json::from_value(record.value).unwrap_or_default(),
+            Some(record.version),
+        ),
+        None => (crate::probe::groups::GroupConfig::default(), None),
+    })
+}
+
+/// 改自动分组设置；`change` 拒绝时不写入，并发修改时重读再改
+///
+/// # Errors
+/// 回调失败或一直冲突时返回错误
+pub async fn update_group_config(
+    host: &HostClient,
+    mut change: impl FnMut(&mut crate::probe::groups::GroupConfig) -> Result<(), String>,
+) -> Result<Result<(), String>, PluginFault> {
+    for _ in 0..5 {
+        let (mut config, version) = group_config(host).await?;
+        if let Err(reason) = change(&mut config) {
+            return Ok(Err(reason));
+        }
+        match host::state_put(host, SETTINGS, GROUPS, encode(&config)?, version).await {
+            Ok(_) => return Ok(Ok(())),
+            Err(error) if error.code == ErrorCode::Conflict => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Conflict,
+        "设置被同时修改，请重试",
+    ))
+}
+
+/// 改一个账号一种方法的设置；并发修改时重读再改
+///
+/// # Errors
+/// 回调失败时返回错误
+pub async fn update_schedule(
+    host: &HostClient,
+    account_id: &str,
+    method: Method,
+    schedule: MethodSchedule,
+) -> Result<AccountSchedule, PluginFault> {
+    for _ in 0..5 {
+        let (mut all, version) = schedules(host).await?;
+        let account = all.accounts.entry(account_id.to_owned()).or_default();
+        *account.get_mut(method) = schedule.clone();
+        let updated = account.clone();
+        if updated == AccountSchedule::default() {
+            all.accounts.remove(account_id);
+        }
+        match host::state_put(host, SETTINGS, SCHEDULES, encode(&all)?, version).await {
+            Ok(_) => return Ok(updated),
+            Err(error) if error.code == ErrorCode::Conflict => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Conflict,
+        "设置被同时修改，请重试",
+    ))
+}
+
+/// 同一次 CAS 写入所有选中账号，冲突时重读，避免部分账号被修改。
+///
+/// # Errors
+/// 私有状态操作失败或连续版本冲突时返回错误。
+pub async fn update_schedules(
+    host: &HostClient,
+    account_ids: &[String],
+    method: Method,
+    patch: &SchedulePatch,
+) -> Result<(), PluginFault> {
+    for _ in 0..5 {
+        let (mut all, version) = schedules(host).await?;
+        for id in account_ids {
+            let account = all.accounts.entry(id.clone()).or_default();
+            let schedule = account.get_mut(method);
+            if let Some(enabled) = patch.enabled {
+                schedule.enabled = enabled;
+            }
+            if let Some(model) = &patch.model {
+                schedule.model.clone_from(model);
+            }
+            if let Some(interval) = patch.interval_minutes {
+                schedule.interval_minutes = interval;
+            }
+            if *account == AccountSchedule::default() {
+                all.accounts.remove(id);
+            }
+        }
+        match host::state_put(host, SETTINGS, SCHEDULES, encode(&all)?, version).await {
+            Ok(_) => return Ok(()),
+            Err(error) if error.code == ErrorCode::Conflict => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Conflict,
+        "设置被同时修改，请重试",
+    ))
+}
+
+/// 一个账号一种方法的摘要，旧的在前
+///
+/// # Errors
+/// 回调失败时返回错误
+pub async fn history(
+    host: &HostClient,
+    account_id: &str,
+    method: Method,
+) -> Result<Vec<Summary>, PluginFault> {
+    Ok(history_record(host, account_id, method).await?.0.runs)
+}
+
+/// 展示用的历史：最近的逐条摘要（旧的在前）、更早的按小时汇总，和测票的当前判定
+#[derive(Debug, Clone, Default)]
+pub struct HistoryView {
+    pub runs: Vec<Summary>,
+    pub buckets: Vec<Bucket>,
+    pub health: Option<HealthView>,
+    pub blocked: Option<Blocked>,
+}
+
+/// 读一个账号一种方法的历史，按现在压缩（只在内存里，不写回）
+///
+/// # Errors
+/// 回调失败时返回错误
+pub async fn history_view(
+    host: &HostClient,
+    account_id: &str,
+    method: Method,
+) -> Result<HistoryView, PluginFault> {
+    let (mut history, _) = history_record(host, account_id, method).await?;
+    let health = (method == Method::Turnstate).then(|| history.health_view());
+    history.compact(crate::clock::now_ms());
+    Ok(HistoryView {
+        runs: history.runs,
+        buckets: history.hours,
+        health,
+        blocked: history.blocked,
+    })
+}
+
+/// 账号测票现在记着的受阻状态
+///
+/// # Errors
+/// 回调失败时返回错误
+pub async fn blocked(host: &HostClient, account_id: &str) -> Result<Option<Blocked>, PluginFault> {
+    Ok(history_record(host, account_id, Method::Turnstate)
+        .await?
+        .0
+        .blocked)
+}
+
+/// 改受阻状态；`notice` 有值且开着 TG 通知时同一次写入放进待发队列
+///
+/// # Errors
+/// 回调失败或一直冲突时返回错误
+pub async fn set_blocked(
+    host: &HostClient,
+    account_id: &str,
+    next: Option<Blocked>,
+    notice: Option<NoticeKind>,
+    notifications: bool,
+) -> Result<(), PluginFault> {
+    let key = history_key(account_id, Method::Turnstate);
+    for _ in 0..5 {
+        let (mut history, version) = history_record(host, account_id, Method::Turnstate).await?;
+        let previous = history.blocked.clone();
+        history.blocked.clone_from(&next);
+        if let (Some(kind), true) = (notice, notifications) {
+            let health = history
+                .health
+                .clone()
+                .unwrap_or_else(|| Health::from_history(&history.runs));
+            // 恢复通知带上受阻时的原因和开始时间
+            let about = next.clone().or(previous);
+            let at_ms = crate::clock::now_ms();
+            history.enqueue(Notification {
+                id: format!("{}-{at_ms}", kind_name(kind)),
+                kind,
+                from: health.level,
+                to: health.level,
+                model: health.model,
+                at_ms,
+                blocked: about,
+                attempts: 0,
+                retry_at_ms: 0,
+                last_error: None,
+            });
+        }
+        let mut expired = Vec::new();
+        match put_history(host, &key, &mut history, version, &mut expired).await {
+            Ok(()) => return delete_runs(host, expired).await,
+            Err(error) if error.code == ErrorCode::Conflict => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Conflict,
+        "探测历史被同时修改，请重试",
+    ))
+}
+
+const fn kind_name(kind: NoticeKind) -> &'static str {
+    match kind {
+        NoticeKind::Verdict => "verdict",
+        NoticeKind::Blocked => "blocked",
+        NoticeKind::Unblocked => "unblocked",
+    }
+}
+
+/// 账号测票的当前判定，和自动分组上次按哪个判定调整过
+///
+/// # Errors
+/// 回调失败时返回错误
+pub async fn group_levels(
+    host: &HostClient,
+    account_id: &str,
+) -> Result<(Level, Option<Level>), PluginFault> {
+    let (history, _) = history_record(host, account_id, Method::Turnstate).await?;
+    Ok((history.health_view().health.level, history.grouped_level))
+}
+
+/// 记下自动分组已按 `level` 调整过（或以它为起点）
+///
+/// # Errors
+/// 回调失败或一直冲突时返回错误
+pub async fn set_grouped_level(
+    host: &HostClient,
+    account_id: &str,
+    level: Level,
+) -> Result<(), PluginFault> {
+    let key = history_key(account_id, Method::Turnstate);
+    for _ in 0..5 {
+        let (mut history, version) = history_record(host, account_id, Method::Turnstate).await?;
+        if history.grouped_level == Some(level) {
+            return Ok(());
+        }
+        history.grouped_level = Some(level);
+        let mut expired = Vec::new();
+        match put_history(host, &key, &mut history, version, &mut expired).await {
+            Ok(()) => return delete_runs(host, expired).await,
+            Err(error) if error.code == ErrorCode::Conflict => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Conflict,
+        "探测历史被同时修改，请重试",
+    ))
+}
+
+async fn history_record(
+    host: &HostClient,
+    account_id: &str,
+    method: Method,
+) -> Result<(History, Option<u64>), PluginFault> {
+    Ok(
+        match host::state_get(host, HISTORY, &history_key(account_id, method)).await? {
+            Some(record) => (
+                serde_json::from_value(record.value).unwrap_or_default(),
+                Some(record.version),
+            ),
+            None => (History::default(), None),
+        },
+    )
+}
+
+/// 读一条详情
+///
+/// # Errors
+/// 回调失败时返回错误
+pub async fn run(host: &HostClient, id: &str) -> Result<Option<(Run, u64)>, PluginFault> {
+    Ok(match host::state_get(host, RUNS, id).await? {
+        Some(record) => serde_json::from_value(record.value)
+            .ok()
+            .map(|run| (run, record.version)),
+        None => None,
+    })
+}
+
+/// 保存详情并更新摘要。`version` 为空表示新记录
+///
+/// # Errors
+/// 回调失败时返回错误
+pub async fn save(host: &HostClient, run: &Run, version: Option<u64>) -> Result<u64, PluginFault> {
+    save_with_notifications(host, run, version, false).await
+}
+
+/// Save health and its notification outbox in the same history CAS write.
+///
+/// # Errors
+/// Returns state storage or version conflict errors.
+pub async fn save_with_notifications(
+    host: &HostClient,
+    run: &Run,
+    version: Option<u64>,
+    notifications: bool,
+) -> Result<u64, PluginFault> {
+    let version = host::state_put(host, RUNS, &run.id, encode(run)?, version).await?;
+    let expired = upsert_summary(
+        host,
+        run.summary(),
+        &run.account_id,
+        run.method,
+        notifications,
+    )
+    .await?;
+    delete_runs(host, expired).await?;
+    Ok(version)
+}
+
+/// 写入一条摘要并压缩历史；返回该删的详情 ID
+async fn upsert_summary(
+    host: &HostClient,
+    summary: Summary,
+    account_id: &str,
+    method: Method,
+    notifications: bool,
+) -> Result<Vec<String>, PluginFault> {
+    let key = history_key(account_id, method);
+    for _ in 0..5 {
+        let (mut history, version) = history_record(host, account_id, method).await?;
+        let completed = history
+            .runs
+            .iter()
+            .any(|s| s.id == summary.id && s.status != Status::Running);
+        if method == Method::Turnstate && !completed {
+            history.observe(&summary, notifications);
+        }
+        match history.runs.iter_mut().find(|s| s.id == summary.id) {
+            Some(existing) => *existing = summary.clone(),
+            None => history.runs.push(summary.clone()),
+        }
+        history.runs.sort_by_key(|s| s.started_ms);
+        let mut expired = history.compact(summary.started_ms.max(crate::clock::now_ms()));
+        let with_detail = history.runs.iter().filter(|s| s.detail).count();
+        let mut drop = with_detail.saturating_sub(DETAIL_KEEP);
+        for s in &mut history.runs {
+            if drop == 0 {
+                break;
+            }
+            if s.detail && s.status != Status::Running {
+                s.detail = false;
+                expired.push(s.id.clone());
+                drop -= 1;
+            }
+        }
+        match put_history(host, &key, &mut history, version, &mut expired).await {
+            Ok(()) => return Ok(expired),
+            Err(error) if error.code == ErrorCode::Conflict => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PluginFault::new(
+        ErrorCode::Conflict,
+        "探测历史被同时修改，请重试",
+    ))
+}
+
+/// Claim the oldest queued notification for one minute across concurrent callers.
+pub(crate) async fn claim_notification(
+    host: &HostClient,
+    account_id: &str,
+    enabled: bool,
+) -> Result<Option<Notification>, PluginFault> {
+    for _ in 0..5 {
+        let (mut history, version) = history_record(host, account_id, Method::Turnstate).await?;
+        if history.notifications.is_empty() {
+            return Ok(None);
+        }
+        let claimed = if enabled {
+            let first = &mut history.notifications[0];
+            if first.retry_at_ms > crate::clock::now_ms() {
+                return Ok(None);
+            }
+            first.attempts = first.attempts.saturating_add(1);
+            first.retry_at_ms = crate::clock::now_ms() + 60_000;
+            Some(first.clone())
+        } else {
+            history.notifications.clear();
+            None
+        };
+        let mut expired = Vec::new();
+        let key = history_key(account_id, Method::Turnstate);
+        match put_history(host, &key, &mut history, version, &mut expired).await {
+            Ok(()) => {
+                delete_runs(host, expired).await?;
+                return Ok(claimed);
+            }
+            Err(e) if e.code == ErrorCode::Conflict => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(PluginFault::new(ErrorCode::Conflict, "通知队列被同时修改"))
+}
+
+pub(crate) async fn finish_notification(
+    host: &HostClient,
+    account_id: &str,
+    claimed: &Notification,
+    error: Option<String>,
+    retry_after_ms: Option<i64>,
+) -> Result<(), PluginFault> {
+    for _ in 0..5 {
+        let (mut history, version) = history_record(host, account_id, Method::Turnstate).await?;
+        let Some(index) = history
+            .notifications
+            .iter()
+            .position(|n| n.id == claimed.id && n.attempts == claimed.attempts)
+        else {
+            return Ok(());
+        };
+        if let Some(error) = &error {
+            let n = &mut history.notifications[index];
+            n.last_error = Some(error.clone());
+            let delay = 60_000_i64 * (1_i64 << n.attempts.saturating_sub(1).min(6));
+            n.retry_at_ms =
+                crate::clock::now_ms() + delay.min(3_600_000).max(retry_after_ms.unwrap_or(0));
+        } else {
+            history.notifications.remove(index);
+        }
+        let mut expired = Vec::new();
+        let key = history_key(account_id, Method::Turnstate);
+        match put_history(host, &key, &mut history, version, &mut expired).await {
+            Ok(()) => return delete_runs(host, expired).await,
+            Err(e) if e.code == ErrorCode::Conflict => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(PluginFault::new(ErrorCode::Conflict, "通知队列被同时修改"))
+}
