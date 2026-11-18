@@ -280,6 +280,173 @@ async fn relogin_runs_through_the_bound_proxy_and_replaces_cpr_credentials() {
 }
 
 #[tokio::test]
+async fn email_otp_page_falls_back_to_password_login() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    host.forbidden_secrets = vec![
+        TEST_PASSWORD.to_owned(),
+        NEW_ACCESS_TOKEN_SIG.to_owned(),
+        NEW_REFRESH_TOKEN.to_owned(),
+    ];
+
+    let mut peer = Peer::start(test_config()).await;
+
+    let session_cookie_payload = base64_url_encode(
+        &serde_json::to_vec(&json!({
+            "client_auth_session": {
+                "workspaces": [
+                    {"id": "chatgpt-acct_a", "name": "Personal"}
+                ]
+            }
+        }))
+        .unwrap(),
+    );
+    let new_jwt = make_jwt("acct_a@example.com", "chatgpt-acct_a", "plus");
+
+    host.http.extend([
+        redirect("https://auth.openai.com/log-in"),
+        HttpReply {
+            status: 200,
+            headers: vec![
+                ("content-type".into(), b"text/html".to_vec()),
+                ("set-cookie".into(), b"login_session=sess1; Path=/".to_vec()),
+            ],
+            body: b"<html>login</html>".to_vec(),
+        },
+        ok(json!({
+            "token": "sent-tok-1",
+            "proofofwork": {"required": true, "seed": "seed1", "difficulty": "f"}
+        })),
+        // 邮箱提交后先落到 Email OTP 页面
+        ok(json!({
+            "page": {"type": "email_otp_verification"},
+            "continue_url": "/email-verification"
+        })),
+        // 自动走邮箱验证码页上的“Continue with password”
+        HttpReply {
+            status: 200,
+            headers: vec![("content-type".into(), b"text/html".to_vec())],
+            body: b"<html>password</html>".to_vec(),
+        },
+        ok(json!({
+            "token": "sent-tok-2",
+            "proofofwork": {"required": true, "seed": "seed2", "difficulty": "f"}
+        })),
+        HttpReply {
+            status: 200,
+            headers: vec![
+                ("content-type".into(), b"application/json".to_vec()),
+                (
+                    "set-cookie".into(),
+                    format!("oai-client-auth-session=s:{session_cookie_payload}.sig; Path=/")
+                        .into_bytes(),
+                ),
+            ],
+            body: serde_json::to_vec(&json!({
+                "page": {"type": "consent"}
+            }))
+            .unwrap(),
+        },
+        redirect(
+            "http://localhost:1455/auth/callback?code=otp_fallback_code&state=__OAUTH_STATE__",
+        ),
+        ok(json!({
+            "access_token": new_jwt,
+            "refresh_token": NEW_REFRESH_TOKEN,
+            "id_token": ""
+        })),
+    ]);
+
+    let (code, body) = peer
+        .api(
+            "POST",
+            "api/login/run",
+            "",
+            Some(json!({
+                "accountId": "acct_a",
+                "password": TEST_PASSWORD,
+                "saveCredentials": true,
+            })),
+            &mut host,
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert_no_secret_in_value(&body, &[]);
+    assert_eq!(body["ok"], true);
+
+    // 第 4 步应带着邮箱验证码页的 Referer 跳到密码页，而不是直接报 email_otp_required
+    assert_eq!(host.seen_http.len(), 9);
+    assert_eq!(host.seen_http[4].method, "GET");
+    assert_eq!(
+        host.seen_http[4].url,
+        "https://auth.openai.com/log-in/password"
+    );
+    assert_eq!(
+        host.seen_http[4].header("referer").as_deref(),
+        Some("https://auth.openai.com/email-verification")
+    );
+    assert!(
+        host.seen_http[6]
+            .header("openai-sentinel-token")
+            .unwrap()
+            .contains("password_verify")
+    );
+    let password_body: Value = serde_json::from_slice(&host.seen_http[6].body).unwrap();
+    assert_eq!(password_body["password"], TEST_PASSWORD);
+    let workspace_body: Value = serde_json::from_slice(&host.seen_http[7].body).unwrap();
+    assert_eq!(workspace_body["workspace_id"], "chatgpt-acct_a");
+}
+
+#[tokio::test]
+async fn email_otp_page_reports_passwordless_accounts_without_looping() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    host.forbidden_secrets = vec![TEST_PASSWORD.to_owned()];
+
+    let mut peer = Peer::start(test_config()).await;
+
+    host.http.extend([
+        redirect("https://auth.openai.com/log-in"),
+        HttpReply {
+            status: 200,
+            headers: vec![("content-type".into(), b"text/html".to_vec())],
+            body: b"<html>login</html>".to_vec(),
+        },
+        ok(json!({
+            "token": "sent-tok-1",
+            "proofofwork": {"required": true, "seed": "seed1", "difficulty": "f"}
+        })),
+        ok(json!({
+            "page": {"type": "email_otp_verification"},
+            "continue_url": "/email-verification"
+        })),
+        // 该账号未开放密码登录时，密码页会退回邮箱验证码页
+        redirect("https://auth.openai.com/email-verification"),
+        HttpReply {
+            status: 200,
+            headers: vec![("content-type".into(), b"text/html".to_vec())],
+            body: b"<html>email verification</html>".to_vec(),
+        },
+    ]);
+
+    let (code, body) = peer
+        .api(
+            "POST",
+            "api/login/run",
+            "",
+            Some(json!({
+                "accountId": "acct_a",
+                "password": TEST_PASSWORD,
+            })),
+            &mut host,
+        )
+        .await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(body["error"]["code"], "email_otp_required");
+    assert_eq!(body["error"]["details"]["stage"], "password");
+    assert_no_secret_in_value(&body, &[]);
+    assert_eq!(host.seen_http.len(), 6);
+}
+
+#[tokio::test]
 async fn cloudflare_challenge_triggers_browser_challenge_and_manual_oauth_completes() {
     let mut host = FakeHost::new(&["acct_a"]);
     host.forbidden_secrets = vec![

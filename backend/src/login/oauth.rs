@@ -600,6 +600,7 @@ impl Flow<'_> {
 
         let mut password_sent = false;
         let mut totp_sent = false;
+        let mut password_fallback_tried = false;
 
         for _ in 0..MAX_STEPS {
             if let Some(res) = self.check_callback(&p.next) {
@@ -648,11 +649,22 @@ impl Flow<'_> {
                     p = self.select_organization(&p.data, "").await?;
                 }
                 "email_otp" | "email_otp_verification" | "email-verification" => {
-                    return Err(LoginError::new(
-                        self.stage,
-                        "email_otp_required",
-                        "该账号要求邮箱验证码（Email OTP），无法仅凭密码和 2FA 自动登录，请使用手动 OAuth 链接登录",
-                    ));
+                    if password_fallback_tried {
+                        return Err(LoginError::new(
+                            "password",
+                            "email_otp_required",
+                            "该账号当前只允许邮箱验证码（Email OTP）登录，无法切换到密码登录，请使用手动 OAuth 链接登录",
+                        ));
+                    }
+                    // OpenAI 的邮箱验证码页有“Continue with password”入口，实际就是
+                    // 带着当前登录会话跳回 /log-in/password；先切过去再复用密码验证分支。
+                    password_fallback_tried = true;
+                    self.stage = "password";
+                    self.report("password", "切换为密码登录");
+                    let otp_ref = format!("{DEFAULT_ORIGIN}/email-verification");
+                    p = self
+                        .get(&format!("{DEFAULT_ORIGIN}/log-in/password"), &otp_ref)
+                        .await?;
                 }
                 "add_phone" | "phone" | "phone_verification" | "captcha" | "sso" | "signup" => {
                     return Err(LoginError::new(

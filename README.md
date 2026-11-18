@@ -100,6 +100,7 @@
 - **CPR 管理接口**：经 `host.http.dispatch` 调宿主自己的路由（只传 `/api/admin/...` 相对路径），宿主给子请求注入插件身份，不需要管理 API Key，也不出本机网络。v0.1.5 起清单里不再有 v0.1.3 及以前的 `cprAdminUrl`、`cprAdminApiKey`，从旧版本升级时按发布说明删掉它们。
 - **多个工作区**：账号有多个工作区或组织时，错误里带上候选（`details.choices`），详情页和导入行直接点选重试，不用手抄 ID。
 - **2FA**：当前 30 秒窗口只剩 4 秒以内时，等到下一个窗口再生成验证码，避免经代理到达时已过期；“发起 2FA 验证失败”（`mfa_issue_failed`）和“验证码被拒”（`totp_rejected`）分开报。
+- **邮箱验证码（Email OTP）**：登录落到邮箱验证码页时，先按页面上的“Continue with password”切到 `/log-in/password`，再用已保存的密码和 2FA 继续；只有账号确实未开放密码登录时才返回 `email_otp_required`，提示改用手动 OAuth。
 
 ## 模块分工
 
