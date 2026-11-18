@@ -577,6 +577,9 @@ addEventListener('DOMContentLoaded', () => window.__setHostTheme('light'), { onc
 </script>`
 
 const rawHtml = await readFile(join(distDir, 'index.html'), 'utf8')
+const builtCss = await readFile(join(distDir, 'app.css'), 'utf8')
+assert.doesNotMatch(builtCss, /url\s*\(/i, '打包后的 CSS 不能包含 url(...)，CPR 插件沙箱会拒绝')
+assert.doesNotMatch(`${rawHtml}\n${builtCss}`, /data:image\//i, '打包产物不能包含 data:image/ 资源地址')
 const html = rawHtml.replace('<head>', `<head>${bridgeScript}`)
 const mime = {
   '.html': 'text/html; charset=utf-8',
