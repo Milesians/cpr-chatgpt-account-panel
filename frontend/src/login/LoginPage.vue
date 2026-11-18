@@ -10,12 +10,14 @@ import { ZButton, ZTag } from '@codex-proxy/ui'
 import {
   Check,
   Copy,
+  Eraser,
   ExternalLink,
   Link2,
   Play,
+  RotateCcw,
   Square,
 } from '@lucide/vue'
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { canOpenExternal, openExternal } from '../api'
 import { copyText, selectField } from '../clipboard'
 import { loginApi } from './client'
@@ -85,6 +87,13 @@ const importAction = computed(() => resolveImportAction({
   importing: importing.value,
   includeExistingUpdates: includeExistingUpdates.value,
 }))
+
+const failedTasks = computed(() =>
+  importQueue.value.filter(task => rowStates.value[task.line]?.status === 'error'),
+)
+const onlyExistingPending = computed(() =>
+  Boolean(previewReport.value && previewReport.value.created === 0 && previewReport.value.updated > 0 && !includeExistingUpdates.value),
+)
 
 const hasImportProgress = computed(() => importing.value || Object.keys(rowStates.value).length > 0)
 const missingProxy = computed(() => proxyId.value !== null && proxyId.value !== '' && !proxies.value.some(p => p.id === proxyId.value))
@@ -175,8 +184,19 @@ async function runPreview(text: string) {
   }
 }
 
-async function handleStartImport() {
-  const queue = importQueue.value
+function clearPaste() {
+  if (importing.value)
+    return
+  pasteText.value = ''
+  includeExistingUpdates.value = false
+  previewReport.value = null
+  rowStates.value = {}
+  manualTarget.value = null
+  importError.value = ''
+  importNotice.value = ''
+}
+
+async function runImportTasks(queue: QueuedImportTask[]) {
   if (!queue.length) {
     importError.value = importAction.value.title ?? '没有可导入的行'
     return
@@ -221,6 +241,24 @@ async function handleStartImport() {
   importNotice.value = `导入执行结束${stoppedText}：成功 ${succeeded} 个，失败 ${failed} 个`
   await loadProxies()
   emit('accountsChanged')
+}
+
+async function handleStartImport() {
+  await runImportTasks(importQueue.value)
+}
+
+async function handleRetryFailed() {
+  if (importing.value || !failedTasks.value.length)
+    return
+  await runImportTasks(failedTasks.value)
+}
+
+async function overwriteAndReloginExisting() {
+  if (importing.value)
+    return
+  includeExistingUpdates.value = true
+  await nextTick()
+  await handleStartImport()
 }
 
 async function executeImportTask(task: QueuedImportTask, choice?: LoginChoice, egress?: string) {
@@ -330,6 +368,13 @@ async function submitManualCallback() {
   }
 }
 
+function onManualCallbackPaste() {
+  void nextTick(() => {
+    if (manualCallbackUrl.value.trim().includes('code=') && !manualBusy.value)
+      void submitManualCallback()
+  })
+}
+
 async function copyManualUrl() {
   if (!manualAuthUrl.value)
     return
@@ -356,15 +401,21 @@ onMounted(loadProxies)
       读不到 CPR 的代理：{{ proxiesError }}
     </p>
 
-    <section class="detail-card" aria-labelledby="quick-import-title">
+    <section class="detail-card" aria-label="批量粘贴导入">
       <div class="detail-card-head">
         <div class="card-title-group">
-          <h2 id="quick-import-title" class="card-title">
-            导入账号
-          </h2>
-          <span class="muted">
-            一行一个 <code>邮箱----密码----2FA</code>，行尾可加 <code>----team</code> 或 <code>----personal</code>（2FA 为空写 <code>邮箱----密码--------team</code>）
+          <span class="muted text-xs leading-relaxed">
+            格式：<code>邮箱----密码----2FA</code>，行尾可加 <code>----team</code> 或 <code>----personal</code>（2FA 为空写 <code>邮箱----密码--------team</code>）
           </span>
+        </div>
+        <div class="card-actions">
+          <ZButton
+            size="small"
+            :disabled="(!pasteText.trim() && !previewReport) || importing"
+            @click="clearPaste"
+          >
+            <Eraser :size="13" aria-hidden="true" /> 清空
+          </ZButton>
         </div>
       </div>
 
@@ -378,9 +429,9 @@ onMounted(loadProxies)
 
       <div class="flex flex-wrap items-center justify-between gap-3 text-xs">
         <div class="flex flex-wrap items-center gap-4">
-          <label class="inline-flex items-center gap-2 text-cp-text-secondary">
+          <label class="inline-flex max-w-full flex-wrap items-center gap-2 text-cp-text-secondary">
             <span class="whitespace-nowrap">新账号出口：</span>
-            <select v-model="proxyId" class="cp-select w-72" aria-label="新账号出口" :disabled="loadingProxies || importing">
+            <select v-model="proxyId" class="cp-select w-72 max-w-full" aria-label="新账号出口" :disabled="loadingProxies || importing">
               <option v-if="proxyId === null" :value="null" disabled>{{ loadingProxies ? '正在读取代理…' : '选择直连或代理' }}</option>
               <option value="">直连（不使用代理）</option>
               <option v-if="missingProxy" :value="proxyId" disabled>原代理已移除，请重新选择</option>
@@ -390,14 +441,21 @@ onMounted(loadProxies)
             </select>
           </label>
 
-          <label class="inline-flex cursor-pointer items-center gap-1.5 text-cp-text-secondary">
-            <input v-model="includeExistingUpdates" type="checkbox">
+          <label class="cp-check-label">
+            <input v-model="includeExistingUpdates" type="checkbox" class="cp-check">
             <span>同时对 CPR 中已存在的同邮箱同类型账号重新登录并更新</span>
           </label>
         </div>
 
         <div class="flex flex-wrap items-center gap-2">
           <span v-if="previewing" class="muted">正在解析预览…</span>
+          <ZButton
+            v-if="!importing && failedTasks.length"
+            size="small"
+            @click="handleRetryFailed"
+          >
+            <RotateCcw :size="13" aria-hidden="true" /> 重试失败项 ({{ failedTasks.length }})
+          </ZButton>
           <ZButton
             type="primary"
             size="small"
@@ -446,6 +504,17 @@ onMounted(loadProxies)
             <span>跳过</span>
             <strong>{{ previewReport.skipped }}</strong>
           </span>
+          <template v-if="onlyExistingPending">
+            <span class="flex-1" />
+            <ZButton
+              size="small"
+              type="primary"
+              :disabled="importing"
+              @click="overwriteAndReloginExisting"
+            >
+              <Play :size="13" aria-hidden="true" /> 覆盖并重登这 {{ previewReport.updated }} 个已有账号
+            </ZButton>
+          </template>
         </div>
 
         <div v-if="previewReport.items.length" class="card-list" role="list" aria-label="导入预览列表">
@@ -547,7 +616,7 @@ onMounted(loadProxies)
             <!-- 触发行原地展开浏览器手动登录 -->
             <div
               v-if="manualTarget?.line === item.line"
-              class="sub-panel"
+              class="sub-panel sub-panel-inset"
               aria-label="浏览器手动登录"
             >
               <div class="detail-card-head">
@@ -559,7 +628,7 @@ onMounted(loadProxies)
                 </ZButton>
               </div>
               <p class="muted note">
-                在浏览器中打开下方授权链接并完成验证，然后将跳转后的 <code>{{ manualRedirectUrl || 'http://127.0.0.1:1455/auth/callback' }}?code=...&amp;state=...</code> 完整地址粘贴到下方提交（浏览器会显示“无法访问此网站”，这是正常的，复制地址栏即可）。
+                在浏览器中打开下方授权链接并完成验证，跳转后复制 <code>{{ manualRedirectUrl || 'http://127.0.0.1:1455/auth/callback' }}?code=...&amp;state=...</code> 完整地址粘贴到下方将自动提交（浏览器会显示“无法访问此网站”，这是正常的，复制地址栏即可）。
               </p>
               <p v-if="manualError" class="banner banner-error" role="alert">
                 {{ manualError }}
@@ -591,8 +660,9 @@ onMounted(loadProxies)
                   v-model="manualCallbackUrl"
                   type="text"
                   class="cp-input font-mono text-xs"
-                  :placeholder="`粘贴 ${manualRedirectUrl || 'http://127.0.0.1:1455/auth/callback'}?code=...&state=...`"
+                  :placeholder="`粘贴 ${manualRedirectUrl || 'http://127.0.0.1:1455/auth/callback'}?code=...&state=...（粘贴即自动提交）`"
                   aria-label="OAuth 回调链接"
+                  @paste="onManualCallbackPaste"
                 >
                 <ZButton
                   type="primary"

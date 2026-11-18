@@ -44,8 +44,8 @@ async function testTelegram() {
 
 <template>
   <div class="probe-detail-page">
-    <header class="detail-header">
-      <ZButton variant="text" @click="emit('back')"><ArrowLeft class="size-4" aria-hidden="true" /> 返回列表</ZButton>
+    <header class="detail-header detail-header-bar">
+      <ZButton variant="text" aria-label="返回列表" @click="emit('back')"><ArrowLeft class="size-4" aria-hidden="true" /> 返回列表</ZButton>
       <h1 class="m-0 text-lg font-semibold text-cp-text">设置</h1>
       <span class="flex-1" />
       <ZSegmented v-model="tab" :options="tabs" aria-label="设置分类" />

@@ -301,7 +301,12 @@ async fn read_billing(host: &HostClient, id: &str, cursor: &str) -> Result<Value
     let mut payment = None;
     if cursor.is_empty() {
         payment = LastPayment::of(&history);
-        if history.subscription.is_none() {
+        if history.problem.is_some() {
+            if let Some(sub) = &history.subscription {
+                let previous = store::payment(host, id).await.ok().flatten();
+                payment = Some(LastPayment::with_subscription(previous, sub));
+            }
+        } else if history.subscription.is_none() {
             let previous = store::payment(host, id).await.ok().flatten();
             payment = match (payment, previous) {
                 (Some(mut current), Some(previous)) => {

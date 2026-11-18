@@ -185,6 +185,31 @@ export function graceTooltip(p: LastPayment): string {
   return `付款逾期宽限期截止 ${dateTime(p.grace_ends_at_ms)}${since}`
 }
 
+export function subscriptionStateOf(p: LastPayment): string | undefined {
+  return p.subscription_status ?? (p.created_at_ms ? undefined : p.status)
+}
+
+/** 列表上显示的账单日文字 */
+export function subscriptionBillingDateText(p: LastPayment | null | undefined): string {
+  return p?.created_at_ms ? `账单日 ${day(p.created_at_ms)}` : ''
+}
+
+/** 列表上显示的宽限期 / 续费日 / 到期日文字 */
+export function subscriptionDetailText(p: LastPayment | null | undefined, now = Date.now()): string {
+  if (!p)
+    return ''
+  if (p.grace_ends_at_ms)
+    return graceText(p.grace_ends_at_ms, now)
+  const status = subscriptionStateOf(p)
+  if (p.subscription_expires_at_ms) {
+    const verb = p.subscription_will_renew && status === 'active' ? '续费日' : '到期日'
+    return `${verb} ${day(p.subscription_expires_at_ms)}`
+  }
+  if (status === 'active' && p.subscription_will_renew !== undefined)
+    return p.subscription_will_renew ? '自动续费' : '不自动续费'
+  return ''
+}
+
 export function paymentTag(p: LastPayment): TagType {
   if (!p.created_at_ms) {
     const sub = (p.subscription_status ?? p.status).trim().toLowerCase()

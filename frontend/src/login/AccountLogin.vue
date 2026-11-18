@@ -1,21 +1,24 @@
 <script setup lang="ts">
 import type { ApiError } from '../api'
 import type { AccountLoginStatus, LoginChoice } from './helpers'
+import type { ReloginTarget } from './ReloginDialog.vue'
 import { ZButton, ZTag } from '@codex-proxy/ui'
-import { Check, Copy, ExternalLink, KeyRound, Link2, Lock, Trash2 } from '@lucide/vue'
-import { computed, onMounted, ref, watch } from 'vue'
+import { Check, Copy, ExternalLink, Eye, EyeOff, KeyRound, Link2, Lock, Trash2 } from '@lucide/vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { canOpenExternal, openExternal } from '../api'
 import { copyText, selectField } from '../clipboard'
 import { credentialStateLabel, dateTime, formatPlanName } from '../format'
 import { loginApi } from './client'
 import { formatLoginError, loginChoices, needsManualOAuth, resolveLoginMainAction } from './helpers'
+import ReloginDialog from './ReloginDialog.vue'
 
-const props = defineProps<{ accountId: string }>()
+const props = defineProps<{ accountId: string, refreshSeq?: number }>()
 const emit = defineEmits<{ updated: [account: AccountLoginStatus] }>()
 
 const status = ref<AccountLoginStatus | null>(null)
 const loadingStatus = ref(false)
 const runningLogin = ref(false)
+const reloginOpen = ref(false)
 const savingCreds = ref(false)
 const savingAutoLogin = ref(false)
 const startingOAuth = ref(false)
@@ -23,6 +26,8 @@ const completingOAuth = ref(false)
 
 const password = ref('')
 const totp = ref('')
+const showPassword = ref(false)
+const showTotp = ref(false)
 const workspaceId = ref('')
 const organizationId = ref('')
 const saveCredentials = ref(true)
@@ -93,10 +98,20 @@ const submitCallbackTitle = computed(() => {
   return undefined
 })
 
-async function loadStatus() {
+const reloginTargets = computed<ReloginTarget[]>(() => [{
+  id: props.accountId,
+  name: status.value?.name || status.value?.email || props.accountId,
+  email: status.value?.email,
+  ...(workspaceId.value.trim() ? { workspaceId: workspaceId.value.trim() } : {}),
+  ...(organizationId.value.trim() ? { organizationId: organizationId.value.trim() } : {}),
+}])
+
+async function loadStatus(preserveError = false) {
   loadingStatus.value = true
-  errorMsg.value = ''
-  errorCode.value = ''
+  if (!preserveError) {
+    errorMsg.value = ''
+    errorCode.value = ''
+  }
   try {
     const r = await loginApi.accountStatus(props.accountId)
     status.value = r.account
@@ -107,6 +122,8 @@ async function loadStatus() {
     }
     if (r.account.lastError?.code && needsManualOAuth(r.account.lastError.code)) {
       showManualOAuth.value = true
+      if (!authorizeUrl.value && r.account.enabled && !startingOAuth.value)
+        void handleStartOAuth()
     }
     if (r.account.lastError?.code === 'workspace_ambiguous') {
       showAdvanced.value = true
@@ -122,7 +139,42 @@ async function loadStatus() {
   }
 }
 
+function onReloginSucceeded(payload: { account: AccountLoginStatus, planType: string, expiresAtMs: number }) {
+  status.value = payload.account
+  errorMsg.value = ''
+  errorCode.value = ''
+  errorChoices.value = []
+  const planLabel = formatPlanName(payload.planType) || 'Plus'
+  successMsg.value = `登录成功，新令牌已写回 CPR（套餐：${planLabel}，到期：${dateTime(payload.expiresAtMs)}）`
+  emit('updated', payload.account)
+}
+
+function onReloginFailed(payload: { code: string, rawMessage: string, choices: LoginChoice[] }) {
+  errorCode.value = payload.code
+  errorMsg.value = payload.rawMessage
+  errorChoices.value = payload.choices
+  if (needsManualOAuth(payload.code)) {
+    showManualOAuth.value = true
+    if (!authorizeUrl.value && !blockedByDisabled.value && !startingOAuth.value)
+      void handleStartOAuth()
+  }
+  if (payload.code === 'workspace_ambiguous') {
+    showAdvanced.value = true
+  }
+  void loadStatus(true).catch(() => {})
+}
+
 async function handleRunLogin() {
+  if (mainAction.value.disabled || runningLogin.value || reloginOpen.value)
+    return
+  if (!password.value && !totp.value.trim() && status.value?.hasPassword) {
+    errorMsg.value = ''
+    errorCode.value = ''
+    errorChoices.value = []
+    successMsg.value = ''
+    reloginOpen.value = true
+    return
+  }
   runningLogin.value = true
   errorMsg.value = ''
   errorCode.value = ''
@@ -151,11 +203,13 @@ async function handleRunLogin() {
     errorChoices.value = loginChoices(err.details)
     if (needsManualOAuth(err.code)) {
       showManualOAuth.value = true
+      if (!authorizeUrl.value && !blockedByDisabled.value && !startingOAuth.value)
+        void handleStartOAuth()
     }
     if (err.code === 'workspace_ambiguous') {
       showAdvanced.value = true
     }
-    await loadStatus().catch(() => {})
+    await loadStatus(true).catch(() => {})
   }
   finally {
     runningLogin.value = false
@@ -248,6 +302,12 @@ async function handleAutoLoginChange() {
   }
 }
 
+function toggleManualOAuth() {
+  showManualOAuth.value = !showManualOAuth.value
+  if (showManualOAuth.value && !authorizeUrl.value && !blockedByDisabled.value && !startingOAuth.value)
+    void handleStartOAuth()
+}
+
 async function handleStartOAuth() {
   startingOAuth.value = true
   errorMsg.value = ''
@@ -302,6 +362,13 @@ async function handleCompleteOAuth() {
   }
 }
 
+function onCallbackPaste() {
+  void nextTick(() => {
+    if (callbackUrl.value.trim().includes('code=') && !blockedByDisabled.value && !completingOAuth.value)
+      void handleCompleteOAuth()
+  })
+}
+
 async function copyAuthorizeUrl() {
   if (!authorizeUrl.value)
     return
@@ -326,15 +393,24 @@ function selectInput(e: Event) {
 watch(() => props.accountId, () => {
   password.value = ''
   totp.value = ''
+  showPassword.value = false
+  showTotp.value = false
   autoLoginEnabled.value = false
+  showManualOAuth.value = false
+  reloginOpen.value = false
   authorizeUrl.value = ''
   callbackUrl.value = ''
   errorMsg.value = ''
   successMsg.value = ''
-  loadStatus()
+  void loadStatus()
 })
 
-onMounted(loadStatus)
+watch(() => props.refreshSeq, (seq) => {
+  if (seq)
+    void loadStatus()
+})
+
+onMounted(() => void loadStatus())
 </script>
 
 <template>
@@ -368,7 +444,7 @@ onMounted(loadStatus)
           size="small"
           :disabled="blockedByDisabled"
           :title="manualToggleTitle"
-          @click="showManualOAuth = !showManualOAuth"
+          @click="toggleManualOAuth"
         >
           <Link2 :size="13" aria-hidden="true" />
           {{ showManualOAuth ? '收起手动登录' : '浏览器手动登录' }}
@@ -386,14 +462,20 @@ onMounted(loadStatus)
       上次登录失败（{{ dateTime(status.lastError.atMs) }}）：{{ formatLoginError(status.lastError.code, status.lastError.message) }}
     </p>
     <p
-      v-if="status?.autoLoginLast"
-      class="banner"
-      :class="status.autoLoginLast.success ? 'banner-ok' : 'banner-warn'"
+      v-if="status?.autoLoginLast && !status.autoLoginLast.success"
+      class="banner banner-warn"
       role="status"
     >
-      自动重登{{ status.autoLoginLast.success ? '成功' : '失败' }}
-      （{{ dateTime(status.autoLoginLast.atMs) }}）：{{ status.autoLoginLast.trigger }}
+      自动重登失败（{{ dateTime(status.autoLoginLast.atMs) }}）：{{ status.autoLoginLast.trigger }}
       <template v-if="status.autoLoginLast.error">；{{ status.autoLoginLast.error }}</template>
+    </p>
+    <p
+      v-else-if="status?.autoLoginLast?.success"
+      class="work-inline-note"
+      role="status"
+    >
+      <span class="state-dot ok" aria-hidden="true" />
+      <span>自动重登成功（{{ dateTime(status.autoLoginLast.atMs) }}）：{{ status.autoLoginLast.trigger }}</span>
     </p>
     <div v-if="choices.length" class="flex flex-wrap items-center gap-2 text-xs" role="group" aria-label="选一个重登">
       <span class="text-cp-text-secondary">选一个{{ choices[0]?.kind === 'organization' ? '组织' : '工作区' }}直接重登：</span>
@@ -413,113 +495,141 @@ onMounted(loadStatus)
       {{ successMsg }}
     </p>
 
-    <div class="form-grid">
-      <label class="form-field">
-        <span>登录密码</span>
-        <input
-          v-model="password"
-          type="password"
-          autocomplete="new-password"
-          class="cp-input"
-          :placeholder="status?.hasPassword ? '已保存密码，留空则直接使用已保存密码' : '输入 OpenAI 登录密码'"
-        >
-      </label>
-      <label class="form-field">
-        <span>2FA 密钥（Base32 或 otpauth://）</span>
-        <input
-          v-model="totp"
-          type="password"
-          autocomplete="off"
-          class="cp-input"
-          :placeholder="status?.hasTotp ? '已保存 2FA，留空则直接使用已保存 2FA' : '选填：Base32 密钥或 otpauth://totp/ 链接'"
-        >
-      </label>
-    </div>
-
-    <div v-if="showAdvanced" class="form-grid">
-      <label class="form-field">
-        <span>指定 Workspace ID（多工作区时必填）</span>
-        <input
-          v-model="workspaceId"
-          type="text"
-          class="cp-input"
-          placeholder="例如：ws-..."
-        >
-      </label>
-      <label class="form-field">
-        <span>指定 Organization ID（多组织时选填）</span>
-        <input
-          v-model="organizationId"
-          type="text"
-          class="cp-input"
-          placeholder="例如：org-..."
-        >
-      </label>
-    </div>
-
-    <div class="flex flex-wrap items-center justify-between gap-3 text-xs">
-      <div class="flex flex-wrap items-center gap-3">
-        <label class="inline-flex cursor-pointer items-center gap-1.5 text-cp-text-secondary">
-          <input
-            v-model="saveCredentials"
-            type="checkbox"
-          >
-          <span>保存密码与 2FA</span>
+    <form class="flex flex-col gap-3.5" @submit.prevent="handleRunLogin">
+      <div class="form-grid">
+        <label class="form-field">
+          <span>登录密码</span>
+          <div class="input-with-toggle">
+            <input
+              v-model="password"
+              :type="showPassword ? 'text' : 'password'"
+              autocomplete="new-password"
+              class="cp-input"
+              :placeholder="status?.hasPassword ? '已保存密码，留空则直接使用已保存密码' : '输入 OpenAI 登录密码'"
+            >
+            <button
+              type="button"
+              class="input-eye-btn"
+              :aria-label="showPassword ? '隐藏密码' : '显示密码'"
+              :title="showPassword ? '隐藏密码' : '显示密码'"
+              @click="showPassword = !showPassword"
+            >
+              <EyeOff v-if="showPassword" :size="14" aria-hidden="true" />
+              <Eye v-else :size="14" aria-hidden="true" />
+            </button>
+          </div>
         </label>
-        <label
-          class="inline-flex cursor-pointer items-center gap-1.5 text-cp-text-secondary"
-          :title="autoLoginTitle"
-        >
-          <input
-            v-model="autoLoginEnabled"
-            type="checkbox"
-            :disabled="!status?.hasPassword || blockedByDisabled || savingAutoLogin || runningLogin"
-            @change="handleAutoLoginChange"
-          >
-          <span>{{ savingAutoLogin ? '正在保存自动重登设置…' : '401 / 令牌过期时自动重登一次' }}</span>
+        <label class="form-field">
+          <span>2FA 密钥（Base32 或 otpauth://）</span>
+          <div class="input-with-toggle">
+            <input
+              v-model="totp"
+              :type="showTotp ? 'text' : 'password'"
+              autocomplete="off"
+              class="cp-input"
+              :placeholder="status?.hasTotp ? '已保存 2FA，留空则直接使用已保存 2FA' : '选填：Base32 密钥或 otpauth://totp/ 链接'"
+            >
+            <button
+              type="button"
+              class="input-eye-btn"
+              :aria-label="showTotp ? '隐藏 2FA 密钥' : '显示 2FA 密钥'"
+              :title="showTotp ? '隐藏 2FA 密钥' : '显示 2FA 密钥'"
+              @click="showTotp = !showTotp"
+            >
+              <EyeOff v-if="showTotp" :size="14" aria-hidden="true" />
+              <Eye v-else :size="14" aria-hidden="true" />
+            </button>
+          </div>
         </label>
-        <button
-          type="button"
-          class="text-link"
-          @click="showAdvanced = !showAdvanced"
-        >
-          {{ showAdvanced ? '隐藏工作区选项' : '指定工作区 ID' }}
-        </button>
       </div>
 
-      <div class="flex flex-wrap items-center gap-2">
-        <ZButton
-          type="primary"
-          size="small"
-          :loading="runningLogin"
-          :disabled="mainAction.disabled"
-          :title="mainAction.title"
-          @click="handleRunLogin"
-        >
-          <KeyRound :size="13" aria-hidden="true" />
-          {{ mainAction.label }}
-        </ZButton>
-        <ZButton
-          size="small"
-          :loading="savingCreds"
-          :disabled="!password && !totp.trim()"
-          :title="saveOnlyTitle"
-          @click="handleSaveCredentials"
-        >
-          <Lock :size="13" aria-hidden="true" /> 仅保存
-        </ZButton>
-        <ZButton
-          v-if="status?.hasPassword || status?.hasTotp"
-          size="small"
-          type="danger"
-          variant="text"
-          :loading="savingCreds"
-          @click="handleClearCredentials"
-        >
-          <Trash2 :size="13" aria-hidden="true" /> 清除已存凭据
-        </ZButton>
+      <div v-if="showAdvanced" class="form-grid">
+        <label class="form-field">
+          <span>指定 Workspace ID（多工作区时必填）</span>
+          <input
+            v-model="workspaceId"
+            type="text"
+            class="cp-input"
+            placeholder="例如：ws-..."
+          >
+        </label>
+        <label class="form-field">
+          <span>指定 Organization ID（多组织时选填）</span>
+          <input
+            v-model="organizationId"
+            type="text"
+            class="cp-input"
+            placeholder="例如：org-..."
+          >
+        </label>
       </div>
-    </div>
+
+      <div class="flex flex-wrap items-center justify-between gap-3 text-xs">
+        <div class="flex flex-wrap items-center gap-3.5">
+          <label class="cp-check-label">
+            <input
+              v-model="saveCredentials"
+              type="checkbox"
+              class="cp-check"
+            >
+            <span>保存密码与 2FA</span>
+          </label>
+          <label
+            class="cp-check-label"
+            :title="autoLoginTitle"
+          >
+            <input
+              v-model="autoLoginEnabled"
+              type="checkbox"
+              class="cp-check"
+              :disabled="!status?.hasPassword || blockedByDisabled || savingAutoLogin || runningLogin"
+              @change="handleAutoLoginChange"
+            >
+            <span>{{ savingAutoLogin ? '正在保存自动重登设置…' : '401 / 令牌过期时自动重登一次' }}</span>
+          </label>
+          <button
+            type="button"
+            class="inline-action-btn"
+            @click="showAdvanced = !showAdvanced"
+          >
+            {{ showAdvanced ? '隐藏工作区选项' : '指定工作区 ID' }}
+          </button>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2">
+          <ZButton
+            type="primary"
+            native-type="submit"
+            size="small"
+            :loading="runningLogin || reloginOpen"
+            :disabled="mainAction.disabled"
+            :title="mainAction.title"
+          >
+            <KeyRound :size="13" aria-hidden="true" />
+            {{ mainAction.label }}
+          </ZButton>
+          <ZButton
+            size="small"
+            :loading="savingCreds"
+            :disabled="!password && !totp.trim()"
+            :title="saveOnlyTitle"
+            @click="handleSaveCredentials"
+          >
+            <Lock :size="13" aria-hidden="true" /> 仅保存
+          </ZButton>
+          <ZButton
+            v-if="status?.hasPassword || status?.hasTotp"
+            size="small"
+            type="danger"
+            variant="text"
+            :loading="savingCreds"
+            @click="handleClearCredentials"
+          >
+            <Trash2 :size="13" aria-hidden="true" /> 清除已存凭据
+          </ZButton>
+        </div>
+      </div>
+    </form>
 
     <div v-if="showManualOAuth" class="sub-panel">
       <div class="detail-card-head">
@@ -535,7 +645,7 @@ onMounted(loadStatus)
         </ZButton>
       </div>
       <p class="muted note">
-        在您自己的浏览器中打开下方授权链接完成登录，浏览器跳转到 <code>http://localhost:1455/auth/callback?code=...</code> 后，复制完整地址贴回下方即可经当前账号的代理写回 CPR。
+        在浏览器中打开下方授权链接完成登录，跳转到 <code>http://localhost:1455/auth/callback?code=...</code> 后，复制完整地址贴回下方将自动提交写回 CPR。
       </p>
       <div v-if="authorizeUrl" class="inline-copy-row">
         <input
@@ -556,6 +666,9 @@ onMounted(loadStatus)
           {{ copiedUrl ? '已复制' : '复制授权链接' }}
         </ZButton>
       </div>
+      <p v-else-if="startingOAuth" class="muted note">
+        正在生成授权链接…
+      </p>
       <p v-if="copyFailed" class="muted text-xs" role="status">
         浏览器不允许插件页面写剪贴板，链接已选中，按 Ctrl+C（Mac 上 ⌘C）复制
       </p>
@@ -564,8 +677,9 @@ onMounted(loadStatus)
           v-model="callbackUrl"
           type="text"
           class="cp-input font-mono text-xs"
-          placeholder="粘贴 http://localhost:1455/auth/callback?code=...&state=..."
+          placeholder="粘贴 http://localhost:1455/auth/callback?code=...&state=...（粘贴即自动提交）"
           aria-label="OAuth 回调链接"
+          @paste="onCallbackPaste"
         >
         <ZButton
           type="primary"
@@ -579,5 +693,12 @@ onMounted(loadStatus)
         </ZButton>
       </div>
     </div>
+
+    <ReloginDialog
+      v-model="reloginOpen"
+      :targets="reloginTargets"
+      @succeeded="onReloginSucceeded"
+      @failed="onReloginFailed"
+    />
   </section>
 </template>

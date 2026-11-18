@@ -251,3 +251,29 @@ export function loginChoices(details: unknown): LoginChoice[] {
     && typeof c.id === 'string' && c.id !== ''
     && typeof c.name === 'string')
 }
+
+export const LOGIN_STAGE_STEPS = [
+  { key: 'prepare', label: '读取出口' },
+  { key: 'connect', label: '连接授权' },
+  { key: 'identify', label: '提交邮箱' },
+  { key: 'password', label: '验证密码' },
+  { key: 'totp', label: '验证 2FA' },
+  { key: 'authorize', label: '确认授权' },
+  { key: 'exchange', label: '换取令牌' },
+  { key: 'save', label: '写回 CPR' },
+] as const
+
+const STAGE_LABEL_MAP: Record<string, string> = Object.fromEntries(
+  LOGIN_STAGE_STEPS.map(s => [s.key, s.label]),
+)
+
+export function loginStageLabel(stage?: string | null): string {
+  if (!stage)
+    return ''
+  return STAGE_LABEL_MAP[stage] ?? stage
+}
+
+export function extractLoginStage(details: unknown): string {
+  const stage = (details as { stage?: unknown } | undefined)?.stage
+  return typeof stage === 'string' ? stage : ''
+}

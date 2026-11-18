@@ -3,9 +3,11 @@ import { test } from 'node:test'
 import {
   buildImportQueue,
   errorCodeLabel,
+  extractLoginStage,
   formatLoginError,
   hasKnownErrorCode,
   loginChoices,
+  loginStageLabel,
   needsManualOAuth,
   resolveImportAction,
   resolveLoginMainAction,
@@ -172,4 +174,17 @@ test('reads workspace choices from error details and drops odd entries', () => {
     { kind: 'workspace', id: 'ws-a', name: '个人' },
     { kind: 'organization', id: 'org-1', name: '' },
   ])
+})
+
+test('reads login stage from error details and maps stage labels', () => {
+  assert.equal(extractLoginStage(undefined), '')
+  assert.equal(extractLoginStage({ stage: 123 }), '')
+  assert.equal(extractLoginStage({ stage: 'password' }), 'password')
+
+  assert.equal(loginStageLabel(''), '')
+  assert.equal(loginStageLabel('prepare'), '读取出口')
+  assert.equal(loginStageLabel('password'), '验证密码')
+  assert.equal(loginStageLabel('totp'), '验证 2FA')
+  assert.equal(loginStageLabel('save'), '写回 CPR')
+  assert.equal(loginStageLabel('custom_step'), 'custom_step')
 })

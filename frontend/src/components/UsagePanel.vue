@@ -2,14 +2,14 @@
 import type { CodexUsage, UsageSummary } from '../api'
 import { ZButton, ZSegmented } from '@codex-proxy/ui'
 import { RefreshCw, Sparkles } from '@lucide/vue'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { api } from '../api'
 import { compact, dateTime, percent, shortDate, unitNote } from '../format'
 import { featureLabel, isWork, slotColour, slotOf, surfaceLabel } from '../surfaces'
 import DailyChart from './DailyChart.vue'
 import ShareBars from './ShareBars.vue'
 
-const props = defineProps<{ accountId: string, summary: UsageSummary | null, blocked: string | null }>()
+const props = defineProps<{ accountId: string, summary: UsageSummary | null, blocked: string | null, active?: boolean }>()
 const emit = defineEmits<{ checked: [summary: UsageSummary] }>()
 
 const days = ref('7')
@@ -22,22 +22,50 @@ const usage = ref<CodexUsage | null>(null)
 const loading = ref(false)
 const error = ref('')
 const hoveredTokenIndex = ref<number | null>(null)
+let loadSeq = 0
 
 async function load() {
+  const seq = ++loadSeq
   loading.value = true
   error.value = ''
   try {
     const r = await api.usage(props.accountId, Number(days.value))
+    if (seq !== loadSeq)
+      return
     usage.value = r.usage
     emit('checked', r.summary)
   }
   catch (e) {
-    error.value = (e as Error).message
+    if (seq === loadSeq)
+      error.value = (e as Error).message
   }
   finally {
-    loading.value = false
+    if (seq === loadSeq)
+      loading.value = false
   }
 }
+
+watch(() => props.accountId, () => {
+  loadSeq++
+  usage.value = null
+  error.value = ''
+  loading.value = false
+  hoveredTokenIndex.value = null
+})
+
+watch(
+  () => [props.active, props.accountId, props.blocked] as const,
+  ([isActive, , blocked]) => {
+    if (isActive && !usage.value && !loading.value && !error.value && !blocked)
+      void load()
+  },
+  { immediate: true },
+)
+
+watch(days, () => {
+  if (!props.blocked)
+    void load()
+})
 
 const work = computed(() => usage.value?.work ?? null)
 const unit = computed(() => unitNote(usage.value?.breakdown?.unit))
@@ -74,22 +102,22 @@ function surfaceColour(key: string): string {
       <div class="card-actions">
         <ZSegmented v-model="days" :options="ranges" size="small" aria-label="天数" />
         <ZButton
-          type="primary"
+          :type="usage || loading ? undefined : 'primary'"
           size="small"
           :loading="loading"
           :disabled="!!blocked"
           :title="blocked ?? (usage ? '重新读取官方用量' : '读取 ChatGPT 官方用量')"
           @click="load"
         >
-          <RefreshCw v-if="usage" :size="13" aria-hidden="true" />
+          <RefreshCw v-if="usage || loading" :size="13" aria-hidden="true" />
           <Sparkles v-else :size="13" aria-hidden="true" />
-          {{ usage ? '刷新' : '查询用量' }}
+          {{ usage || loading ? '刷新' : '查询用量' }}
         </ZButton>
       </div>
     </div>
 
     <p class="muted note">
-      经账号绑定的代理读取 ChatGPT 官方用量，不消耗额度，点了才查。
+      经账号绑定的代理读取 ChatGPT 官方用量，不消耗额度，打开或切换天数时自动刷新。
     </p>
 
     <p v-if="blocked" class="banner banner-warn">
@@ -98,6 +126,10 @@ function surfaceColour(key: string): string {
     <p v-if="error" class="banner banner-error" role="alert">
       {{ error }}
     </p>
+
+    <div v-if="loading && !usage" class="inline-loading">
+      正在读取官方用量…
+    </div>
 
     <template v-if="usage">
       <p v-if="work && work.total > 0" class="work-inline-note">

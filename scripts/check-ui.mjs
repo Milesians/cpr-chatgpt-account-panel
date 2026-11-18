@@ -471,6 +471,8 @@ const bridgeScript = `<script>
 const __MOCK__ = ${JSON.stringify(bridgePayload)};
 const __THEMES__ = ${JSON.stringify(themes)};
 window.__LOGIN_DELAY_MS__ = 0;
+window.__LOGIN_PROGRESS__ = null;
+window.__LOGIN_ERROR__ = null;
 window.__setHostTheme = (name) => {
   const root = document.documentElement;
   root.dataset.theme = name;
@@ -503,7 +505,8 @@ window.codexProxyPlugin = {
     if (fn === 'api/usage') return __reply(__MOCK__.usage);
     if (fn === 'api/subscription') {
       if (query.id === 'acc-work') return __reply({ ...__MOCK__.subscription, payment: __MOCK__.billing.payment });
-      return __reply({ payment: { status: 'paid', subscription_status: 'active', checked_at_ms: Date.now(), subscription_expires_at_ms: Date.now() + 604800000, subscription_will_renew: true } });
+      const existing = __MOCK__.accounts.accounts.find(a => a.id === query.id)?.payment;
+      return __reply({ payment: { ...(existing || {}), status: existing?.created_at_ms ? existing.status : 'paid', subscription_status: 'active', checked_at_ms: Date.now(), subscription_expires_at_ms: Date.now() + 604800000, subscription_will_renew: true } });
     }
     if (fn === 'api/billing') return __reply(__MOCK__.billing);
     if (fn === 'api/devices') return __reply(__MOCK__.devices);
@@ -515,6 +518,9 @@ window.codexProxyPlugin = {
         return __reply({ oauthRedirect: 'http://localhost:1455/auth/callback', account: found });
       }
       return __reply(__MOCK__.loginOverview);
+    }
+    if (fn === 'api/login/progress') {
+      return __reply({ progress: window.__LOGIN_PROGRESS__ });
     }
     if (fn === 'api/login/auto-login') {
       const found = __MOCK__.loginOverview.accounts.find(a => a.accountId === payload.accountId);
@@ -539,10 +545,21 @@ window.codexProxyPlugin = {
     }
     if (fn === 'api/login/oauth/start') return __reply(__MOCK__.oauthStart);
     if (fn === 'api/login/run') {
+      const acctId = payload?.accountId || 'acc-work';
       if (window.__LOGIN_DELAY_MS__ > 0) {
+        window.__LOGIN_PROGRESS__ = {
+          accountId: acctId,
+          stage: 'password',
+          label: '验证登录密码',
+          startedAtMs: Date.now(),
+          updatedAtMs: Date.now(),
+        };
         await new Promise(r => setTimeout(r, window.__LOGIN_DELAY_MS__));
       }
-      const acctId = payload?.accountId || 'acc-work';
+      window.__LOGIN_PROGRESS__ = null;
+      if (window.__LOGIN_ERROR__) {
+        return __reply({ error: window.__LOGIN_ERROR__ }, window.__LOGIN_ERROR__.status || 401);
+      }
       const found = __MOCK__.loginOverview.accounts.find(a => a.accountId === acctId) || __MOCK__.loginOverview.accounts[0];
       return __reply({
         ok: true,
@@ -721,7 +738,9 @@ try {
   assert.match(listStats.work, /降智/)
   assert.match(listStats.work, /付款逾期/)
   assert.match(listStats.work, /宽限期至 .*剩 4 天/)
+  assert.match(listStats.work, /账单日 \d{4}\/\d{2}\/\d{2}/, '宽限期账号主界面应同时显示账单日')
   assert.match(listStats.paid, /未查订阅/, '旧的已支付账单不能当作订阅有效')
+  assert.match(listStats.paid, /账单日 2026\/10\/25/, '已查账单账号主界面应显示账单日')
   assert.match(listStats.text, /免输重登/)
   assert.match(listStats.text, /去重新登录/)
   assert.doesNotMatch(listStats.text, /额度|周额度/)
@@ -761,7 +780,77 @@ try {
     await new Promise(r => setTimeout(r, 140));
     return document.querySelector('[data-account="acc-codex"] .subscription-cell').innerText;
   `)
-  assert.match(refreshed, /有效.*续费/s)
+  assert.match(refreshed, /有效.*账单日 2026\/10\/25.*续费日 \d{4}\/\d{2}\/\d{2}/s)
+
+  // 验证免输重登弹窗：展示实时进度、失败原因与阶段，并支持重试成功
+  const reloginRunning = await evaluate(`
+    window.__LOGIN_DELAY_MS__ = 700;
+    window.__LOGIN_ERROR__ = {
+      status: 401,
+      code: 'password_rejected',
+      message: '密码校验未通过，请核对后重试',
+      details: { stage: 'password' },
+    };
+    const rowBtn = [...document.querySelectorAll('[data-account="acc-expired-saved"] button')]
+      .find(b => b.textContent.trim() === '免输重登');
+    rowBtn.click();
+    await new Promise(r => setTimeout(r, 520));
+    const dlg = [...document.querySelectorAll('[role="dialog"]')].find(el => !el.closest('[inert]') && el.querySelector('.relogin-list'));
+    return {
+      open: Boolean(dlg),
+      title: dlg?.innerText || '',
+      hasProgressTrack: Boolean(dlg?.querySelector('.relogin-progress-track')),
+      stepChips: dlg?.querySelectorAll('.relogin-step-chip').length || 0,
+      hasStageLabel: dlg?.innerText.includes('验证登录密码') || false,
+    };
+  `)
+  assert.equal(reloginRunning.open, true, '点击免输重登应立即打开进度弹窗')
+  assert.equal(reloginRunning.hasProgressTrack, true, '弹窗应显示总进度条')
+  assert.ok(reloginRunning.stepChips >= 6, '运行中应显示分阶段进度胶囊')
+  assert.equal(reloginRunning.hasStageLabel, true, '轮询进度应展示当前阶段文字')
+
+  await sleep(320)
+  const reloginFailed = await evaluate(`
+    const dlg = [...document.querySelectorAll('[role="dialog"]')].find(el => !el.closest('[inert]') && el.querySelector('.relogin-list'));
+    return {
+      text: dlg?.innerText || '',
+      state: dlg?.querySelector('[data-relogin-state]')?.getAttribute('data-relogin-state'),
+      hasErrorBox: Boolean(dlg?.querySelector('.relogin-error-box')),
+    };
+  `)
+  assert.equal(reloginFailed.state, 'failed', '失败后列表项应进入 failed 状态')
+  assert.equal(reloginFailed.hasErrorBox, true, '失败后应在弹窗内展示错误原因卡片')
+  assert.match(reloginFailed.text, /验证密码阶段/)
+  assert.match(reloginFailed.text, /\[密码被拒绝\] 密码校验未通过，请核对后重试/)
+  await capture('16-relogin-error-light', 1440, 900, 'light')
+  await capture('17-relogin-error-dark', 1440, 900, 'dark')
+  await setViewport(390, 844, 'light')
+  await assertNoClippedButtons('390px 免输重登弹窗')
+  await setViewport(1440, 900, 'light')
+
+  const reloginRetried = await evaluate(`
+    window.__LOGIN_DELAY_MS__ = 0;
+    window.__LOGIN_ERROR__ = null;
+    const dlg = [...document.querySelectorAll('[role="dialog"]')].find(el => !el.closest('[inert]') && el.querySelector('.relogin-list'));
+    const retryBtn = [...dlg.querySelectorAll('button')].find(b => b.textContent.includes('重试'));
+    retryBtn.click();
+    await new Promise(r => setTimeout(r, 150));
+    const afterRetry = {
+      state: dlg.querySelector('[data-relogin-state]')?.getAttribute('data-relogin-state'),
+      text: dlg.innerText,
+    };
+    const closeBtn = [...dlg.querySelectorAll('button')].find(b => b.textContent.trim() === '关闭');
+    closeBtn.click();
+    await new Promise(r => setTimeout(r, 250));
+    const stillOpen = [...document.querySelectorAll('[role="dialog"]')].some(el => !el.closest('[inert]') && el.querySelector('.relogin-list'));
+    return {
+      ...afterRetry,
+      closed: !stillOpen,
+    };
+  `)
+  assert.equal(reloginRetried.state, 'done', '弹窗内点重试应重新执行并成功')
+  assert.match(reloginRetried.text, /新令牌已写回 CPR/)
+  assert.equal(reloginRetried.closed, true, '完成后应可正常关闭免输重登弹窗')
 
   const probeDetail = await evaluate(`
     const row = document.querySelector('[data-account="acc-work"]');
@@ -777,37 +866,58 @@ try {
     document.querySelector('button[aria-label="返回列表"]').click();
     await new Promise(r => setTimeout(r, 100));
     document.querySelector('[data-account="acc-work"] .subscription-cell').click();
-    await new Promise(r => setTimeout(r, 100));
-    [...document.querySelectorAll('button')].find(b => b.textContent.includes('查询订阅与账单')).click();
-    await new Promise(r => setTimeout(r, 160));
+    await new Promise(r => setTimeout(r, 200));
   `)
-  assert.equal(await evaluate(`return document.querySelectorAll('.billing-row').length;`), 2)
+  assert.equal(await evaluate(`return document.querySelectorAll('.billing-row').length;`), 2, '进入订阅与账单页应自动加载 2 条账单记录')
+  assert.equal(await evaluate(`return [...document.querySelectorAll('button')].some(b => b.textContent.trim() === '刷新');`), true, '自动加载完成后应显示刷新按钮')
   await capture('04-billing-390px', 390, 1300, 'light')
   await assertNoClippedButtons('390px 订阅与账单')
 
   await evaluate(`
     const tabs = [...document.querySelectorAll('[aria-label="账号详情分类"] [role="radio"], [aria-label="账号详情分类"] .z-segmented-item')];
     tabs.find(el => el.textContent.includes('官方用量')).click();
-    await new Promise(r => setTimeout(r, 90));
-    [...document.querySelectorAll('button')].find(b => b.textContent.trim() === '查询用量').click();
+    await new Promise(r => setTimeout(r, 200));
+  `)
+  assert.equal(await evaluate(`return document.querySelectorAll('[aria-labelledby="usage-title"] .trend-chart').length;`), 2, '进入官方用量页应自动加载 2 张走势图')
+  assert.equal(await evaluate(`return document.querySelector('[aria-labelledby="usage-title"] .meters');`), null)
+  await evaluate(`
+    const dayBtns = [...document.querySelectorAll('[aria-label="天数"] [role="radio"], [aria-label="天数"] .z-segmented-item')];
+    dayBtns.find(el => el.textContent.includes('14 天')).click();
     await new Promise(r => setTimeout(r, 160));
   `)
-  assert.equal(await evaluate(`return document.querySelectorAll('[aria-labelledby="usage-title"] .trend-chart').length;`), 2)
-  assert.equal(await evaluate(`return document.querySelector('[aria-labelledby="usage-title"] .meters');`), null)
+  assert.equal(await evaluate(`return document.querySelectorAll('[aria-labelledby="usage-title"] .trend-chart').length;`), 2, '切换天数应自动刷新且不破坏走势图')
+
   await evaluate(`
     const tabs = [...document.querySelectorAll('[aria-label="账号详情分类"] [role="radio"], [aria-label="账号详情分类"] .z-segmented-item')];
     tabs.find(el => el.textContent.includes('登录与设备')).click();
+    await new Promise(r => setTimeout(r, 200));
   `)
+
+  // 验证账号详情顶栏「下一个 / 上一个账号」切换并保持当前标签页
+  const pagerCheck = await evaluate(`
+    const nextBtn = document.querySelector('button[aria-label="下一个账号"]');
+    nextBtn.click();
+    await new Promise(r => setTimeout(r, 180));
+    const afterNext = {
+      title: document.querySelector('.detail-header-bar h1')?.textContent.trim(),
+      hasLoginSection: Boolean(document.querySelector('#account-login-section')),
+    };
+    document.querySelector('button[aria-label="上一个账号"]').click();
+    await new Promise(r => setTimeout(r, 180));
+    return {
+      afterNext,
+      restoredTitle: document.querySelector('.detail-header-bar h1')?.textContent.trim(),
+    };
+  `)
+  assert.notEqual(pagerCheck.afterNext.title, 'alpha@acme.io', '点击下一个账号应切换到其他账号')
+  assert.equal(pagerCheck.afterNext.hasLoginSection, true, '切换账号后应保持在登录与设备标签页')
+  assert.equal(pagerCheck.restoredTitle, 'alpha@acme.io', '点击上一个账号应切回原账号')
 
   // ── 3. 详情页（重新登录 + 登录设备）验收与截图 ──
   await setViewport(1440, 1100, 'light')
   await evaluate(`
     const buttons = [...document.querySelectorAll('button')];
-    buttons.find(b => b.textContent.includes('查询设备'))?.click();
     buttons.find(b => b.textContent.includes('浏览器手动登录'))?.click();
-    await new Promise(r => setTimeout(r, 200));
-    const genBtn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('生成授权链接'));
-    genBtn?.click();
     await new Promise(r => setTimeout(r, 200));
     document.querySelector('#account-login-section')?.scrollIntoView({ behavior: 'instant', block: 'start' });
     await new Promise(r => setTimeout(r, 150));
@@ -817,12 +927,16 @@ try {
     return {
       deviceRows: document.querySelectorAll('.device-row').length,
       loginSection: Boolean(document.querySelector('#account-login-section')),
+      hasAuthorizeUrl: Boolean(document.querySelector('input[aria-label="OAuth 授权链接"]')?.value),
+      inputBorder: getComputedStyle(document.querySelector('#account-login-section .cp-input')).borderTopWidth,
       hasAutoLoginToggle: document.body.innerText.includes('401 / 令牌过期时自动重登一次'),
       hasAutoLoginResult: document.body.innerText.includes('自动重登成功'),
     };
   `)
-  assert.equal(deviceStats.deviceRows, 3, '点击查询设备后应渲染 3 台登录设备行')
+  assert.equal(deviceStats.deviceRows, 3, '进入登录与设备页应自动加载 3 台登录设备行')
   assert.equal(deviceStats.loginSection, true, '详情页应包含重新登录卡片')
+  assert.equal(deviceStats.hasAuthorizeUrl, true, '展开浏览器手动登录应自动生成授权链接')
+  assert.equal(deviceStats.inputBorder, '1px', '输入框应具备可见边框（未被 @layer base 重置）')
   assert.equal(deviceStats.hasAutoLoginToggle, true, '重新登录卡片应包含账号级自动重登开关')
   assert.equal(deviceStats.hasAutoLoginResult, true, '应显示最近一次自动重登结果')
 
@@ -866,6 +980,36 @@ try {
   assert.equal(voidedBannerCheck.hasVoidedNotice, true, '登出所有设备后应提示需要重新登录写回 CPR')
   assert.equal(voidedBannerCheck.hasQuickReloginBtn, true, '提示旁应直接提供免输重登与去重新登录入口')
 
+  // 验证设备卡片上的「免输重登」也会打开进度弹窗并明确展示失败原因
+  const deviceReloginCheck = await evaluate(`
+    window.__LOGIN_ERROR__ = {
+      status: 409,
+      code: 'proxy_unavailable',
+      message: '绑定的出口代理已停用',
+      details: { stage: 'prepare' },
+    };
+    const quickBtn = [...document.querySelectorAll('[aria-labelledby="devices-title"] .banner-ok button')]
+      .find(b => b.textContent.includes('免输重登'));
+    quickBtn.click();
+    await new Promise(r => setTimeout(r, 150));
+    const dlg = [...document.querySelectorAll('[role="dialog"]')].find(el => !el.closest('[inert]') && el.querySelector('.relogin-list'));
+    const dlgText = dlg?.innerText || '';
+    const closeBtn = [...(dlg?.querySelectorAll('button') || [])].find(b => b.textContent.trim() === '关闭');
+    closeBtn?.click();
+    await new Promise(r => setTimeout(r, 150));
+    window.__LOGIN_ERROR__ = null;
+    const bannerError = document.querySelector('[aria-labelledby="devices-title"] .banner-error')?.innerText || '';
+    return {
+      hasDialog: Boolean(dlg),
+      dlgText,
+      bannerError,
+    };
+  `)
+  assert.equal(deviceReloginCheck.hasDialog, true, '设备面板点击免输重登应打开进度弹窗')
+  assert.match(deviceReloginCheck.dlgText, /读取出口阶段/)
+  assert.match(deviceReloginCheck.dlgText, /\[代理不可用\] 绑定的出口代理已停用/)
+  assert.match(deviceReloginCheck.bannerError, /免输重登失败：\[代理不可用\] 绑定的出口代理已停用/)
+
   // ── 4. 导入账号页验收与截图 ──
   await evaluate(`
     document.querySelector('button[aria-label="返回列表"]').click();
@@ -895,12 +1039,17 @@ try {
 
   const proxyPick = await evaluate(`
     const sel = document.querySelector('select[aria-label="新账号出口"]');
+    const ta = document.querySelector('textarea.cp-textarea');
     return {
       value: sel.value,
+      selectBorder: getComputedStyle(sel).borderTopWidth,
+      textareaBorder: getComputedStyle(ta).borderTopWidth,
       options: [...sel.options].map(o => ({ text: o.textContent.trim(), disabled: o.disabled })),
     };
   `)
   assert.equal(proxyPick.value, 'px-new', '默认选第一个启用的代理')
+  assert.equal(proxyPick.selectBorder, '1px', '下拉框应具备可见边框')
+  assert.equal(proxyPick.textareaBorder, '1px', '多行文本框应具备可见边框')
   assert.match(proxyPick.options[0].text, /直连/)
   assert.deepEqual(proxyPick.options.map(o => o.disabled), [false, true, false, false], '直连可选，停用的代理不能选')
 

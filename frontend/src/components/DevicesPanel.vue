@@ -1,30 +1,45 @@
 <script setup lang="ts">
 import type { Device, Devices, SignOutTarget } from '../api'
+import type { ReloginTarget } from '../login/ReloginDialog.vue'
 import { ZButton, ZDialog, ZEmpty, ZTag } from '@codex-proxy/ui'
 import { KeyRound, Laptop, LogOut, MapPin, RefreshCw } from '@lucide/vue'
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { api } from '../api'
 import { dateTime } from '../format'
-import { loginApi } from '../login/client'
+import ReloginDialog from '../login/ReloginDialog.vue'
 
-const props = defineProps<{ accountId: string, blocked: string | null }>()
+const props = defineProps<{
+  accountId: string
+  blocked: string | null
+  active?: boolean
+  accountName?: string
+  accountEmail?: string | null
+  planType?: string | null
+}>()
+const emit = defineEmits<{ loginUpdated: [] }>()
 
 const devices = ref<Devices | null>(null)
 const loading = ref(false)
 const error = ref('')
 const notice = ref('')
+let loadSeq = 0
 
 async function load() {
+  const seq = ++loadSeq
   loading.value = true
   error.value = ''
   try {
-    devices.value = (await api.devices(props.accountId)).devices
+    const res = (await api.devices(props.accountId)).devices
+    if (seq === loadSeq)
+      devices.value = res
   }
   catch (e) {
-    error.value = (e as Error).message
+    if (seq === loadSeq)
+      error.value = (e as Error).message
   }
   finally {
-    loading.value = false
+    if (seq === loadSeq)
+      loading.value = false
   }
 }
 
@@ -57,7 +72,32 @@ const signOutAllTitle = computed(() => {
 const confirmOpen = ref(false)
 const working = ref(false)
 const cprVoided = ref(false)
-const relogging = ref(false)
+const reloginOpen = ref(false)
+const reloginTargets = computed<ReloginTarget[]>(() => [{
+  id: props.accountId,
+  name: props.accountName || props.accountEmail || props.accountId,
+  email: props.accountEmail,
+  planType: props.planType,
+}])
+
+watch(() => props.accountId, () => {
+  loadSeq++
+  devices.value = null
+  loading.value = false
+  error.value = ''
+  notice.value = ''
+  cprVoided.value = false
+  reloginOpen.value = false
+})
+
+watch(
+  () => [props.active, props.accountId, props.blocked] as const,
+  ([isActive, , blocked]) => {
+    if (isActive && !devices.value && !loading.value && !error.value && !blocked && !cprVoided.value)
+      void load()
+  },
+  { immediate: true },
+)
 
 async function executeSignOut(target: SignOutTarget) {
   working.value = true
@@ -109,21 +149,22 @@ function scrollToLogin() {
   })
 }
 
-async function quickRelogin() {
-  relogging.value = true
+function quickRelogin() {
   error.value = ''
-  try {
-    await loginApi.runLogin({ accountId: props.accountId })
-    cprVoided.value = false
-    notice.value = '已使用已保存密码重新登录并写回 CPR'
-    await load()
-  }
-  catch {
-    scrollToLogin()
-  }
-  finally {
-    relogging.value = false
-  }
+  reloginOpen.value = true
+}
+
+async function onReloginSucceeded() {
+  cprVoided.value = false
+  error.value = ''
+  notice.value = '已使用已保存密码重新登录并写回 CPR'
+  emit('loginUpdated')
+  await load()
+}
+
+function onReloginFailed(payload: { message: string }) {
+  error.value = `免输重登失败：${payload.message}`
+  emit('loginUpdated')
 }
 </script>
 
@@ -140,16 +181,16 @@ async function quickRelogin() {
       </div>
       <div class="card-actions">
         <ZButton
-          :type="devices ? undefined : 'primary'"
+          :type="devices || loading ? undefined : 'primary'"
           size="small"
           :loading="loading"
           :disabled="!!blocked"
           :title="blocked ?? (devices ? '重新读取登录设备列表' : '读取登录设备列表')"
           @click="load"
         >
-          <RefreshCw v-if="devices" :size="13" aria-hidden="true" />
+          <RefreshCw v-if="devices || loading" :size="13" aria-hidden="true" />
           <Laptop v-else :size="13" aria-hidden="true" />
-          {{ devices ? '刷新' : '查询设备' }}
+          {{ devices || loading ? '刷新' : '查询设备' }}
         </ZButton>
         <template v-if="devices">
           <ZButton
@@ -174,7 +215,7 @@ async function quickRelogin() {
     </div>
 
     <p class="muted note">
-      ChatGPT 设置页里这个登录的设备，点了才查。CPR 正在使用的登录不能单独登出；「登出所有设备」会连它一起登出，之后需要重新登录。
+      ChatGPT 设置页里这个登录的设备，打开即自动读取。CPR 正在使用的登录不能单独登出；「登出所有设备」会连它一起登出，之后需要重新登录。
     </p>
 
     <p v-if="blocked" class="banner banner-warn">
@@ -183,6 +224,10 @@ async function quickRelogin() {
     <p v-if="error" class="banner banner-error" role="alert">
       {{ error }}
     </p>
+
+    <div v-if="loading && !devices" class="inline-loading">
+      正在读取登录设备…
+    </div>
 
     <div
       v-if="notice"
@@ -194,7 +239,7 @@ async function quickRelogin() {
         v-if="cprVoided || notice.includes('重新登录')"
         class="inline-flex flex-wrap items-center gap-2"
       >
-        <ZButton type="primary" size="small" :loading="relogging" @click="quickRelogin">
+        <ZButton type="primary" size="small" :loading="reloginOpen" @click="quickRelogin">
           <KeyRound :size="13" aria-hidden="true" /> 免输重登
         </ZButton>
         <ZButton size="small" @click="scrollToLogin">
@@ -277,5 +322,12 @@ async function quickRelogin() {
         <ZButton type="danger" :loading="working" @click="confirmAll">登出</ZButton>
       </template>
     </ZDialog>
+
+    <ReloginDialog
+      v-model="reloginOpen"
+      :targets="reloginTargets"
+      @succeeded="onReloginSucceeded"
+      @failed="onReloginFailed"
+    />
   </section>
 </template>

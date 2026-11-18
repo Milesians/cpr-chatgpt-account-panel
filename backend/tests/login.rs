@@ -1102,3 +1102,59 @@ async fn an_api_401_is_remembered_and_triggers_on_the_next_maintenance_round() {
             .contains("ChatGPT 查询返回 401")
     );
 }
+
+#[tokio::test]
+async fn login_progress_endpoint_and_error_stages_are_reported() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    host.forbidden_secrets = vec![TEST_PASSWORD.to_owned()];
+    let mut peer = Peer::start(test_config()).await;
+
+    let (code, idle_one) = peer
+        .api("GET", "api/login/progress", "id=acct_a", None, &mut host)
+        .await;
+    assert_eq!(code, 200, "{idle_one}");
+    assert_eq!(idle_one, json!({ "progress": Value::Null }));
+
+    let (code, idle_all) = peer
+        .api("GET", "api/login/progress", "", None, &mut host)
+        .await;
+    assert_eq!(code, 200, "{idle_all}");
+    assert_eq!(idle_all, json!({ "items": [] }));
+
+    // 密码阶段被拒绝时应返回 details.stage == "password"，并清理进行中进度
+    host.http.extend([
+        redirect("https://auth.openai.com/log-in"),
+        HttpReply {
+            status: 200,
+            headers: vec![("content-type".into(), b"text/html".to_vec())],
+            body: b"<html>login</html>".to_vec(),
+        },
+        ok(json!({ "token": "t1", "proofofwork": { "required": false } })),
+        ok(json!({ "page": { "type": "password" } })),
+        ok(json!({ "token": "t2", "proofofwork": { "required": false } })),
+        ok(json!({ "page": { "type": "password" } })),
+    ]);
+
+    let (code, err_body) = peer
+        .api(
+            "POST",
+            "api/login/run",
+            "",
+            Some(json!({
+                "accountId": "acct_a",
+                "password": TEST_PASSWORD,
+            })),
+            &mut host,
+        )
+        .await;
+    assert_eq!(code, 401, "{err_body}");
+    assert_eq!(err_body["error"]["code"], "password_rejected");
+    assert_eq!(err_body["error"]["details"]["stage"], "password");
+    assert_no_secret_in_value(&err_body, &[]);
+
+    let (code, after_err) = peer
+        .api("GET", "api/login/progress", "id=acct_a", None, &mut host)
+        .await;
+    assert_eq!(code, 200, "{after_err}");
+    assert_eq!(after_err, json!({ "progress": Value::Null }));
+}

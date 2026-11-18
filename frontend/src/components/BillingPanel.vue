@@ -2,7 +2,7 @@
 import type { LastPayment, Subscription, Transaction } from '../api'
 import { ZButton, ZEmpty, ZTag } from '@codex-proxy/ui'
 import { Check, Copy, CreditCard, ExternalLink, RefreshCw } from '@lucide/vue'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { api, canOpenExternal, openExternal } from '../api'
 import { copyText } from '../clipboard'
 import {
@@ -18,7 +18,7 @@ import {
   subscriptionStatusLabel,
 } from '../format'
 
-const props = defineProps<{ accountId: string, payment: LastPayment | null, blocked: string | null }>()
+const props = defineProps<{ accountId: string, payment: LastPayment | null, blocked: string | null, active?: boolean }>()
 const emit = defineEmits<{ payment: [payment: LastPayment | null] }>()
 
 const subscription = ref<Subscription | null>(null)
@@ -31,18 +31,40 @@ const copied = ref('')
 const copyFailed = ref('')
 const hostOpens = canOpenExternal()
 let copyTimer: ReturnType<typeof setTimeout> | null = null
+let loadSeq = 0
 
 const hasData = computed(() => subscription.value !== null || rows.value !== null)
 const loadingInitial = computed(() => billLoading.value && !hasData.value)
 const loadingRefresh = computed(() => billLoading.value && hasData.value)
 
+const knownSubStatus = computed(() => {
+  if (subscription.value)
+    return null
+  const p = props.payment
+  if (!p)
+    return null
+  const status = p.subscription_status ?? (p.created_at_ms ? undefined : p.status)
+  if (!status && !p.grace_ends_at_ms && !p.subscription_expires_at_ms)
+    return null
+  return {
+    status: status ?? (p.grace_ends_at_ms ? 'past_due' : 'unknown'),
+    expires_at_ms: p.subscription_expires_at_ms,
+    will_renew: p.subscription_will_renew,
+    grace_ends_at_ms: p.grace_ends_at_ms,
+    delinquent_since_ms: p.delinquent_since_ms,
+  }
+})
+
 async function loadBilling(more = false) {
+  const seq = ++loadSeq
   billLoading.value = true
   billError.value = ''
   if (!more)
     subError.value = ''
   try {
     const r = await api.billing(props.accountId, more ? cursor.value : '')
+    if (seq !== loadSeq)
+      return
     cursor.value = r.history.next_cursor ?? ''
     if (!more) {
       emit('payment', r.payment)
@@ -61,16 +83,37 @@ async function loadBilling(more = false) {
     }
   }
   catch (e) {
-    billError.value = (e as Error).message
+    if (seq === loadSeq)
+      billError.value = (e as Error).message
   }
   finally {
-    billLoading.value = false
+    if (seq === loadSeq)
+      billLoading.value = false
   }
 }
 
 async function loadAll() {
   await loadBilling(false)
 }
+
+watch(() => props.accountId, () => {
+  loadSeq++
+  subscription.value = null
+  subError.value = ''
+  rows.value = null
+  cursor.value = ''
+  billError.value = ''
+  billLoading.value = false
+})
+
+watch(
+  () => [props.active, props.accountId, props.blocked] as const,
+  ([isActive, , blocked]) => {
+    if (isActive && !hasData.value && !billLoading.value && !billError.value && !blocked)
+      void loadAll()
+  },
+  { immediate: true },
+)
 
 /** 新版 CPR 能经宿主弹窗打开外链；老版本只能复制 */
 function openInvoice(url: string) {
@@ -105,16 +148,16 @@ async function copy(url: string, id: string) {
       </div>
       <div class="card-actions">
         <ZButton
-          type="primary"
+          :type="hasData || billLoading ? undefined : 'primary'"
           size="small"
           :loading="loadingInitial || loadingRefresh"
           :disabled="!!blocked"
-          :title="blocked ?? (hasData ? '重新读取订阅与账单' : '并行读取订阅状态与账单记录')"
+          :title="blocked ?? (hasData ? '重新读取订阅与账单' : '读取订阅状态与账单记录')"
           @click="loadAll"
         >
-          <RefreshCw v-if="hasData" :size="13" aria-hidden="true" />
+          <RefreshCw v-if="hasData || billLoading" :size="13" aria-hidden="true" />
           <CreditCard v-else :size="13" aria-hidden="true" />
-          {{ hasData ? '刷新' : '查询订阅与账单' }}
+          {{ hasData || billLoading ? '刷新' : '查询订阅与账单' }}
         </ZButton>
       </div>
     </div>
@@ -156,6 +199,37 @@ async function copy(url: string, id: string) {
         <dd>{{ day(subscription.delinquent_since_ms) }}</dd>
       </div>
     </dl>
+
+    <dl v-else-if="knownSubStatus" class="facts-grid">
+      <div class="fact-box">
+        <dt>已知订阅状态</dt>
+        <dd>
+          <ZTag size="small" :type="knownSubStatus.status === 'active' ? 'success' : knownSubStatus.status === 'past_due' ? 'danger' : 'default'">
+            {{ subscriptionStatusLabel[knownSubStatus.status] ?? knownSubStatus.status }}
+          </ZTag>
+        </dd>
+      </div>
+      <div v-if="knownSubStatus.expires_at_ms" class="fact-box">
+        <dt>当前周期到期</dt>
+        <dd>{{ day(knownSubStatus.expires_at_ms) }}</dd>
+      </div>
+      <div v-if="knownSubStatus.will_renew !== undefined" class="fact-box">
+        <dt>自动续费</dt>
+        <dd>{{ knownSubStatus.will_renew ? '是' : '否' }}</dd>
+      </div>
+      <div v-if="knownSubStatus.grace_ends_at_ms" class="fact-box">
+        <dt>宽限期</dt>
+        <dd class="text-bad">至 {{ day(knownSubStatus.grace_ends_at_ms) }}（{{ daysLeft(knownSubStatus.grace_ends_at_ms) > 0 ? `剩 ${daysLeft(knownSubStatus.grace_ends_at_ms)} 天` : '已到期' }}）</dd>
+      </div>
+      <div v-if="knownSubStatus.delinquent_since_ms" class="fact-box">
+        <dt>逾期开始</dt>
+        <dd>{{ day(knownSubStatus.delinquent_since_ms) }}</dd>
+      </div>
+    </dl>
+
+    <div v-if="loadingInitial && !rows" class="inline-loading">
+      正在读取订阅与账单…
+    </div>
 
     <p v-if="billError" class="banner banner-error" role="alert">
       账单：{{ billError }}

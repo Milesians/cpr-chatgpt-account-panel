@@ -14,6 +14,14 @@ export interface SingleAccountLoginStatus {
   account: AccountLoginStatus
 }
 
+export interface LoginProgress {
+  accountId: string
+  stage: string
+  label: string
+  startedAtMs: number
+  updatedAtMs: number
+}
+
 export interface RunLoginResponse {
   ok: boolean
   account: AccountLoginStatus
@@ -62,6 +70,9 @@ export const loginApi = {
 
   accountStatus: (id: string) =>
     call<SingleAccountLoginStatus>('GET', 'api/login/status', { id }),
+
+  progress: (id: string) =>
+    call<{ progress: LoginProgress | null }>('GET', 'api/login/progress', { id }),
 
   saveCredentials: (data: {
     accountId: string

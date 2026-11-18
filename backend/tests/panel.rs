@@ -387,3 +387,40 @@ async fn challenge_pages_and_bad_input_are_reported() {
     assert_eq!(code, 404);
     assert_eq!(host.seen_http.len(), 1);
 }
+
+#[tokio::test]
+async fn billing_error_keeps_previous_billing_date_when_subscription_succeeds() {
+    let mut host = FakeHost::new(&["acct_a"]);
+    host.http.extend([
+        ok(history("paid", "")),
+        ok(
+            json!({"account_id": "chatgpt-acct_a", "plan_type": "plus", "is_active": true,
+            "active_until": "2026-11-01T00:00:00Z", "will_renew": true}),
+        ),
+        status(500, json!({})),
+        ok(
+            json!({"account_id": "chatgpt-acct_a", "plan_type": "plus", "is_active": true,
+            "active_until": "2026-12-01T00:00:00Z", "will_renew": true}),
+        ),
+    ]);
+    let mut peer = Peer::start(json!({})).await;
+    let (code, first) = peer
+        .api("GET", "api/billing", "id=acct_a", None, &mut host)
+        .await;
+    assert_eq!(code, 200, "{first}");
+    let expected_created = first["payment"]["created_at_ms"].as_i64().unwrap();
+
+    let (code, second) = peer
+        .api("GET", "api/billing", "id=acct_a", None, &mut host)
+        .await;
+    assert_eq!(code, 200, "{second}");
+    assert!(second["history"]["problem"].is_string());
+    assert_eq!(
+        second["payment"]["created_at_ms"].as_i64(),
+        Some(expected_created)
+    );
+    assert_eq!(
+        second["payment"]["subscription_expires_at_ms"].as_i64(),
+        Some(1_796_083_200_000_i64)
+    );
+}

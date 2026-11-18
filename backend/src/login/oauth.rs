@@ -241,6 +241,9 @@ pub fn authorize_params(auth_url: &str) -> AuthorizeParams {
     AuthorizeParams::default()
 }
 
+/// 登录过程阶段回调：`(stage, label)`
+pub type ProgressSink<'a> = &'a (dyn Fn(&'static str, &'static str) + Send + Sync);
+
 /// 使用外部提供的 OAuth `authorize` 地址（如 CPR `oauth/start` 返回的 `authorizationUrl`）
 /// 执行邮箱 + 密码 + 2FA 登录状态机，截下回调地址后返回（不换取令牌）
 ///
@@ -292,6 +295,7 @@ pub async fn login_with_authorize_url(
         device_id: &identity.device_id,
         cookies: BTreeMap::from([("oai-did".to_owned(), identity.device_id.clone())]),
         stage: "connect",
+        progress: None,
     };
 
     let (callback_url, code) = flow.run_from_url(auth_url).await?;
@@ -311,6 +315,19 @@ pub async fn login_and_exchange(
     host: &HostClient,
     egress: &Egress,
     input: &LoginInput,
+) -> Result<LoginOutput, LoginError> {
+    login_and_exchange_with_progress(host, egress, input, None).await
+}
+
+/// 带阶段进度回调的完整登录流程
+///
+/// # Errors
+/// 任一步骤失败时返回结构化 [`LoginError`]，绝不包含明文密码、2FA 密钥或令牌
+pub async fn login_and_exchange_with_progress(
+    host: &HostClient,
+    egress: &Egress,
+    input: &LoginInput,
+    progress: Option<ProgressSink<'_>>,
 ) -> Result<LoginOutput, LoginError> {
     let email = input.email.trim().to_ascii_lowercase();
     if email.is_empty() {
@@ -350,9 +367,13 @@ pub async fn login_and_exchange(
         device_id: &identity.device_id,
         cookies: BTreeMap::from([("oai-did".to_owned(), identity.device_id.clone())]),
         stage: "connect",
+        progress,
     };
 
     let (callback_url, code) = flow.run_from_url(&auth_url).await?;
+    if let Some(cb) = progress {
+        cb("exchange", "换取 OAuth 令牌");
+    }
     let tokens = exchange_authorization_code(
         host,
         egress,
@@ -530,6 +551,7 @@ struct Flow<'a> {
     device_id: &'a str,
     cookies: BTreeMap<String, String>,
     stage: &'static str,
+    progress: Option<ProgressSink<'a>>,
 }
 
 #[derive(Debug, Default)]
@@ -540,8 +562,15 @@ struct Page {
 }
 
 impl Flow<'_> {
+    fn report(&self, stage: &'static str, label: &'static str) {
+        if let Some(cb) = self.progress {
+            cb(stage, label);
+        }
+    }
+
     async fn run_from_url(&mut self, auth_url: &str) -> Result<(String, String), LoginError> {
         self.stage = "connect";
+        self.report("connect", "连接 OpenAI 授权页");
         let mut p = self.get(auth_url, "").await?;
         for _ in 0..MAX_STEPS {
             if p.next.is_empty() {
@@ -558,6 +587,7 @@ impl Flow<'_> {
         }
 
         self.stage = "identify";
+        self.report("identify", "提交登录邮箱");
         let referer = format!("{DEFAULT_ORIGIN}/log-in");
         p = self
             .post_json(
@@ -585,6 +615,7 @@ impl Flow<'_> {
                         ));
                     }
                     self.stage = "password";
+                    self.report("password", "验证登录密码");
                     password_sent = true;
                     let pw_ref = format!("{DEFAULT_ORIGIN}/log-in/password");
                     p = self
@@ -644,6 +675,7 @@ impl Flow<'_> {
                     if let Some(res) = self.check_callback(&p.next) {
                         return res;
                     }
+                    self.report("authorize", "完成登录授权跳转");
                     p = self.get(&p.next, DEFAULT_ORIGIN).await?;
                 }
             }
@@ -668,6 +700,7 @@ impl Flow<'_> {
     }
 
     async fn verify_totp(&mut self, p: &Page) -> Result<Page, LoginError> {
+        self.report("totp", "发起 2FA 验证");
         let mut factor_id = find_totp_factor_id(&p.data);
         if factor_id.is_empty() {
             let sess = self.session().await?;
@@ -707,9 +740,11 @@ impl Flow<'_> {
             })?;
         let wait = totp_wait_ms(now_ms());
         if wait > 0 {
+            self.report("totp", "等待下一个 2FA 窗口");
             // 验证码临近失效，加上代理延迟可能到达时已过期
             tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
         }
+        self.report("totp", "验证 2FA 动态码");
         let code = totp_code(self.totp_secret, now_ms()).map_err(|err_code| {
             let msg = if err_code == "totp_secret_missing" {
                 "该账号开启了 2FA 验证，但尚未提供 2FA 密钥"
@@ -746,6 +781,7 @@ impl Flow<'_> {
     }
 
     async fn select_workspace(&mut self, p: &Page) -> Result<Page, LoginError> {
+        self.report("authorize", "选择工作区并授权");
         let mut sess = self.session().await.unwrap_or_default();
         if sess.is_empty() {
             sess = p.data.clone();
@@ -825,6 +861,7 @@ impl Flow<'_> {
         data: &Map<String, Value>,
         referer: &str,
     ) -> Result<Page, LoginError> {
+        self.report("authorize", "选择组织并授权");
         let candidates = organization_candidates(data);
         let chosen = if !self.organization_id.is_empty() {
             candidates

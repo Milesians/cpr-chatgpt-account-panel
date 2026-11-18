@@ -11,6 +11,7 @@ pub mod totp;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gateway_plugin_sdk::{
     ErrorCode, PluginFault,
@@ -32,8 +33,8 @@ use crate::host;
 
 use self::oauth::{
     Choice, Egress, LoginError, LoginInput, Tokens, authorize_params, authorize_url,
-    exchange_authorization_code, login_and_exchange, login_with_authorize_url, new_pkce,
-    normalize_redirect_url, parse_callback_url,
+    exchange_authorization_code, login_and_exchange_with_progress, login_with_authorize_url,
+    new_pkce, normalize_redirect_url, parse_callback_url,
 };
 use self::paste::{account_kind, is_valid_email, normalize_kind, parse_paste_lines};
 use self::sentinel::{Identity, ensure_identity, is_uuid_v4};
@@ -49,6 +50,36 @@ const OAUTH_SESSION_TTL_MS: i64 = 15 * 60 * 1000;
 pub struct Login {
     redirect_url: String,
     pending_oauth: Mutex<HashMap<String, PendingOAuth>>,
+    in_flight: Mutex<HashMap<String, InFlightLogin>>,
+    next_progress_token: AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginProgress {
+    pub account_id: String,
+    pub stage: String,
+    pub label: String,
+    pub started_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct InFlightLogin {
+    token: u64,
+    progress: LoginProgress,
+}
+
+struct ProgressGuard<'a> {
+    login: &'a Login,
+    account_id: String,
+    token: u64,
+}
+
+impl Drop for ProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.login.clear_progress(&self.account_id, self.token);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -155,7 +186,76 @@ impl Login {
         Self {
             redirect_url: normalize_redirect_url(&config.oauth_redirect),
             pending_oauth: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
+            next_progress_token: AtomicU64::new(1),
         }
+    }
+
+    fn begin_progress(&self, account_id: &str, stage: &str, label: &str) -> ProgressGuard<'_> {
+        let token = self.next_progress_token.fetch_add(1, Ordering::Relaxed);
+        let now = now_ms();
+        let mut map = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert(
+            account_id.to_owned(),
+            InFlightLogin {
+                token,
+                progress: LoginProgress {
+                    account_id: account_id.to_owned(),
+                    stage: stage.to_owned(),
+                    label: label.to_owned(),
+                    started_at_ms: now,
+                    updated_at_ms: now,
+                },
+            },
+        );
+        ProgressGuard {
+            login: self,
+            account_id: account_id.to_owned(),
+            token,
+        }
+    }
+
+    fn update_progress(&self, account_id: &str, token: u64, stage: &str, label: &str) {
+        let mut map = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = map.get_mut(account_id)
+            && entry.token == token
+        {
+            entry.progress.stage = stage.to_owned();
+            entry.progress.label = label.to_owned();
+            entry.progress.updated_at_ms = now_ms();
+        }
+    }
+
+    fn clear_progress(&self, account_id: &str, token: u64) {
+        let mut map = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.get(account_id).is_some_and(|e| e.token == token) {
+            map.remove(account_id);
+        }
+    }
+
+    fn get_progress(&self, account_id: &str) -> Option<LoginProgress> {
+        let map = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(account_id).map(|e| e.progress.clone())
+    }
+
+    fn list_progress(&self) -> Vec<LoginProgress> {
+        let map = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.values().map(|e| e.progress.clone()).collect()
     }
 
     fn get_pending_oauth(&self, key: &str, now: i64) -> Option<PendingOAuth> {
@@ -191,6 +291,7 @@ impl Login {
 pub fn routes() -> Vec<ManagementRoute> {
     vec![
         api::route("GET", "api/login/status"),
+        api::route("GET", "api/login/progress"),
         api::route("GET", "api/login/proxies"),
         api::route("POST", "api/login/credentials"),
         api::route("POST", "api/login/auto-login"),
@@ -212,6 +313,7 @@ pub async fn handle(login: &Login, call: &TypedCall<ManagementRequest>) -> Resul
     let query = api::parse_query(&req.query);
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "api/login/status") => handle_status(login, host, &query).await,
+        ("GET", "api/login/progress") => Ok(handle_progress(login, &query)),
         ("GET", "api/login/proxies") => handle_proxies(host).await,
         ("POST", "api/login/credentials") => {
             let body: CredentialsRequest = api::decode(call)?;
@@ -242,6 +344,14 @@ pub async fn handle(login: &Login, call: &TypedCall<ManagementRequest>) -> Resul
             handle_import(login, host, body).await
         }
         _ => Err(ApiError::new(404, "not_found", "没有这个接口")),
+    }
+}
+
+fn handle_progress(login: &Login, query: &HashMap<String, String>) -> Value {
+    if let Some(id) = query.get("id").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        json!({ "progress": login.get_progress(id) })
+    } else {
+        json!({ "items": login.list_progress() })
     }
 }
 
@@ -511,6 +621,9 @@ async fn handle_run_login(
     let (identity, _, _) = ensure_identity(&rec.identity);
     rec.identity = identity.clone();
 
+    let progress_guard = login.begin_progress(account_id, "prepare", "读取账号出口");
+    let progress_token = progress_guard.token;
+
     let egress = relogin_egress(host, &acct).await;
     let input = LoginInput {
         email: email.clone(),
@@ -523,7 +636,11 @@ async fn handle_run_login(
         redirect_url: login.redirect_url.clone(),
     };
 
-    match login_and_exchange(host, &egress, &input).await {
+    let report = |stage: &'static str, label: &'static str| {
+        login.update_progress(account_id, progress_token, stage, label);
+    };
+
+    match login_and_exchange_with_progress(host, &egress, &input, Some(&report)).await {
         Err(err) => {
             let now = now_ms();
             rec.last_error = Some(StoredLoginError {
@@ -548,6 +665,7 @@ async fn handle_run_login(
             Err(login_error_to_api(&err))
         }
         Ok(out) => {
+            login.update_progress(account_id, progress_token, "save", "写回 CPR 凭据");
             rec.identity = out.identity;
             save_replaced_credential(host, &acct, &out.tokens, &rec.identity).await?;
             let now = now_ms();
@@ -570,6 +688,7 @@ async fn handle_run_login(
             .await;
             let refreshed_acct = host::account(host, account_id).await.unwrap_or(acct);
             let status = build_account_status(login, &refreshed_acct, &rec, now);
+            drop(progress_guard);
             Ok(json!({
                 "ok": true,
                 "account": status,
@@ -1677,9 +1796,54 @@ fn login_error_to_api(err: &LoginError) -> ApiError {
         _ => 502,
     };
     let api = ApiError::new(status, err.code, err.message.clone());
-    if err.choices.is_empty() {
-        api
-    } else {
-        api.with_details(json!({ "choices": err.choices }))
+    let mut details = json!({ "stage": err.stage });
+    if !err.choices.is_empty() {
+        details["choices"] = json!(err.choices);
+    }
+    api.with_details(details)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_tracks_stages_and_clears_on_drop() {
+        let login = Login::new(&Config::default());
+        assert_eq!(
+            handle_progress(&login, &HashMap::from([("id".into(), "acct_1".into())])),
+            json!({ "progress": Value::Null })
+        );
+        assert_eq!(
+            handle_progress(&login, &HashMap::new()),
+            json!({ "items": [] })
+        );
+
+        {
+            let guard = login.begin_progress("acct_1", "prepare", "读取账号出口");
+            let token = guard.token;
+
+            let one = handle_progress(&login, &HashMap::from([("id".into(), "acct_1".into())]));
+            assert_eq!(one["progress"]["accountId"], "acct_1");
+            assert_eq!(one["progress"]["stage"], "prepare");
+            assert_eq!(one["progress"]["label"], "读取账号出口");
+
+            login.update_progress("acct_1", token, "password", "验证登录密码");
+            let list = handle_progress(&login, &HashMap::new());
+            assert_eq!(list["items"].as_array().unwrap().len(), 1);
+            assert_eq!(list["items"][0]["stage"], "password");
+            assert_eq!(list["items"][0]["label"], "验证登录密码");
+
+            // 旧 token 不能误更新或误清掉新任务
+            login.update_progress("acct_1", token + 99, "save", "旧任务");
+            login.clear_progress("acct_1", token + 99);
+            let still = handle_progress(&login, &HashMap::from([("id".into(), "acct_1".into())]));
+            assert_eq!(still["progress"]["stage"], "password");
+        }
+
+        assert_eq!(
+            handle_progress(&login, &HashMap::from([("id".into(), "acct_1".into())])),
+            json!({ "progress": Value::Null })
+        );
     }
 }

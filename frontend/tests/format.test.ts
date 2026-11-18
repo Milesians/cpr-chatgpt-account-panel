@@ -23,6 +23,9 @@ import {
   paymentText,
   rowAccentTone,
   shortDate,
+  subscriptionBillingDateText,
+  subscriptionDetailText,
+  subscriptionStateOf,
   windowName,
 } from '../src/format.ts'
 
@@ -56,6 +59,31 @@ test('payment issues, subscription-only records, and grace period text', () => {
   assert.match(graceText(Date.UTC(2026, 10, 10), Date.UTC(2026, 10, 6)), /宽限期至 2026\/11\/10 · 剩 4 天/)
   assert.match(graceText(Date.UTC(2026, 10, 6), Date.UTC(2026, 10, 6, 1)), /宽限期至 2026\/11\/06 · 已到期/)
   assert.match(graceTooltip(subOnly), /付款逾期宽限期截止 .*（逾期始于 2026\/11\/03）/)
+
+  const billOnly = {
+    status: 'paid',
+    created_at_ms: Date.UTC(2026, 9, 25, 8, 0, 0),
+    checked_at_ms: Date.UTC(2026, 10, 6, 8, 0, 0),
+  }
+  assert.equal(subscriptionStateOf(billOnly), undefined)
+  assert.equal(subscriptionBillingDateText(billOnly), '账单日 2026/10/25')
+  assert.equal(subscriptionDetailText(billOnly), '')
+
+  const activeWithBilling = {
+    ...billOnly,
+    subscription_status: 'active' as const,
+    subscription_expires_at_ms: Date.UTC(2026, 10, 25, 8, 0, 0),
+    subscription_will_renew: true,
+  }
+  assert.equal(subscriptionStateOf(activeWithBilling), 'active')
+  assert.equal(subscriptionBillingDateText(activeWithBilling), '账单日 2026/10/25')
+  assert.equal(subscriptionDetailText(activeWithBilling), '续费日 2026/11/25')
+
+  const cancelAtEnd = {
+    ...activeWithBilling,
+    subscription_will_renew: false,
+  }
+  assert.equal(subscriptionDetailText(cancelAtEnd), '到期日 2026/11/25')
 })
 
 test('plan formatting and kind labels', () => {
